@@ -4,10 +4,8 @@
 // Subscreve ticks ao vivo. Analisa janela deslizante.
 // CALL se tendência ascendente, PUT se descendente.
 // ============================================================
-
-import { BotConfig, TrendFollowingParams, TradeDirection, TradeResult } from '../bot.types.js';
+import { BotConfig, TrendFollowingParams, TradeDirection, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { DerivWsAdapter } from '../bot.types.js';
 
 export class TrendFollowingStrategy extends BaseStrategy {
   private params: TrendFollowingParams;
@@ -20,19 +18,17 @@ export class TrendFollowingStrategy extends BaseStrategy {
     this.params = (config.strategyParams ?? {
       ticksWindow: 10,
       trendThreshold: 0.002,
-    }) as TrendFollowingParams;
+    }) as unknown as TrendFollowingParams;
   }
 
   protected async onStart(): Promise<void> {
     const { symbol } = this.state.config;
     const { ticksWindow } = this.params;
     this.tickBuffer = [];
-
     this.tickSub = this.derivWs.subscribeToTicks(symbol, (price) => {
       this.tickBuffer.push(price);
       if (this.tickBuffer.length > ticksWindow) this.tickBuffer.shift();
     });
-
     this.log('info', `Trend Following — símbolo: ${symbol}, janela: ${ticksWindow} ticks`);
   }
 
@@ -47,7 +43,6 @@ export class TrendFollowingStrategy extends BaseStrategy {
 
   protected async tick(): Promise<void> {
     if (this.pending) return;
-
     const { ticksWindow, trendThreshold } = this.params;
     const { symbol, duration, durationUnit, currency } = this.state.config;
 
@@ -67,8 +62,8 @@ export class TrendFollowingStrategy extends BaseStrategy {
       first: this.tickBuffer[0],
       last: this.tickBuffer[this.tickBuffer.length - 1],
     });
-    this.pending = true;
 
+    this.pending = true;
     try {
       const entryTime = new Date();
       const { contractId } = await this.derivWs.buyContract({

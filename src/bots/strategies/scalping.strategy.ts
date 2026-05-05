@@ -4,10 +4,8 @@
 // Abre contratos rápidos consecutivos.
 // Para automaticamente após N perdas consecutivas.
 // ============================================================
-
-import { BotConfig, ScalpingParams, TradeDirection, TradeResult } from '../bot.types.js';
+import { BotConfig, ScalpingParams, TradeDirection, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { DerivWsAdapter } from '../bot.types.js';
 
 export class ScalpingStrategy extends BaseStrategy {
   private params: ScalpingParams;
@@ -18,7 +16,7 @@ export class ScalpingStrategy extends BaseStrategy {
     super(id, name, 'scalping', config, derivWs);
     this.params = (config.strategyParams ?? {
       maxConsecutiveLosses: 3,
-    }) as ScalpingParams;
+    }) as unknown as ScalpingParams;
   }
 
   protected async onStart(): Promise<void> {
@@ -35,7 +33,6 @@ export class ScalpingStrategy extends BaseStrategy {
 
   protected async tick(): Promise<void> {
     if (this.pending) return;
-
     const { symbol, duration, durationUnit, currency } = this.state.config;
     const { maxConsecutiveLosses } = this.params;
 
@@ -47,10 +44,9 @@ export class ScalpingStrategy extends BaseStrategy {
 
     const stake = this.state.stats.currentStake;
     const direction = this.chooseDirection();
-
     this.log('trade', `Abrindo ${direction} — stake: $${stake.toFixed(2)}`, { symbol, direction, stake });
-    this.pending = true;
 
+    this.pending = true;
     try {
       const entryTime = new Date();
       const { contractId } = await this.derivWs.buyContract({

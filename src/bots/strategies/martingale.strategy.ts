@@ -4,10 +4,8 @@
 // Martingale:      multiplica stake após PERDA, reseta no win
 // Anti-Martingale: multiplica stake após WIN, reseta na perda
 // ============================================================
-
-import { BotConfig, MartingaleParams, TradeDirection, TradeResult } from '../bot.types.js';
+import { BotConfig, MartingaleParams, TradeDirection, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { DerivWsAdapter } from '../bot.types.js';
 
 export class MartingaleStrategy extends BaseStrategy {
   private params: MartingaleParams;
@@ -18,7 +16,7 @@ export class MartingaleStrategy extends BaseStrategy {
       multiplier: 2,
       maxStake: 100,
       resetOnWin: false,
-    }) as MartingaleParams;
+    }) as unknown as MartingaleParams;
     super(id, name, params.resetOnWin ? 'anti_martingale' : 'martingale', config, derivWs);
     this.params = params;
   }
@@ -37,10 +35,8 @@ export class MartingaleStrategy extends BaseStrategy {
 
   protected async tick(): Promise<void> {
     if (this.pending) return;
-
     const { symbol, duration, durationUnit, currency } = this.state.config;
     const { multiplier, maxStake, resetOnWin } = this.params;
-
     const stake = Math.min(this.state.stats.currentStake, maxStake);
     const direction = this.chooseDirection();
     const mode = resetOnWin ? 'Anti-Martingale' : 'Martingale';
@@ -48,8 +44,8 @@ export class MartingaleStrategy extends BaseStrategy {
     this.log('trade', `[${mode}] Abrindo ${direction} — stake: $${stake.toFixed(2)}`, {
       stake, currentStreak: this.state.stats.currentStreak,
     });
-    this.pending = true;
 
+    this.pending = true;
     try {
       const entryTime = new Date();
       const { contractId } = await this.derivWs.buyContract({

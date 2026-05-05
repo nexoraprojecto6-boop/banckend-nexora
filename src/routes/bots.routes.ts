@@ -18,16 +18,17 @@
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express';
+import type { BotManager } from '../bots/bot.manager.js';
 import { CreateBotRequest } from '../bots/bot.types.js';
 import logger from '@utils/logger.js';
 
-declare module 'express-serve-static-core' {
+declare module 'express' {
   interface Request {
-    botManager?: import('../bots/bot.manager.js').BotManager;
+    botManager?: BotManager;
   }
 }
 
-const router = Router();
+const router: Router = Router();
 
 // ─── Helpers ─────────────────────────────────────────────────
 
@@ -45,7 +46,7 @@ function wrap(fn: (req: Request, res: Response) => Promise<unknown>) {
 }
 
 // Garante que o BotManager está disponível (cliente autenticado via WS)
-function requireManager(req: Request, res: Response): import('../bots/bot.manager.js').BotManager | null {
+function requireManager(req: Request, res: Response): BotManager | null {
   if (!req.botManager) {
     fail(res, 'Sessão WebSocket não autenticada. Conecte via WS primeiro.', 401);
     return null;

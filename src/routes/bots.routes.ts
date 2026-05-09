@@ -1,187 +1,257 @@
 // ============================================================
-// NEXORA FOREX — Bot Routes  (/api/bots)
+// NEXORA FOREX — Bot Routes (/api/bots)
 // ============================================================
 //
-// POST   /api/bots                  → criar bot
-// GET    /api/bots                  → listar bots da sessão
-// GET    /api/bots/:id              → estado completo do bot
-// POST   /api/bots/:id/start        → iniciar
-// POST   /api/bots/:id/stop         → parar
-// POST   /api/bots/:id/pause        → pausar
-// POST   /api/bots/:id/resume       → retomar
-// DELETE /api/bots/:id              → remover
-// GET    /api/bots/:id/logs         → logs (query: ?limit=N)
-// POST   /api/bots/stop-all         → parar todos
+// Modelo de catálogo:
+//   Admin  → POST/PUT/DELETE /api/bots/catalog/:id
+//   User   → GET /api/bots/catalog           (lista activos)
+//   User   → GET /api/bots/session           (bots da sessão WS)
+//   User   → GET /api/bots/session/:id/logs
 //
-// O BotManager é obtido via req.botManager (injectado pelo
-// middleware attachBotManager em server.ts).
+// O BotManager é injectado via middleware no server.ts.
+// Apenas o admin pode criar/editar/eliminar bots do catálogo.
 // ============================================================
 
-import { Router, Request, Response, NextFunction } from 'express';
-import type { BotManager } from '../bots/bot.manager.js';
-import { CreateBotRequest } from '../bots/bot.types.js';
+import { Router, Request, Response } from 'express';
+import { BotCatalog, CreateCatalogBotDto, UpdateCatalogBotDto } from '../bots/bot-catalog.js';
+import { BotManager } from '../bots/bot.manager.js';
+import { AppError } from '../types/errors.js';
 import logger from '@utils/logger.js';
 
-declare module 'express' {
-  interface Request {
-    botManager?: BotManager;
+// ─── Extensão do Request para BotManager e papel do utilizador ──
+
+declare global {
+  namespace Express {
+    interface Request {
+      botManager?: BotManager;
+      isAdmin?: boolean;       // injectado pelo middleware do server.ts
+    }
   }
 }
 
-const router: Router = Router();
+const router = Router();
 
-// ─── Helpers ─────────────────────────────────────────────────
+// ─── Guard: requer BotManager (sessão WS activa) ─────────────
 
-function ok(res: Response, data: unknown, status = 200) {
-  return res.status(status).json({ success: true, data });
-}
-
-function fail(res: Response, message: string, status = 400) {
-  return res.status(status).json({ success: false, error: message });
-}
-
-function wrap(fn: (req: Request, res: Response) => Promise<unknown>) {
-  return (req: Request, res: Response, next: NextFunction) =>
-    fn(req, res).catch(next);
-}
-
-// Garante que o BotManager está disponível (cliente autenticado via WS)
-function requireManager(req: Request, res: Response): BotManager | null {
+function requireManager(req: Request, res: Response, next: () => void): void {
   if (!req.botManager) {
-    fail(res, 'Sessão WebSocket não autenticada. Conecte via WS primeiro.', 401);
-    return null;
+    res.status(401).json({ error: 'Sessão WS não autenticada. Liga ao WebSocket primeiro.' });
+    return;
   }
-  return req.botManager;
+  next();
 }
 
-const VALID_STRATEGIES = ['scalping', 'martingale', 'anti_martingale', 'trend_following'];
+// ─── Guard: requer admin ──────────────────────────────────────
 
-// ─── POST /api/bots ──────────────────────────────────────────
-
-router.post('/', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
-
-  const { name, strategy, config }: CreateBotRequest = req.body;
-
-  if (!name?.trim()) return fail(res, 'Campo obrigatório: name');
-  if (!strategy || !VALID_STRATEGIES.includes(strategy)) {
-    return fail(res, `Estratégia inválida. Opções: ${VALID_STRATEGIES.join(', ')}`);
+function requireAdmin(req: Request, res: Response, next: () => void): void {
+  if (!req.isAdmin) {
+    res.status(403).json({ error: 'Acesso restrito ao administrador.' });
+    return;
   }
-  if (!config?.symbol || !config?.initialStake || !config?.duration) {
-    return fail(res, 'config deve conter: symbol, initialStake, duration, durationUnit, currency, contractType');
-  }
+  next();
+}
 
-  const state = manager.createBot({ name, strategy, config });
-  logger.info(`[BotRoute] Bot criado: ${state.id}`);
-  return ok(res, state, 201);
-}));
+// ============================================================
+// CATÁLOGO — Público (utilizadores autenticados)
+// ============================================================
 
-// ─── GET /api/bots ───────────────────────────────────────────
-
-router.get('/', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
-  return ok(res, manager.listBots());
-}));
-
-// ─── POST /api/bots/stop-all ─────────────────────────────────
-
-router.post('/stop-all', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
-  await manager.stopAll();
-  return ok(res, { message: 'Todos os bots foram parados' });
-}));
-
-// ─── GET /api/bots/:id ───────────────────────────────────────
-
-router.get('/:id', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
+/**
+ * GET /api/bots/catalog
+ * Lista todos os bots activos do catálogo.
+ * Utilizador escolhe um daqui para executar na sessão.
+ */
+router.get('/catalog', async (_req, res) => {
   try {
-    return ok(res, manager.getBotState(req.params.id));
-  } catch {
-    return fail(res, 'Bot não encontrado', 404);
+    const bots = await BotCatalog.listActive();
+    res.json({ data: bots, count: bots.length });
+  } catch (err: any) {
+    logger.error('[BotRoutes] Erro ao listar catálogo', { error: err.message });
+    res.status(500).json({ error: 'Erro ao carregar catálogo de bots.' });
   }
-}));
+});
 
-// ─── POST /api/bots/:id/start ────────────────────────────────
-
-router.post('/:id/start', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
+/**
+ * GET /api/bots/catalog/:id
+ * Detalhes de um bot do catálogo (inclui defaultConfig para pré-preencher o form).
+ */
+router.get('/catalog/:id', async (req, res) => {
   try {
-    await manager.startBot(req.params.id);
-    return ok(res, { message: 'Bot iniciado', id: req.params.id });
-  } catch (err) {
-    return fail(res, err instanceof Error ? err.message : String(err));
+    const bot = await BotCatalog.getById(req.params.id);
+    if (!bot || !bot.isActive) {
+      res.status(404).json({ error: 'Bot não encontrado.' });
+      return;
+    }
+    res.json({ data: bot });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-}));
+});
 
-// ─── POST /api/bots/:id/stop ─────────────────────────────────
+// ============================================================
+// CATÁLOGO — Admin (gerir bots disponíveis)
+// ============================================================
 
-router.post('/:id/stop', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
+/**
+ * GET /api/bots/catalog/admin/all
+ * Lista TODOS os bots (incluindo inactivos). Só admin.
+ */
+router.get('/catalog/admin/all', requireAdmin, async (_req, res) => {
   try {
-    await manager.stopBot(req.params.id);
-    return ok(res, { message: 'Bot parado', id: req.params.id });
-  } catch (err) {
-    return fail(res, err instanceof Error ? err.message : String(err));
+    const bots = await BotCatalog.listAll();
+    res.json({ data: bots, count: bots.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-}));
+});
 
-// ─── POST /api/bots/:id/pause ────────────────────────────────
-
-router.post('/:id/pause', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
+/**
+ * POST /api/bots/catalog
+ * Adiciona um novo bot ao catálogo. Só admin.
+ *
+ * Body: CreateCatalogBotDto
+ * {
+ *   name: string,
+ *   description: string,
+ *   strategy: BotStrategyType,
+ *   defaultConfig: BotConfig,
+ *   tags: string[],
+ *   createdBy: string,
+ *   isActive: boolean
+ * }
+ */
+router.post('/catalog', requireAdmin, async (req, res) => {
   try {
-    manager.pauseBot(req.params.id);
-    return ok(res, { message: 'Bot pausado', id: req.params.id });
-  } catch (err) {
-    return fail(res, err instanceof Error ? err.message : String(err));
+    const dto = req.body as CreateCatalogBotDto;
+
+    // Validações básicas
+    if (!dto.name || typeof dto.name !== 'string') {
+      res.status(400).json({ error: 'Campo "name" é obrigatório.' });
+      return;
+    }
+    if (!dto.strategy) {
+      res.status(400).json({ error: 'Campo "strategy" é obrigatório.' });
+      return;
+    }
+    if (!dto.defaultConfig?.symbol || !dto.defaultConfig?.contractType) {
+      res.status(400).json({ error: 'defaultConfig.symbol e defaultConfig.contractType são obrigatórios.' });
+      return;
+    }
+
+    const bot = await BotCatalog.create({
+      ...dto,
+      tags: dto.tags ?? [],
+      isActive: dto.isActive ?? true,
+    });
+
+    logger.info(`[BotRoutes] Admin criou bot no catálogo: ${bot.id}`);
+    res.status(201).json({ data: bot });
+  } catch (err: any) {
+    logger.error('[BotRoutes] Erro ao criar bot no catálogo', { error: err.message });
+    res.status(500).json({ error: err.message });
   }
-}));
+});
 
-// ─── POST /api/bots/:id/resume ───────────────────────────────
-
-router.post('/:id/resume', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
+/**
+ * PUT /api/bots/catalog/:id
+ * Actualiza um bot do catálogo. Só admin.
+ */
+router.put('/catalog/:id', requireAdmin, async (req, res) => {
   try {
-    await manager.resumeBot(req.params.id);
-    return ok(res, { message: 'Bot retomado', id: req.params.id });
-  } catch (err) {
-    return fail(res, err instanceof Error ? err.message : String(err));
+    const dto = req.body as UpdateCatalogBotDto;
+    const updated = await BotCatalog.update(req.params.id, dto);
+    if (!updated) {
+      res.status(404).json({ error: 'Bot não encontrado no catálogo.' });
+      return;
+    }
+    res.json({ data: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-}));
+});
 
-// ─── DELETE /api/bots/:id ────────────────────────────────────
-
-router.delete('/:id', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
+/**
+ * PATCH /api/bots/catalog/:id/toggle
+ * Activa ou desactiva um bot do catálogo. Só admin.
+ * Body: { isActive: boolean }
+ */
+router.patch('/catalog/:id/toggle', requireAdmin, async (req, res) => {
   try {
-    manager.deleteBot(req.params.id);
-    return ok(res, { message: 'Bot removido', id: req.params.id });
-  } catch {
-    return fail(res, 'Bot não encontrado', 404);
+    const { isActive } = req.body as { isActive: boolean };
+    if (typeof isActive !== 'boolean') {
+      res.status(400).json({ error: 'Campo "isActive" (boolean) é obrigatório.' });
+      return;
+    }
+    const updated = await BotCatalog.setActive(req.params.id, isActive);
+    if (!updated) {
+      res.status(404).json({ error: 'Bot não encontrado.' });
+      return;
+    }
+    res.json({ data: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-}));
+});
 
-// ─── GET /api/bots/:id/logs ──────────────────────────────────
-
-router.get('/:id/logs', wrap(async (req, res) => {
-  const manager = requireManager(req, res);
-  if (!manager) return;
-  const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+/**
+ * DELETE /api/bots/catalog/:id
+ * Remove um bot do catálogo permanentemente. Só admin.
+ */
+router.delete('/catalog/:id', requireAdmin, async (req, res) => {
   try {
-    return ok(res, manager.getBotLogs(req.params.id, limit));
-  } catch {
-    return fail(res, 'Bot não encontrado', 404);
+    const deleted = await BotCatalog.delete(req.params.id);
+    if (!deleted) {
+      res.status(404).json({ error: 'Bot não encontrado.' });
+      return;
+    }
+    res.json({ message: 'Bot removido do catálogo com sucesso.' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-}));
+});
+
+// ============================================================
+// SESSÃO — Bots activos do utilizador (BotManager da sessão WS)
+// ============================================================
+
+/**
+ * GET /api/bots/session
+ * Lista os bots em execução na sessão WS actual do utilizador.
+ * Requer sessão WS autenticada (BotManager injectado pelo middleware do server.ts).
+ */
+router.get('/session', requireManager, (req, res) => {
+  try {
+    const bots = req.botManager!.listBots();
+    res.json({ data: bots, count: bots.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/bots/session/:id
+ * Estado detalhado de um bot da sessão.
+ */
+router.get('/session/:id', requireManager, (req, res) => {
+  try {
+    const state = req.botManager!.getBotState(req.params.id);
+    res.json({ data: state });
+  } catch (err: any) {
+    res.status(err.message.includes('não encontrado') ? 404 : 500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/bots/session/:id/logs
+ * Logs de um bot da sessão. Query: ?limit=100
+ */
+router.get('/session/:id/logs', requireManager, (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 100;
+    const logs = req.botManager!.getBotLogs(req.params.id, limit);
+    res.json({ data: logs, count: logs.length });
+  } catch (err: any) {
+    res.status(404).json({ error: err.message });
+  }
+});
 
 export default router;

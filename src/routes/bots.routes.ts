@@ -12,7 +12,7 @@
 // Apenas o admin pode criar/editar/eliminar bots do catálogo.
 // ============================================================
 
-import { Router, Request, Response, IRouter } from 'express';
+import express, { Router, Request, Response } from 'express';
 import { BotCatalog, CreateCatalogBotDto, UpdateCatalogBotDto } from '../bots/bot-catalog.js';
 import { BotManager } from '../bots/bot.manager.js';
 import logger from '@utils/logger.js';
@@ -28,7 +28,7 @@ declare global {
   }
 }
 
-const router: IRouter = Router();
+const router: express.Router = Router();
 
 // ─── Guard: requer BotManager (sessão WS activa) ─────────────
 

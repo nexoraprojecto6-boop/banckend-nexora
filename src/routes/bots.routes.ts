@@ -12,10 +12,9 @@
 // Apenas o admin pode criar/editar/eliminar bots do catálogo.
 // ============================================================
 
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, IRouter } from 'express';
 import { BotCatalog, CreateCatalogBotDto, UpdateCatalogBotDto } from '../bots/bot-catalog.js';
 import { BotManager } from '../bots/bot.manager.js';
-import { AppError } from '../types/errors.js';
 import logger from '@utils/logger.js';
 
 // ─── Extensão do Request para BotManager e papel do utilizador ──
@@ -24,12 +23,12 @@ declare global {
   namespace Express {
     interface Request {
       botManager?: BotManager;
-      isAdmin?: boolean;       // injectado pelo middleware do server.ts
+      isAdmin?: boolean;
     }
   }
 }
 
-const router = Router();
+const router: IRouter = Router();
 
 // ─── Guard: requer BotManager (sessão WS activa) ─────────────
 
@@ -55,11 +54,6 @@ function requireAdmin(req: Request, res: Response, next: () => void): void {
 // CATÁLOGO — Público (utilizadores autenticados)
 // ============================================================
 
-/**
- * GET /api/bots/catalog
- * Lista todos os bots activos do catálogo.
- * Utilizador escolhe um daqui para executar na sessão.
- */
 router.get('/catalog', async (_req, res) => {
   try {
     const bots = await BotCatalog.listActive();
@@ -70,10 +64,6 @@ router.get('/catalog', async (_req, res) => {
   }
 });
 
-/**
- * GET /api/bots/catalog/:id
- * Detalhes de um bot do catálogo (inclui defaultConfig para pré-preencher o form).
- */
 router.get('/catalog/:id', async (req, res) => {
   try {
     const bot = await BotCatalog.getById(req.params.id);
@@ -88,13 +78,9 @@ router.get('/catalog/:id', async (req, res) => {
 });
 
 // ============================================================
-// CATÁLOGO — Admin (gerir bots disponíveis)
+// CATÁLOGO — Admin
 // ============================================================
 
-/**
- * GET /api/bots/catalog/admin/all
- * Lista TODOS os bots (incluindo inactivos). Só admin.
- */
 router.get('/catalog/admin/all', requireAdmin, async (_req, res) => {
   try {
     const bots = await BotCatalog.listAll();
@@ -104,26 +90,9 @@ router.get('/catalog/admin/all', requireAdmin, async (_req, res) => {
   }
 });
 
-/**
- * POST /api/bots/catalog
- * Adiciona um novo bot ao catálogo. Só admin.
- *
- * Body: CreateCatalogBotDto
- * {
- *   name: string,
- *   description: string,
- *   strategy: BotStrategyType,
- *   defaultConfig: BotConfig,
- *   tags: string[],
- *   createdBy: string,
- *   isActive: boolean
- * }
- */
 router.post('/catalog', requireAdmin, async (req, res) => {
   try {
     const dto = req.body as CreateCatalogBotDto;
-
-    // Validações básicas
     if (!dto.name || typeof dto.name !== 'string') {
       res.status(400).json({ error: 'Campo "name" é obrigatório.' });
       return;
@@ -136,13 +105,11 @@ router.post('/catalog', requireAdmin, async (req, res) => {
       res.status(400).json({ error: 'defaultConfig.symbol e defaultConfig.contractType são obrigatórios.' });
       return;
     }
-
     const bot = await BotCatalog.create({
       ...dto,
-      tags: dto.tags ?? [],
+      tags:     dto.tags     ?? [],
       isActive: dto.isActive ?? true,
     });
-
     logger.info(`[BotRoutes] Admin criou bot no catálogo: ${bot.id}`);
     res.status(201).json({ data: bot });
   } catch (err: any) {
@@ -151,10 +118,6 @@ router.post('/catalog', requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * PUT /api/bots/catalog/:id
- * Actualiza um bot do catálogo. Só admin.
- */
 router.put('/catalog/:id', requireAdmin, async (req, res) => {
   try {
     const dto = req.body as UpdateCatalogBotDto;
@@ -169,11 +132,6 @@ router.put('/catalog/:id', requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * PATCH /api/bots/catalog/:id/toggle
- * Activa ou desactiva um bot do catálogo. Só admin.
- * Body: { isActive: boolean }
- */
 router.patch('/catalog/:id/toggle', requireAdmin, async (req, res) => {
   try {
     const { isActive } = req.body as { isActive: boolean };
@@ -192,10 +150,6 @@ router.patch('/catalog/:id/toggle', requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/bots/catalog/:id
- * Remove um bot do catálogo permanentemente. Só admin.
- */
 router.delete('/catalog/:id', requireAdmin, async (req, res) => {
   try {
     const deleted = await BotCatalog.delete(req.params.id);
@@ -210,14 +164,9 @@ router.delete('/catalog/:id', requireAdmin, async (req, res) => {
 });
 
 // ============================================================
-// SESSÃO — Bots activos do utilizador (BotManager da sessão WS)
+// SESSÃO — Bots activos do utilizador
 // ============================================================
 
-/**
- * GET /api/bots/session
- * Lista os bots em execução na sessão WS actual do utilizador.
- * Requer sessão WS autenticada (BotManager injectado pelo middleware do server.ts).
- */
 router.get('/session', requireManager, (req, res) => {
   try {
     const bots = req.botManager!.listBots();
@@ -227,10 +176,6 @@ router.get('/session', requireManager, (req, res) => {
   }
 });
 
-/**
- * GET /api/bots/session/:id
- * Estado detalhado de um bot da sessão.
- */
 router.get('/session/:id', requireManager, (req, res) => {
   try {
     const state = req.botManager!.getBotState(req.params.id);
@@ -240,10 +185,6 @@ router.get('/session/:id', requireManager, (req, res) => {
   }
 });
 
-/**
- * GET /api/bots/session/:id/logs
- * Logs de um bot da sessão. Query: ?limit=100
- */
 router.get('/session/:id/logs', requireManager, (req, res) => {
   try {
     const limit = parseInt(req.query.limit as string) || 100;

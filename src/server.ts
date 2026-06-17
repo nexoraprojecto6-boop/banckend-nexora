@@ -188,6 +188,20 @@ async function handleBotMessage(
   type: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
+  // ── Catálogo é público — não depende de autenticação nem do BotManager ──
+  // O utilizador deve poder ver os bots disponíveis mesmo antes de
+  // autenticar (ex: ao abrir a app, enquanto o login/OTP ainda decorre).
+  if (type === 'list_bots') {
+    try {
+      const bots = await BotCatalog.listActive();
+      sendToClient(ws, 'bots_list', { payload: bots });
+    } catch (err: any) {
+      logger.error('[WS] Erro ao listar catálogo de bots', { error: err.message });
+      sendError(ws, err.message ?? 'Erro ao listar catálogo', 'BOT_ERROR');
+    }
+    return;
+  }
+
   const manager = session.botManager;
   if (!manager) {
     sendError(ws, 'BotManager não disponível. Aguarda autenticação.', 'NO_MANAGER');
@@ -196,13 +210,6 @@ async function handleBotMessage(
 
   try {
     switch (type) {
-
-      // ── Listar bots do catálogo (bots disponíveis para usar) ──
-      case 'list_bots': {
-        const bots = await BotCatalog.listActive();
-        sendToClient(ws, 'bots_list', { payload: bots });
-        break;
-      }
 
       // ── Listar bots da sessão do utilizador ───────────────────
       case 'list_session_bots': {
@@ -564,7 +571,12 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
 
     // ── Mensagens de bots — INTERCEPTAR antes do proxy ────────
     if (type && BOT_MESSAGE_TYPES.has(type)) {
-      if (!session.authenticated) { sendError(ws, 'Not authenticated', 'NOT_AUTH'); return; }
+      // list_bots é público: o catálogo pode ser consultado mesmo
+      // antes (ou durante) a autenticação do cliente.
+      if (type !== 'list_bots' && !session.authenticated) {
+        sendError(ws, 'Not authenticated', 'NOT_AUTH');
+        return;
+      }
       await handleBotMessage(ws, session, type, payload);
       return;   // ← NÃO passa para a Deriv
     }

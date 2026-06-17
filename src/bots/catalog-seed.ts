@@ -36,7 +36,7 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // Usa ScalpingStrategy com maxConsecutiveLosses: 0 (sem pausa
   // automática por perdas consecutivas).
   {
-    name:        'Simple CALL/PUT',
+    name:        'GPT5.6',
     description: 'Abre contratos alternando CALL e PUT com stake fixo de $1. Sem ajuste de stake. Para automaticamente ao atingir $20 de perda ou $50 de lucro. Ideal para testar a ligação e ver o fluxo de trades em tempo real.',
     strategy:    'scalping',
     tags:        ['simples', 'iniciante', 'stake-fixo', 'teste'],
@@ -66,7 +66,7 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // Progressão: $1 → $2 → $4 → $8 → $16 → $32 → $64 (tecto)
   // ATENÇÃO: risco elevado — usar apenas em conta demo.
   {
-    name:        'Martingale Classic',
+    name:        'MORGAM',
     description: 'Duplica o stake após cada perda e reseta no ganho. Recupera perdas rapidamente, mas o risco cresce exponencialmente. Progressão máxima: $1→$2→$4→$8→$16→$32→$64. Recomendado apenas em conta demo.',
     strategy:    'martingale',
     tags:        ['martingale', 'risco-alto', 'recuperação', 'demo'],

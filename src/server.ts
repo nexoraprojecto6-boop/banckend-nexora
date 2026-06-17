@@ -25,6 +25,7 @@ import { BotManager } from './bots/bot.manager.js';
 import { BotCatalog } from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
 import { BotEvent, BotConfig, BotStrategyType } from './bots/bot.types.js';
+import { seedBotCatalog } from './bots/catalog-seed.js';
 
 // ─── Identificar admins ───────────────────────────────────────
 // Configura as contas admin via variável de ambiente:
@@ -683,6 +684,8 @@ const startServer = async () => {
     logger.info('Initializing data store...');
     await initRedis();
     logger.info(`Data store ready (Redis: ${isRedisConnected() ? 'connected' : 'unavailable'})`);
+
+    await seedBotCatalog();
 
     server.listen(config.server.port, config.server.host, () => {
       logger.info('Server started successfully', {

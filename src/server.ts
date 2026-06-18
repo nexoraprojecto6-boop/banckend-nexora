@@ -66,7 +66,11 @@ function sendToClient(ws: WebSocket, type: string, payload: Record<string, unkno
 }
 
 function sendError(ws: WebSocket, message: string, code = 'ERROR'): void {
-  sendToClient(ws, 'error', { code, message });
+  // O frontend lê msg.payload.message (ver use-nexora-ws.ts handleMessage).
+  // sendToClient faz spread do 2º argumento na raiz da mensagem, por isso
+  // aqui precisamos de aninhar explicitamente em "payload" para o formato
+  // ficar { type: 'error', payload: { code, message } }.
+  sendToClient(ws, 'error', { payload: { code, message } });
 }
 
 // ─── Proxy Deriv → Frontend ────────────────────────────────────
@@ -172,8 +176,11 @@ function initBotManagerForSession(clientWs: WebSocket, session: ClientSession): 
   const manager = new BotManager(adapter);
 
   // Reencaminhar todos os eventos do bot para o frontend
+  // O frontend (use-nexora-ws.ts) lê msg.payload.botId e msg.payload.*,
+  // por isso aninhamos tudo em "payload" — sendToClient faz spread do
+  // 2º argumento na raiz, então passamos { payload: {...} } explicitamente.
   manager.on('bot_event', (event: BotEvent) => {
-    sendToClient(clientWs, event.type, { botId: event.botId, ...event.payload });
+    sendToClient(clientWs, event.type, { payload: { botId: event.botId, ...event.payload } });
   });
 
   session.botManager = manager;

@@ -18,6 +18,36 @@ function genReqId(): number {
 }
 
 /**
+ * Mapeia valores de durationUnit legíveis para os códigos aceites pela Deriv API.
+ * A Deriv espera: "t" (ticks), "s" (seconds), "m" (minutes), "h" (hours), "d" (days)
+ */
+function mapDurationUnit(unit: string): string {
+  const map: Record<string, string> = {
+    ticks: 't',
+    tick: 't',
+    t: 't',
+    seconds: 's',
+    second: 's',
+    s: 's',
+    minutes: 'm',
+    minute: 'm',
+    m: 'm',
+    hours: 'h',
+    hour: 'h',
+    h: 'h',
+    days: 'd',
+    day: 'd',
+    d: 'd',
+  };
+  const mapped = map[unit.toLowerCase()];
+  if (!mapped) {
+    logger.warn('[DerivAdapter] durationUnit desconhecido, a usar tal-qual', { unit });
+    return unit;
+  }
+  return mapped;
+}
+
+/**
  * Cria um adapter a partir do WebSocket autenticado da sessão do cliente.
  * @param getDerivWs - callback que devolve o derivWs actual da sessão
  *                     (pode mudar se o cliente trocar de conta)
@@ -25,6 +55,10 @@ function genReqId(): number {
 export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivWsAdapter {
 
   // ─── buyContract ──────────────────────────────────────────
+  // Fluxo correcto segundo a documentação Deriv:
+  //   1. Enviar `proposal` com os parâmetros do contrato
+  //   2. Receber o `proposal.id`
+  //   3. Enviar `buy: proposalId` com o preço máximo aceite
 
   async function buyContract(params: {
     symbol: string;
@@ -39,21 +73,69 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
       throw new Error('Deriv WebSocket não está disponível');
     }
 
+    const durationUnit = mapDurationUnit(params.durationUnit);
+
+    // ── Passo 1: obter proposal ────────────────────────────
+    const proposalId = await new Promise<string>((resolve, reject) => {
+      const reqId = genReqId();
+
+      const payload = {
+        proposal: 1,
+        amount: params.stake,
+        basis: 'stake',
+        contract_type: params.contractType,
+        currency: params.currency,
+        duration: params.duration,
+        duration_unit: durationUnit,
+        underlying_symbol: params.symbol,
+        req_id: reqId,
+      };
+
+      const timer = setTimeout(() => {
+        ws.removeListener('message', handler);
+        reject(new Error('Timeout ao obter proposal'));
+      }, 30_000);
+
+      function handler(raw: Buffer | string) {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.req_id !== reqId) return;
+          clearTimeout(timer);
+          ws.removeListener('message', handler);
+
+          if (msg.error) {
+            reject(new Error(msg.error.message ?? 'Erro ao obter proposal'));
+            return;
+          }
+          if (msg.msg_type === 'proposal' && msg.proposal?.id) {
+            resolve(String(msg.proposal.id));
+          } else {
+            reject(new Error('Resposta proposal inválida'));
+          }
+        } catch {
+          // ignorar mensagens não relacionadas
+        }
+      }
+
+      ws.on('message', handler);
+      ws.send(JSON.stringify(payload));
+      logger.debug('[DerivAdapter] proposal enviado', {
+        reqId,
+        symbol: params.symbol,
+        contractType: params.contractType,
+        stake: params.stake,
+        duration: params.duration,
+        durationUnit,
+      });
+    });
+
+    // ── Passo 2: comprar com o proposal.id ────────────────
     return new Promise((resolve, reject) => {
       const reqId = genReqId();
 
       const payload = {
-        buy: 1,
+        buy: proposalId,
         price: params.stake,
-        parameters: {
-          amount: params.stake,
-          basis: 'stake',
-          contract_type: params.contractType,
-          currency: params.currency,
-          duration: params.duration,
-          duration_unit: params.durationUnit,
-          symbol: params.symbol,
-        },
         req_id: reqId,
       };
 
@@ -85,7 +167,7 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
 
       ws.on('message', handler);
       ws.send(JSON.stringify(payload));
-      logger.debug('[DerivAdapter] buy enviado', { reqId, symbol: params.symbol, stake: params.stake });
+      logger.debug('[DerivAdapter] buy enviado', { reqId, proposalId, stake: params.stake });
     });
   }
 

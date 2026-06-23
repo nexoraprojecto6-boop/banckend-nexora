@@ -95,6 +95,17 @@ export interface TradeResult {
 
 // ─── Eventos emitidos pelo bot ───────────────────────────────
 // Estes eventos são repassados via WebSocket ao frontend
+//
+// bot:goal_reached — emitido ANTES de bot:stopped quando o bot pára
+//   automaticamente por ter atingido uma condição de paragem (take
+//   profit, stop de perda, ou limite de trades). payload.reason
+//   identifica qual: 'max_profit_reached' | 'max_loss_reached' |
+//   'max_trades_reached'. O frontend usa isto para mostrar a
+//   mensagem certa ("Meta atingida!", "Stop de perda atingido", etc).
+//
+// bot:insufficient_balance — emitido quando uma compra falha por
+//   saldo insuficiente na conta Deriv (erro InsufficientBalance da
+//   API). O bot é parado automaticamente a seguir.
 
 export type BotEventType =
   | 'bot:started'
@@ -105,7 +116,9 @@ export type BotEventType =
   | 'bot:trade_opened'
   | 'bot:trade_closed'
   | 'bot:stats_updated'
-  | 'bot:log';
+  | 'bot:log'
+  | 'bot:goal_reached'
+  | 'bot:insufficient_balance';
 
 export interface BotEvent {
   type: BotEventType;

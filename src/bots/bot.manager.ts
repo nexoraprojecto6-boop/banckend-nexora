@@ -28,7 +28,11 @@ import { MartingaleStrategy } from './strategies/martingale.strategy.js';
 import { TrendFollowingStrategy } from './strategies/trend-following.strategy.js';
 import logger from '@utils/logger.js';
 
-// Todos os eventos emitidos pelas estratégias
+// Todos os eventos emitidos pelas estratégias.
+// bot:goal_reached e bot:insufficient_balance são emitidos pela
+// BaseStrategy antes de bot:stopped, para o frontend distinguir o
+// motivo exacto da paragem (meta atingida, stop de perda, saldo
+// insuficiente) em vez de um stop genérico.
 const BOT_EVENTS = [
   'bot:started',
   'bot:stopped',
@@ -39,6 +43,8 @@ const BOT_EVENTS = [
   'bot:trade_closed',
   'bot:stats_updated',
   'bot:log',
+  'bot:goal_reached',
+  'bot:insufficient_balance',
 ] as const;
 
 export class BotManager extends EventEmitter {

@@ -1,64 +1,51 @@
 // ============================================================
 // NEXORA FOREX — Deriv WS Adapter
 // ============================================================
-// Recebe o `derivWs` (WebSocket já autenticado via OTP) que
-// existe na sessão do cliente em server.ts e expõe os métodos
-// que as estratégias precisam: buyContract, waitForContract,
-// subscribeToTicks.
-//
-// Nenhuma nova ligação WebSocket é criada aqui.
+// Fluxo correcto da API Deriv para comprar um contrato:
+//   1. Enviar "proposal" com os parâmetros do contrato
+//   2. Aguardar resposta "proposal" com o id da proposta
+//   3. Enviar "buy" com o proposalId + ask_price
+//   4. Aguardar resposta "buy" com o contract_id
+//   5. Subscrever "proposal_open_contract" para acompanhar
+//   6. Resolver quando contract fecha (is_sold / status=sold)
 // ============================================================
 
 import { WebSocket } from 'ws';
 import { DerivWsAdapter } from './bot.types.js';
 import logger from '@utils/logger.js';
 
+// Preserva o código de erro da Deriv (ex: "InsufficientBalance",
+// "InputValidationFailed") para que as estratégias possam reagir de
+// forma específica, em vez de fazer parsing frágil da mensagem.
+export class DerivApiError extends Error {
+  code: string;
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = 'DerivApiError';
+    this.code = code;
+  }
+}
+
 function genReqId(): number {
   return Math.floor(Math.random() * 900_000) + 100_000;
 }
 
-/**
- * Mapeia valores de durationUnit legíveis para os códigos aceites pela Deriv API.
- * A Deriv espera: "t" (ticks), "s" (seconds), "m" (minutes), "h" (hours), "d" (days)
- */
-function mapDurationUnit(unit: string): string {
-  const map: Record<string, string> = {
-    ticks: 't',
-    tick: 't',
-    t: 't',
-    seconds: 's',
-    second: 's',
-    s: 's',
-    minutes: 'm',
-    minute: 'm',
-    m: 'm',
-    hours: 'h',
-    hour: 'h',
-    h: 'h',
-    days: 'd',
-    day: 'd',
-    d: 'd',
-  };
-  const mapped = map[unit.toLowerCase()];
-  if (!mapped) {
-    logger.warn('[DerivAdapter] durationUnit desconhecido, a usar tal-qual', { unit });
-    return unit;
-  }
-  return mapped;
+// ─── Mapeamento durationUnit → duration_unit da Deriv ────────
+// A Deriv usa "t" para ticks, não "ticks".
+// O BotConfig usa os valores legíveis: ticks, s, m, h, d.
+const DURATION_UNIT_MAP: Record<string, string> = {
+  ticks: 't',
+  s:     's',
+  m:     'm',
+  h:     'h',
+  d:     'd',
+  t:     't', // aceitar já no formato Deriv, por segurança
 }
 
-/**
- * Cria um adapter a partir do WebSocket autenticado da sessão do cliente.
- * @param getDerivWs - callback que devolve o derivWs actual da sessão
- *                     (pode mudar se o cliente trocar de conta)
- */
 export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivWsAdapter {
 
   // ─── buyContract ──────────────────────────────────────────
-  // Fluxo correcto segundo a documentação Deriv:
-  //   1. Enviar `proposal` com os parâmetros do contrato
-  //   2. Receber o `proposal.id`
-  //   3. Enviar `buy: proposalId` com o preço máximo aceite
+  // Fluxo: proposal → buy → contractId
 
   async function buyContract(params: {
     symbol: string;
@@ -73,28 +60,28 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
       throw new Error('Deriv WebSocket não está disponível');
     }
 
-    const durationUnit = mapDurationUnit(params.durationUnit);
+    const durationUnit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
 
-    // ── Passo 1: obter proposal ────────────────────────────
+    // ── Passo 1: pedir proposal ─────────────────────────────
     const proposalId = await new Promise<string>((resolve, reject) => {
       const reqId = genReqId();
 
-      const payload = {
-        proposal: 1,
-        amount: params.stake,
-        basis: 'stake',
-        contract_type: params.contractType,
-        currency: params.currency,
-        duration: params.duration,
-        duration_unit: durationUnit,
+      const proposalPayload = {
+        proposal:          1,
+        amount:            params.stake,
+        basis:             'stake',
+        contract_type:     params.contractType,
+        currency:          params.currency,
+        duration:          params.duration,
+        duration_unit:     durationUnit,
         underlying_symbol: params.symbol,
-        req_id: reqId,
+        req_id:            reqId,
       };
 
       const timer = setTimeout(() => {
         ws.removeListener('message', handler);
-        reject(new Error('Timeout ao obter proposal'));
-      }, 30_000);
+        reject(new Error('Timeout ao obter proposta'));
+      }, 15_000);
 
       function handler(raw: Buffer | string) {
         try {
@@ -104,13 +91,16 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
           ws.removeListener('message', handler);
 
           if (msg.error) {
-            reject(new Error(msg.error.message ?? 'Erro ao obter proposal'));
+            reject(new DerivApiError(
+              msg.error.message ?? 'Erro na proposta',
+              msg.error.code ?? 'UNKNOWN',
+            ));
             return;
           }
           if (msg.msg_type === 'proposal' && msg.proposal?.id) {
-            resolve(String(msg.proposal.id));
+            resolve(msg.proposal.id as string);
           } else {
-            reject(new Error('Resposta proposal inválida'));
+            reject(new Error('Resposta de proposal inválida'));
           }
         } catch {
           // ignorar mensagens não relacionadas
@@ -118,31 +108,28 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
       }
 
       ws.on('message', handler);
-      ws.send(JSON.stringify(payload));
-      logger.debug('[DerivAdapter] proposal enviado', {
-        reqId,
-        symbol: params.symbol,
-        contractType: params.contractType,
-        stake: params.stake,
-        duration: params.duration,
+      ws.send(JSON.stringify(proposalPayload));
+      logger.debug('[DerivAdapter] proposal enviada', {
+        reqId, symbol: params.symbol, stake: params.stake,
+        contractType: params.contractType, duration: params.duration,
         durationUnit,
       });
     });
 
-    // ── Passo 2: comprar com o proposal.id ────────────────
+    // ── Passo 2: comprar com o proposalId ──────────────────
     return new Promise((resolve, reject) => {
       const reqId = genReqId();
 
-      const payload = {
-        buy: proposalId,
-        price: params.stake,
+      const buyPayload = {
+        buy:    proposalId,
+        price:  params.stake,
         req_id: reqId,
       };
 
       const timer = setTimeout(() => {
         ws.removeListener('message', handler);
         reject(new Error('Timeout ao comprar contrato'));
-      }, 30_000);
+      }, 15_000);
 
       function handler(raw: Buffer | string) {
         try {
@@ -152,7 +139,10 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
           ws.removeListener('message', handler);
 
           if (msg.error) {
-            reject(new Error(msg.error.message ?? 'Erro ao comprar contrato'));
+            reject(new DerivApiError(
+              msg.error.message ?? 'Erro ao comprar contrato',
+              msg.error.code ?? 'UNKNOWN',
+            ));
             return;
           }
           if (msg.msg_type === 'buy' && msg.buy?.contract_id) {
@@ -166,12 +156,13 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
       }
 
       ws.on('message', handler);
-      ws.send(JSON.stringify(payload));
-      logger.debug('[DerivAdapter] buy enviado', { reqId, proposalId, stake: params.stake });
+      ws.send(JSON.stringify(buyPayload));
+      logger.debug('[DerivAdapter] buy enviado', { reqId, proposalId });
     });
   }
 
   // ─── waitForContract ──────────────────────────────────────
+  // Subscreve proposal_open_contract e resolve quando fechar.
 
   async function waitForContract(contractId: string): Promise<{
     profit: number;
@@ -189,9 +180,9 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
 
       ws.send(JSON.stringify({
         proposal_open_contract: 1,
-        contract_id: parseInt(contractId),
-        subscribe: 1,
-        req_id: reqId,
+        contract_id:            parseInt(contractId),
+        subscribe:              1,
+        req_id:                 reqId,
       }));
 
       const timer = setTimeout(() => {
@@ -213,16 +204,16 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
           const poc = msg.proposal_open_contract;
           if (!poc || String(poc.contract_id) !== contractId) return;
 
-          // Aguardar contrato encerrado
-          if (poc.status === 'sold' || poc.is_expired || poc.is_settleable) {
+          // Contrato fechado: status sold, ou expirado/liquidável
+          if (poc.status === 'sold' || poc.is_sold || poc.is_expired || poc.is_settleable) {
             clearTimeout(timer);
             ws.removeListener('message', handler);
             const profit = parseFloat(poc.profit ?? '0');
             resolve({
               profit,
-              won: profit > 0,
-              entryTick: poc.entry_tick ?? 0,
-              exitTick: poc.exit_tick ?? 0,
+              won:       profit > 0,
+              entryTick: poc.entry_tick   ?? 0,
+              exitTick:  poc.exit_tick    ?? 0,
             });
           }
         } catch {

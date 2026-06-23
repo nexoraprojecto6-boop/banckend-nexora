@@ -262,14 +262,22 @@ async function handleBotMessage(
           },
         };
 
-        const botState = manager.createBot({
+        const created = manager.createBot({
           name:     sessionName ?? catalogBot.name,
           strategy: catalogBot.strategy,
           config:   finalConfig,
         });
 
         // Inicia imediatamente após criar
-        await manager.startBot(botState.id);
+        await manager.startBot(created.id);
+
+        // IMPORTANTE: reler o estado depois de startBot() resolver.
+        // "created" é um snapshot tirado em createBot(), antes do bot
+        // arrancar — nessa altura o status ainda é 'idle'. Sem reler,
+        // o frontend recebia bot_created com status 'idle' e nunca
+        // detectava o bot como "running" (botão Play preso, barra de
+        // progresso parada, mesmo com o bot já a operar no backend).
+        const botState = manager.getBotState(created.id);
 
         sendToClient(ws, 'bot_created', {
           payload: {

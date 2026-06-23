@@ -16,6 +16,7 @@ import {
   TradeResult,
   DerivWsAdapter,
 } from '../bot.types.js';
+import { DerivApiError } from '../deriv-ws.adapter.js';
 
 export function createInitialStats(initialStake: number): BotStats {
   return {
@@ -121,6 +122,14 @@ export abstract class BaseStrategy extends EventEmitter {
         await this.tick();
         this.checkStopConditions();
       } catch (err) {
+        if (err instanceof DerivApiError && err.code === 'InsufficientBalance') {
+          this.log('error', 'Saldo insuficiente para abrir o contrato — bot parado.');
+          this.emit('bot:insufficient_balance', this.buildEvent('bot:insufficient_balance', {
+            message: err.message,
+          }));
+          await this.stop('insufficient_balance');
+          return;
+        }
         const msg = err instanceof Error ? err.message : String(err);
         this.log('error', `Erro no tick: ${msg}`);
         this.setError(msg);
@@ -130,13 +139,35 @@ export abstract class BaseStrategy extends EventEmitter {
   }
 
   // ─── Verificação de condições de parada ───────────────────
+  // Emite bot:goal_reached com o motivo exacto ANTES de parar,
+  // para o frontend poder mostrar uma mensagem clara: meta atingida
+  // (take profit), stop de perda (max loss), ou limite de trades.
 
   protected checkStopConditions(): void {
     const { maxTrades, maxLoss, maxProfit } = this.state.config;
     const { totalTrades, totalLoss, netPnL } = this.state.stats;
-    if (maxTrades && maxTrades > 0 && totalTrades >= maxTrades) { this.stop('max_trades_reached'); return; }
-    if (maxLoss && totalLoss >= maxLoss) { this.stop('max_loss_reached'); return; }
-    if (maxProfit && netPnL >= maxProfit) { this.stop('max_profit_reached'); return; }
+
+    if (maxTrades && maxTrades > 0 && totalTrades >= maxTrades) {
+      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
+        reason: 'max_trades_reached', totalTrades, maxTrades,
+      }));
+      this.stop('max_trades_reached');
+      return;
+    }
+    if (maxLoss && totalLoss >= maxLoss) {
+      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
+        reason: 'max_loss_reached', totalLoss, maxLoss,
+      }));
+      this.stop('max_loss_reached');
+      return;
+    }
+    if (maxProfit && netPnL >= maxProfit) {
+      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
+        reason: 'max_profit_reached', netPnL, maxProfit,
+      }));
+      this.stop('max_profit_reached');
+      return;
+    }
   }
 
   // ─── Registo de resultado de trade ───────────────────────
@@ -160,11 +191,16 @@ export abstract class BaseStrategy extends EventEmitter {
     s.peakProfit = Math.max(s.peakProfit, s.netPnL);
     s.maxDrawdown = Math.max(s.maxDrawdown, s.peakProfit - s.netPnL);
 
+    // contractType incluído para a UI mostrar a coluna "Tipo" (ex: CALL,
+    // PUT, DIGITOVER), e entryTick/exitTick para a coluna "Tick Final".
     this.emit('bot:trade_closed', this.buildEvent('bot:trade_closed', {
-      contractId: result.contractId,
-      profit: result.profit,
-      won: result.won,
-      stake: result.stake,
+      contractId:   result.contractId,
+      profit:       result.profit,
+      won:          result.won,
+      stake:        result.stake,
+      entryTick:    result.entryTick,
+      exitTick:     result.exitTick,
+      contractType: this.state.config.contractType,
     }));
     this.emit('bot:stats_updated', this.buildEvent('bot:stats_updated', { stats: { ...s } }));
   }

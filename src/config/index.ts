@@ -21,6 +21,17 @@ const configSchema = z.object({
     redirectUri: z.string().url().default('http://localhost:3001/api/auth/callback'),
     appId: z.string().min(1, 'DERIV_APP_ID is required'),
   }),
+  // ─── Afiliado ─────────────────────────────────────────────
+  // Aplicados por defeito em todos os pedidos de signup
+  // (prompt=registration), para atribuir novos registos à conta
+  // de parceiro Deriv. O frontend pode sobrepor via query params
+  // se precisar de uma campanha diferente; estes são só o fallback.
+  affiliate: z.object({
+    sidc: z.string().default(''),
+    utmSource: z.string().default(''),
+    utmMedium: z.string().default('affiliate'),
+    utmCampaign: z.string().default('nexora'),
+  }),
   frontend: z.object({
     url: z.string().url().default('http://localhost:3000'),
     prodUrl: z.string().url().default('https://yourdomain.com'),
@@ -70,6 +81,14 @@ const envConfig = {
     clientSecret: process.env.DERIV_CLIENT_SECRET || '',
     redirectUri: process.env.DERIV_REDIRECT_URI || 'http://localhost:3001/api/auth/callback',
     appId: process.env.DERIV_APP_ID || '',
+  },
+  // Valores por defeito já preenchidos com os dados confirmados.
+  // Podem ser sobrepostos via env vars no Railway sem precisar de rebuild.
+  affiliate: {
+    sidc: process.env.DERIV_AFFILIATE_SIDC || 'C52M9QNQNANN',
+    utmSource: process.env.DERIV_AFFILIATE_UTM_SOURCE || '3224',
+    utmMedium: process.env.DERIV_AFFILIATE_UTM_MEDIUM || 'affiliate',
+    utmCampaign: process.env.DERIV_AFFILIATE_UTM_CAMPAIGN || 'nexora',
   },
   frontend: {
     url: process.env.FRONTEND_URL || 'http://localhost:3000',

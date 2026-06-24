@@ -8,6 +8,16 @@
 //   4. Aguardar resposta "buy" com o contract_id
 //   5. Subscrever "proposal_open_contract" para acompanhar
 //   6. Resolver quando contract fecha (is_sold / status=sold)
+//
+// ─── Notas de robustez sob carga (centenas de sessões simultâneas) ───
+// Cada chamada a buyContract/waitForContract regista um listener
+// 'message' temporário no WebSocket da sessão. Com muitos bots a
+// abrir/fechar trades ao mesmo tempo, é crítico garantir que esse
+// listener é SEMPRE removido — mesmo em caminhos de erro, timeout,
+// ou se o `ws` da sessão for substituído a meio (troca de conta).
+// Sem isto, listeners mortos acumulam-se: cada mensagem recebida do
+// WS passa por todos eles (custo O(n) por mensagem), e a memória
+// cresce de forma não controlada ao longo do tempo.
 // ============================================================
 
 import { WebSocket } from 'ws';
@@ -31,15 +41,26 @@ function genReqId(): number {
 }
 
 // ─── Mapeamento durationUnit → duration_unit da Deriv ────────
-// A Deriv usa "t" para ticks, não "ticks".
-// O BotConfig usa os valores legíveis: ticks, s, m, h, d.
 const DURATION_UNIT_MAP: Record<string, string> = {
   ticks: 't',
   s:     's',
   m:     'm',
   h:     'h',
   d:     'd',
-  t:     't', // aceitar já no formato Deriv, por segurança
+  t:     't',
+};
+
+// Limite de segurança: se uma única ligação WS acumular mais do que
+// isto em listeners 'message' activos, há uma fuga de algum tipo
+// (cleanup a falhar em algum caminho). Regista um aviso para
+// investigação em vez de deixar crescer silenciosamente.
+const MAX_SAFE_LISTENERS = 50;
+
+function warnIfListenerLeak(ws: WebSocket, context: string): void {
+  const count = ws.listenerCount('message');
+  if (count > MAX_SAFE_LISTENERS) {
+    logger.warn('[DerivAdapter] Possível fuga de listeners detectada', { context, count });
+  }
 }
 
 export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivWsAdapter {
@@ -65,6 +86,49 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
     // ── Passo 1: pedir proposal ─────────────────────────────
     const proposalId = await new Promise<string>((resolve, reject) => {
       const reqId = genReqId();
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+
+      function cleanup() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ws.removeListener('message', handler);
+      }
+
+      function handler(raw: Buffer | string) {
+        if (settled) return; // protege contra mensagens tardias pós-cleanup
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.req_id !== reqId) return;
+
+          if (msg.error) {
+            cleanup();
+            reject(new DerivApiError(
+              msg.error.message ?? 'Erro na proposta',
+              msg.error.code ?? 'UNKNOWN',
+            ));
+            return;
+          }
+          if (msg.msg_type === 'proposal' && msg.proposal?.id) {
+            cleanup();
+            resolve(msg.proposal.id as string);
+          } else {
+            cleanup();
+            reject(new Error('Resposta de proposal inválida'));
+          }
+        } catch {
+          // ignorar mensagens não relacionadas (não JSON, ou de outro req)
+        }
+      }
+
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Timeout ao obter proposta'));
+      }, 15_000);
+
+      ws.on('message', handler);
+      warnIfListenerLeak(ws, 'buyContract:proposal');
 
       const proposalPayload = {
         proposal:          1,
@@ -77,37 +141,6 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
         underlying_symbol: params.symbol,
         req_id:            reqId,
       };
-
-      const timer = setTimeout(() => {
-        ws.removeListener('message', handler);
-        reject(new Error('Timeout ao obter proposta'));
-      }, 15_000);
-
-      function handler(raw: Buffer | string) {
-        try {
-          const msg = JSON.parse(raw.toString());
-          if (msg.req_id !== reqId) return;
-          clearTimeout(timer);
-          ws.removeListener('message', handler);
-
-          if (msg.error) {
-            reject(new DerivApiError(
-              msg.error.message ?? 'Erro na proposta',
-              msg.error.code ?? 'UNKNOWN',
-            ));
-            return;
-          }
-          if (msg.msg_type === 'proposal' && msg.proposal?.id) {
-            resolve(msg.proposal.id as string);
-          } else {
-            reject(new Error('Resposta de proposal inválida'));
-          }
-        } catch {
-          // ignorar mensagens não relacionadas
-        }
-      }
-
-      ws.on('message', handler);
       ws.send(JSON.stringify(proposalPayload));
       logger.debug('[DerivAdapter] proposal enviada', {
         reqId, symbol: params.symbol, stake: params.stake,
@@ -117,28 +150,33 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
     });
 
     // ── Passo 2: comprar com o proposalId ──────────────────
+    // Reler getDerivWs() — se a sessão trocou de conta entre o passo 1
+    // e aqui, o ws antigo pode já não ser válido.
+    const ws2 = getDerivWs();
+    if (!ws2 || ws2.readyState !== WebSocket.OPEN) {
+      throw new Error('Deriv WebSocket não está disponível (após proposal)');
+    }
+
     return new Promise((resolve, reject) => {
       const reqId = genReqId();
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
 
-      const buyPayload = {
-        buy:    proposalId,
-        price:  params.stake,
-        req_id: reqId,
-      };
-
-      const timer = setTimeout(() => {
-        ws.removeListener('message', handler);
-        reject(new Error('Timeout ao comprar contrato'));
-      }, 15_000);
+      function cleanup() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ws2!.removeListener('message', handler);
+      }
 
       function handler(raw: Buffer | string) {
+        if (settled) return;
         try {
           const msg = JSON.parse(raw.toString());
           if (msg.req_id !== reqId) return;
-          clearTimeout(timer);
-          ws.removeListener('message', handler);
 
           if (msg.error) {
+            cleanup();
             reject(new DerivApiError(
               msg.error.message ?? 'Erro ao comprar contrato',
               msg.error.code ?? 'UNKNOWN',
@@ -146,8 +184,10 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
             return;
           }
           if (msg.msg_type === 'buy' && msg.buy?.contract_id) {
+            cleanup();
             resolve({ contractId: String(msg.buy.contract_id) });
           } else {
+            cleanup();
             reject(new Error('Resposta buy inválida'));
           }
         } catch {
@@ -155,14 +195,25 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
         }
       }
 
-      ws.on('message', handler);
-      ws.send(JSON.stringify(buyPayload));
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Timeout ao comprar contrato'));
+      }, 15_000);
+
+      ws2.on('message', handler);
+      warnIfListenerLeak(ws2, 'buyContract:buy');
+
+      ws2.send(JSON.stringify({ buy: proposalId, price: params.stake, req_id: reqId }));
       logger.debug('[DerivAdapter] buy enviado', { reqId, proposalId });
     });
   }
 
   // ─── waitForContract ──────────────────────────────────────
   // Subscreve proposal_open_contract e resolve quando fechar.
+  // Timeout reduzido para 35s — contratos de duração curta (ticks/
+  // segundos, o caso comum dos bots do catálogo) resolvem bem dentro
+  // disto; 120s deixava listeners pendentes vivos demasiado tempo
+  // sob carga alta, agravando o custo O(n) por mensagem recebida.
 
   async function waitForContract(contractId: string): Promise<{
     profit: number;
@@ -177,43 +228,46 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
 
     return new Promise((resolve, reject) => {
       const reqId = genReqId();
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      let subscriptionId: string | null = null;
 
-      ws.send(JSON.stringify({
-        proposal_open_contract: 1,
-        contract_id:            parseInt(contractId),
-        subscribe:              1,
-        req_id:                 reqId,
-      }));
-
-      const timer = setTimeout(() => {
+      function cleanup() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         ws.removeListener('message', handler);
-        reject(new Error('Timeout aguardando resultado do contrato'));
-      }, 120_000);
+        // Cancela a subscrição na Deriv para não continuar a receber
+        // updates deste contrato depois de já termos o resultado.
+        if (subscriptionId && ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ forget: subscriptionId })); } catch { /* ignorar */ }
+        }
+      }
 
       function handler(raw: Buffer | string) {
+        if (settled) return;
         try {
           const msg = JSON.parse(raw.toString());
 
           if (msg.error && msg.req_id === reqId) {
-            clearTimeout(timer);
-            ws.removeListener('message', handler);
-            reject(new Error(msg.error.message));
+            cleanup();
+            reject(new DerivApiError(msg.error.message ?? 'Erro ao acompanhar contrato', msg.error.code ?? 'UNKNOWN'));
             return;
           }
 
           const poc = msg.proposal_open_contract;
           if (!poc || String(poc.contract_id) !== contractId) return;
 
-          // Contrato fechado: status sold, ou expirado/liquidável
+          if (poc.id && !subscriptionId) subscriptionId = poc.id as string;
+
           if (poc.status === 'sold' || poc.is_sold || poc.is_expired || poc.is_settleable) {
-            clearTimeout(timer);
-            ws.removeListener('message', handler);
+            cleanup();
             const profit = parseFloat(poc.profit ?? '0');
             resolve({
               profit,
               won:       profit > 0,
-              entryTick: poc.entry_tick   ?? 0,
-              exitTick:  poc.exit_tick    ?? 0,
+              entryTick: poc.entry_tick ?? 0,
+              exitTick:  poc.exit_tick  ?? 0,
             });
           }
         } catch {
@@ -221,7 +275,20 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
         }
       }
 
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Timeout aguardando resultado do contrato'));
+      }, 35_000);
+
       ws.on('message', handler);
+      warnIfListenerLeak(ws, 'waitForContract');
+
+      ws.send(JSON.stringify({
+        proposal_open_contract: 1,
+        contract_id:            parseInt(contractId),
+        subscribe:              1,
+        req_id:                 reqId,
+      }));
     });
   }
 
@@ -239,10 +306,10 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
 
     const reqId = genReqId();
     let subId: string | null = null;
-
-    ws.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: reqId }));
+    let unsubscribed = false;
 
     function handler(raw: Buffer | string) {
+      if (unsubscribed) return;
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.msg_type === 'tick' && msg.tick?.symbol === symbol) {
@@ -255,10 +322,14 @@ export function createDerivWsAdapter(getDerivWs: () => WebSocket | null): DerivW
     }
 
     ws.on('message', handler);
+    warnIfListenerLeak(ws, 'subscribeToTicks');
+    ws.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: reqId }));
     logger.debug('[DerivAdapter] Subscrito a ticks', { symbol });
 
     return {
       unsubscribe: () => {
+        if (unsubscribed) return;
+        unsubscribed = true;
         ws.removeListener('message', handler);
         if (subId && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ forget: subId }));

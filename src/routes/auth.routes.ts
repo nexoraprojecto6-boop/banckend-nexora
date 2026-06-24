@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { AuthService } from '@services/auth.service.js';
 import { DerivAPIService } from '@services/deriv-api.service.js';
 import { authLimiter } from '@middleware/security.js';
+import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
 
 const router: Router = Router();
@@ -10,14 +11,26 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://teu-frontend.vercel.ap
 
 /**
  * GET /api/auth/login
+ *
+ * Para signup (prompt=registration), aplica por defeito os parâmetros
+ * de afiliado configurados em config.affiliate (sidc/utm_*), para que
+ * todo novo registo feito através da plataforma seja atribuído à conta
+ * de parceiro Deriv. O frontend pode sobrepor explicitamente via query
+ * string se precisar de uma campanha diferente.
  */
 router.get('/login', authLimiter, (req: Request, res: Response, next: NextFunction) => {
   try {
     const prompt = (req.query.prompt as 'login' | 'registration') || 'login';
-    const sidc = req.query.sidc as string | undefined;
-    const utmCampaign = req.query.utm_campaign as string | undefined;
-    const utmMedium = req.query.utm_medium as string | undefined;
-    const utmSource = req.query.utm_source as string | undefined;
+    const isSignup = prompt === 'registration';
+
+    const sidc = (req.query.sidc as string | undefined)
+      ?? (isSignup ? config.affiliate.sidc : undefined);
+    const utmCampaign = (req.query.utm_campaign as string | undefined)
+      ?? (isSignup ? config.affiliate.utmCampaign : undefined);
+    const utmMedium = (req.query.utm_medium as string | undefined)
+      ?? (isSignup ? config.affiliate.utmMedium : undefined);
+    const utmSource = (req.query.utm_source as string | undefined)
+      ?? (isSignup ? config.affiliate.utmSource : undefined);
 
     const authUrl = AuthService.buildAuthorizationUrl({
       prompt,
@@ -27,7 +40,7 @@ router.get('/login', authLimiter, (req: Request, res: Response, next: NextFuncti
       utmSource,
     });
 
-    logger.info('Login initiated', { prompt });
+    logger.info('Login initiated', { prompt, withAffiliate: isSignup });
     res.json({ authUrl });
   } catch (error) {
     logger.error('Login failed', { error });
@@ -70,13 +83,16 @@ router.get('/callback', authLimiter, async (req: Request, res: Response, next: N
 
 /**
  * GET /api/auth/signup
+ *
+ * Aplica sempre os parâmetros de afiliado por defeito (config.affiliate),
+ * a menos que o chamador sobreponha explicitamente via query string.
  */
 router.get('/signup', authLimiter, (req: Request, res: Response, next: NextFunction) => {
   try {
-    const sidc = req.query.sidc as string | undefined;
-    const utmCampaign = req.query.utm_campaign as string | undefined;
-    const utmMedium = req.query.utm_medium as string | undefined;
-    const utmSource = req.query.utm_source as string | undefined;
+    const sidc = (req.query.sidc as string | undefined) ?? config.affiliate.sidc;
+    const utmCampaign = (req.query.utm_campaign as string | undefined) ?? config.affiliate.utmCampaign;
+    const utmMedium = (req.query.utm_medium as string | undefined) ?? config.affiliate.utmMedium;
+    const utmSource = (req.query.utm_source as string | undefined) ?? config.affiliate.utmSource;
 
     const signupUrl = AuthService.buildAuthorizationUrl({
       prompt: 'registration',
@@ -86,7 +102,7 @@ router.get('/signup', authLimiter, (req: Request, res: Response, next: NextFunct
       utmSource,
     });
 
-    logger.info('Signup initiated');
+    logger.info('Signup initiated', { withAffiliate: true });
     res.json({ signupUrl });
   } catch (error) {
     logger.error('Signup failed', { error });

@@ -4,7 +4,6 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
-
 // Helmet middleware
 export const helmetMiddleware = helmet({
   contentSecurityPolicy: {
@@ -24,7 +23,6 @@ export const helmetMiddleware = helmet({
   noSniff: true,
   xssFilter: true,
 });
-
 // CORS middleware
 export const corsMiddleware = cors({
   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
@@ -42,15 +40,20 @@ export const corsMiddleware = cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  // FIX: adicionado 'Deriv-App-ID' que a Deriv exige em todas as chamadas REST
+  // FIX: 'Deriv-App-ID' exigido pela Deriv em chamadas REST.
+  // FIX: 'x-cr' adicionado — usado por api.checkAdmin() no frontend
+  // para identificar a conta ao verificar privilégios de admin; sem
+  // estar aqui, o browser bloqueia o preflight CORS e a chamada
+  // nunca chega ao backend (erro visto: "Request header field x-cr
+  // is not allowed by Access-Control-Allow-Headers").
   allowedHeaders: [
     'Content-Type',
     'Authorization',
     'Deriv-App-ID',
+    'x-cr',
   ],
   maxAge: 86400,
 });
-
 // Rate limiting
 const createRateLimiter = (windowMs: number, max: number) =>
   rateLimit({
@@ -72,22 +75,18 @@ const createRateLimiter = (windowMs: number, max: number) =>
       });
     },
   });
-
 export const apiLimiter = createRateLimiter(
   config.rateLimit.windowMs,
   config.rateLimit.maxRequests
 );
-
 export const authLimiter = createRateLimiter(
   15 * 60 * 1000,
   5
 );
-
 export const wsLimiter = createRateLimiter(
   1000,
   10
 );
-
 // Request logging middleware
 export const requestLoggerMiddleware = (
   req: Request,
@@ -107,11 +106,9 @@ export const requestLoggerMiddleware = (
   });
   next();
 };
-
 export const sanitizationMiddleware: RequestHandler = express.json({
   limit: '10mb',
 });
-
 export const urlEncodedMiddleware: RequestHandler = express.urlencoded({
   extended: true,
   limit: '10mb',

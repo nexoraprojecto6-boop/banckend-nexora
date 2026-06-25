@@ -20,6 +20,7 @@ import accountRoutes from '@routes/accounts.routes.js';
 import tradingRoutes from '@routes/trading.routes.js';
 import botsRoutes from '@routes/bots.routes.js';
 import adminRoutes from '@routes/admin.routes.js';
+import labelsRoutes from '@routes/labels.routes.js';
 import { AuthService } from '@services/auth.service.js';
 import { DerivAPIService } from '@services/deriv-api.service.js';
 import { BotManager } from './bots/bot.manager.js';
@@ -717,6 +718,7 @@ app.use('/api/accounts', accountRoutes);
 app.use('/api/trading',  tradingRoutes);
 app.use('/api/bots',     botsRoutes);
 app.use('/api/admin',    adminRoutes);
+app.use('/api/admin/labels', labelsRoutes);
 
 // ============================================
 // Error Handlers

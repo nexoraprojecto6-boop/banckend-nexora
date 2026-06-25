@@ -19,6 +19,7 @@ import authRoutes from '@routes/auth.routes.js';
 import accountRoutes from '@routes/accounts.routes.js';
 import tradingRoutes from '@routes/trading.routes.js';
 import botsRoutes from '@routes/bots.routes.js';
+import adminRoutes from '@routes/admin.routes.js';
 import { AuthService } from '@services/auth.service.js';
 import { DerivAPIService } from '@services/deriv-api.service.js';
 import { BotManager } from './bots/bot.manager.js';
@@ -675,6 +676,25 @@ app.use('/api/bots', (req: Request, _res: Response, next: NextFunction) => {
   next();
 });
 
+// ============================================================
+// Online Count (real, não simulado)
+// ============================================================
+// Conta sessões AUTENTICADAS (não apenas ligações WS em aberto —
+// uma ligação pode estar a meio do handshake de auth, ou ser
+// puramente o WS público antes do login). Esta é a métrica honesta
+// de "quantos utilizadores estão realmente online" para mostrar
+// na UI, em vez de qualquer número inventado.
+app.get('/api/online-count', (_req, res) => {
+  let authenticated = 0;
+  for (const [, session] of sessions) {
+    if (session.authenticated) authenticated++;
+  }
+  res.json({
+    count:          authenticated,
+    totalConnections: wss.clients.size,
+  });
+});
+
 // ============================================
 // Health Check
 // ============================================
@@ -696,6 +716,7 @@ app.use('/api/auth',     authRoutes);
 app.use('/api/accounts', accountRoutes);
 app.use('/api/trading',  tradingRoutes);
 app.use('/api/bots',     botsRoutes);
+app.use('/api/admin',    adminRoutes);
 
 // ============================================
 // Error Handlers

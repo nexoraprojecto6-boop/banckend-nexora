@@ -1,20 +1,55 @@
 import { WebSocketManager } from '@websocket/manager.js';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
+import { DerivAPIService } from './deriv-api.service.js';
 import { ProposalRequest, BuyRequest, SellRequest, ContractUpdate } from '../types/schemas.js';
 
 export class TradingService {
   // público para permitir acesso direto em trading.routes.ts
   public wsManager: WebSocketManager;
 
-  constructor(otpUrl: string) {
+  /**
+   * Duas formas de instanciar:
+   *
+   *   new TradingService(otpUrl)
+   *     → mantido por retrocompatibilidade. Usa uma URL fixa; se a
+   *       ligação cair, o reconnect tenta reutilizar a MESMA url, o
+   *       que falha sempre que a Deriv emitiu essa URL com um OTP de
+   *       uso único (o sintoma é "autentica e cai logo a seguir",
+   *       em ciclo, até esgotar as tentativas).
+   *
+   *   new TradingService(otpUrl, { token, accountId })
+   *     → RECOMENDADO. Com token+accountId, cada reconexão pede um
+   *       OTP novo à Deriv antes de tentar ligar — resolve o ciclo
+   *       de desconexão na origem.
+   */
+  constructor(otpUrl: string, refresh?: { token: string; accountId: string }) {
     this.wsManager = new WebSocketManager({
-      url: otpUrl,
+      ...(refresh
+        ? { getUrl: () => TradingService.fetchFreshUrl(refresh.token, refresh.accountId) }
+        : { url: otpUrl }),
       autoConnect: true,
       heartbeatInterval: config.websocket.heartbeatInterval,
       reconnectMaxAttempts: config.websocket.reconnectMaxAttempts,
       reconnectDelay: config.websocket.reconnectDelay,
     });
+
+    if (!refresh) {
+      logger.warn(
+        '[TradingService] Instanciado sem token/accountId — reconexões reutilizarão a mesma URL/OTP ' +
+        'e podem falhar em ciclo. Prefira new TradingService(otpUrl, { token, accountId }).',
+      );
+    }
+  }
+
+  private static async fetchFreshUrl(token: string, accountId: string): Promise<string> {
+    const derivAPI = new DerivAPIService(token);
+    const otpData = await derivAPI.getOTP(accountId);
+    const wsUrl: string = otpData?.url || otpData?.wsUrl;
+    if (!wsUrl) {
+      throw new Error('Failed to get WebSocket URL (OTP)');
+    }
+    return wsUrl;
   }
 
   async getActiveSymbols(detailed = false) {

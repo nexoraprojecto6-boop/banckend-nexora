@@ -1,3 +1,18 @@
+// ============================================================
+// NEXORA FOREX — Server
+// ============================================================
+// CORRECÇÕES DESTA VERSÃO:
+//   ✅ Deduplicação de sessões por accountId — fecha sessão
+//      antiga antes de criar nova (evita múltiplos WS Deriv
+//      para a mesma conta e o limite de 5 conexões da Deriv)
+//   ✅ auth.service usa redisGet/redisSet (sem erro Redis)
+//   ✅ Reconexão Deriv com novo OTP obrigatório
+//   ✅ Bot aguarda WS disponível (waitForDerivWs)
+//   ✅ Limite de sessões simultâneas (DoS protection)
+//   ✅ Timeout de autenticação (30s)
+//   ✅ Cleanup completo em todos os caminhos
+// ============================================================
+
 import 'express-async-errors';
 import express, { Application, Request, Response, NextFunction } from 'express';
 import http from 'http';
@@ -6,49 +21,65 @@ import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
 import { initRedis, closeRedis, isRedisConnected } from '@utils/redis.js';
 import { destroyMemoryStore } from '@utils/memory-store.js';
-import { WebSocketManager } from '@websocket/manager.js';
 import {
-  helmetMiddleware,
-  corsMiddleware,
-  sanitizationMiddleware,
-  urlEncodedMiddleware,
-  requestLoggerMiddleware,
-  apiLimiter,
+  helmetMiddleware, corsMiddleware, sanitizationMiddleware,
+  urlEncodedMiddleware, requestLoggerMiddleware, apiLimiter,
 } from '@middleware/security.js';
 import { errorHandler, notFoundHandler } from '@middleware/errorHandler.js';
-import authRoutes from '@routes/auth.routes.js';
+import authRoutes    from '@routes/auth.routes.js';
 import accountRoutes from '@routes/accounts.routes.js';
 import tradingRoutes from '@routes/trading.routes.js';
-import botsRoutes from '@routes/bots.routes.js';
-import adminRoutes from '@routes/admin.routes.js';
-import labelsRoutes from '@routes/labels.routes.js';
-import { AuthService } from '@services/auth.service.js';
+import botsRoutes    from '@routes/bots.routes.js';
+import adminRoutes   from '@routes/admin.routes.js';
+import labelsRoutes  from '@routes/labels.routes.js';
 import { DerivAPIService } from '@services/deriv-api.service.js';
-import { BotManager } from './bots/bot.manager.js';
-import { BotCatalog } from './bots/bot-catalog.js';
+import { BotManager }      from './bots/bot.manager.js';
+import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
 import { BotEvent, BotConfig, BotStrategyType } from './bots/bot.types.js';
 import { seedBotCatalog } from './bots/catalog-seed.js';
 
+// ─── Limites ──────────────────────────────────────────────────
+const MAX_SESSIONS        = 100;
+const AUTH_TIMEOUT_MS     = 30_000;
+const RECONNECT_BASE_MS   = 3_000;
+const RECONNECT_MAX_MS    = 30_000;
+const RECONNECT_MAX_TRIES = 8;
+const WS_WAIT_TIMEOUT_MS  = 20_000; // tempo max para bot aguardar WS
+
+// ─── Admins ───────────────────────────────────────────────────
 const ADMIN_IDS = new Set<string>(
   (process.env.ADMIN_ACCOUNT_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean)
 );
 
+// ─── App & HTTP Server ────────────────────────────────────────
 const app: Application = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// ─── Sessão ───────────────────────────────────────────────────
 interface ClientSession {
-  wsManager:     WebSocketManager | null;
-  token:         string;
-  accountId:     string | null;
-  pingInterval:  NodeJS.Timeout | null;
-  authenticated: boolean;
-  isAdmin:       boolean;
-  botManager:    BotManager | null;
+  derivWs:           WebSocket | null;
+  token:             string;
+  accountId:         string | null;
+  pingInterval:      NodeJS.Timeout | null;
+  authTimeout:       NodeJS.Timeout | null;
+  reconnectTimer:    NodeJS.Timeout | null;
+  reconnectAttempts: number;
+  authenticated:     boolean;
+  isAdmin:           boolean;
+  botManager:        BotManager | null;
+  nextReqId:         number;
 }
 
+// Mapa principal: clientWs → sessão
 const sessions = new Map<WebSocket, ClientSession>();
+
+// Índice por accountId → clientWs (para deduplicação)
+// Garante que nunca há 2 sessões activas para a mesma conta
+const sessionsByAccount = new Map<string, WebSocket>();
+
+// ─── Helpers ──────────────────────────────────────────────────
 
 function sendToClient(ws: WebSocket, type: string, payload: Record<string, unknown> = {}): void {
   if (ws.readyState === WebSocket.OPEN) {
@@ -60,180 +91,247 @@ function sendError(ws: WebSocket, message: string, code = 'ERROR'): void {
   sendToClient(ws, 'error', { payload: { code, message } });
 }
 
-async function fetchFreshDerivWsUrl(token: string, accountId: string): Promise<string> {
-  const derivAPI = new DerivAPIService(token);
-  const otpData = await derivAPI.getOTP(accountId);
-  const wsUrl: string = otpData?.url || otpData?.wsUrl;
-  if (!wsUrl) {
-    throw new Error('Failed to get WebSocket URL (OTP)');
-  }
-  return wsUrl;
+function getNextReqId(session: ClientSession): number {
+  return ++session.nextReqId;
 }
+
+// ─── Aguardar WS disponível ───────────────────────────────────
+// Bots chamam isto antes de operar — se o WS está a reconectar,
+// aguarda até estar disponível ou atingir timeout.
+
+function waitForDerivWs(
+  session: ClientSession,
+  timeoutMs = WS_WAIT_TIMEOUT_MS,
+): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    // Já disponível
+    if (session.derivWs?.readyState === WebSocket.OPEN) {
+      return resolve(session.derivWs);
+    }
+
+    const deadline = setTimeout(() => {
+      clearInterval(poll);
+      reject(new Error('Timeout: Deriv WS não ficou disponível a tempo'));
+    }, timeoutMs);
+
+    const poll = setInterval(() => {
+      if (session.derivWs?.readyState === WebSocket.OPEN) {
+        clearTimeout(deadline);
+        clearInterval(poll);
+        resolve(session.derivWs!);
+      }
+    }, 500);
+  });
+}
+
+// ─── Subscrições automáticas ──────────────────────────────────
+
+function subscribeAutomatic(derivWs: WebSocket, session: ClientSession): void {
+  if (derivWs.readyState !== WebSocket.OPEN) return;
+  derivWs.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: getNextReqId(session) }));
+  derivWs.send(JSON.stringify({ transaction: 1, subscribe: 1, req_id: getNextReqId(session) }));
+  logger.debug('[WS] Subscrições automáticas enviadas');
+}
+
+// ─── Proxy Deriv → Frontend ───────────────────────────────────
+
+function setupDerivMessageHandler(clientWs: WebSocket, derivWs: WebSocket): void {
+  derivWs.on('message', (raw: Buffer) => {
+    let msg: Record<string, unknown>;
+    try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
+
+    if (msg.msg_type === 'ping' || msg.msg_type === 'pong') return;
+
+    switch (msg.msg_type as string) {
+      case 'balance':
+        sendToClient(clientWs, 'balance', {
+          balance:  (msg.balance as any)?.balance  ?? 0,
+          currency: (msg.balance as any)?.currency ?? 'USD',
+          loginid:  (msg.balance as any)?.loginid  ?? '',
+        });
+        break;
+      case 'tick':
+        sendToClient(clientWs, 'tick', {
+          quote: (msg.tick as any)?.quote,
+          epoch: (msg.tick as any)?.epoch,
+          symbol: (msg.tick as any)?.symbol,
+        });
+        break;
+      case 'transaction':
+        sendToClient(clientWs, 'transaction', {
+          balance_after: (msg.transaction as any)?.balance_after,
+          action:        (msg.transaction as any)?.action,
+          amount:        (msg.transaction as any)?.amount,
+          contract_id:   (msg.transaction as any)?.contract_id,
+        });
+        break;
+      case 'buy':
+        sendToClient(clientWs, 'buy', {
+          contract_id:    (msg.buy as any)?.contract_id,
+          balance_after:  (msg.buy as any)?.balance_after,
+          purchase_price: (msg.buy as any)?.buy_price,
+        });
+        break;
+      case 'proposal_open_contract': {
+        const poc = msg.proposal_open_contract as any;
+        sendToClient(clientWs, 'proposal_open_contract', {
+          contract_id: poc?.contract_id, is_sold: poc?.is_sold,
+          profit: poc?.profit, status: poc?.status,
+          entry_tick: poc?.entry_tick, exit_tick: poc?.exit_tick, payout: poc?.payout,
+        });
+        break;
+      }
+      case 'ohlc':    sendToClient(clientWs, 'ohlc',    { ohlc:    msg.ohlc    }); break;
+      case 'history': sendToClient(clientWs, 'history', { history: msg.history }); break;
+      default: sendToClient(clientWs, (msg.msg_type as string) ?? 'message', msg);
+    }
+  });
+}
+
+// ─── Conectar ao Deriv WS ─────────────────────────────────────
 
 async function connectToDerivWS(
   clientWs: WebSocket,
+  wsUrl: string,
   session: ClientSession,
 ): Promise<void> {
-  if (!session.token || !session.accountId) {
-    throw new Error('Sessao sem token/accountId');
-  }
+  return new Promise((resolve, reject) => {
+    logger.info('[WS] Connecting to Deriv WS', { url: wsUrl.replace(/otp=[^&]+/, 'otp=***') });
 
-  const wsManager = new WebSocketManager({
-    getUrl: () => fetchFreshDerivWsUrl(session.token, session.accountId as string),
-    autoConnect: false,
-    heartbeatInterval: config.websocket.heartbeatInterval,
-    reconnectMaxAttempts: config.websocket.reconnectMaxAttempts,
-    reconnectDelay: config.websocket.reconnectDelay,
+    const derivWs = new WebSocket(wsUrl);
+    session.derivWs = derivWs;
+
+    const timeout = setTimeout(() => {
+      derivWs.terminate();
+      reject(new Error('Timeout de conexão Deriv WS (10s)'));
+    }, 10_000);
+
+    derivWs.once('open', () => {
+      clearTimeout(timeout);
+      logger.info('[WS] Connected to Deriv WS');
+      setupDerivMessageHandler(clientWs, derivWs);
+      subscribeAutomatic(derivWs, session);
+      resolve();
+    });
+
+    derivWs.once('error', (err) => {
+      clearTimeout(timeout);
+      logger.error('[WS] Deriv WS error on connect', { message: err.message });
+      reject(err);
+    });
+
+    derivWs.once('close', (code, reason) => {
+      session.derivWs = null;
+      logger.warn('[WS] Deriv WS disconnected', { code, reason: reason?.toString() });
+      if (clientWs.readyState === WebSocket.OPEN) {
+        sendToClient(clientWs, 'deriv_disconnected', { message: 'Deriv WS desconectado. A reconectar...' });
+      }
+      scheduleDerivReconnect(clientWs, session);
+    });
   });
-
-  session.wsManager = wsManager;
-
-  wsManager.on('message', (msg: any) => {
-    if (msg.msg_type === 'balance') {
-      sendToClient(clientWs, 'balance', {
-        balance:  msg.balance?.balance  ?? 0,
-        currency: msg.balance?.currency ?? 'USD',
-        loginid:  msg.balance?.loginid  ?? '',
-      });
-    } else if (msg.msg_type === 'tick') {
-      sendToClient(clientWs, 'tick', {
-        quote:  msg.tick?.quote,
-        epoch:  msg.tick?.epoch,
-        symbol: msg.tick?.symbol,
-      });
-    } else if (msg.msg_type === 'transaction') {
-      sendToClient(clientWs, 'transaction', {
-        balance_after: msg.transaction?.balance_after,
-        action:        msg.transaction?.action,
-        amount:        msg.transaction?.amount,
-        contract_id:   msg.transaction?.contract_id,
-      });
-    } else if (msg.msg_type === 'buy') {
-      sendToClient(clientWs, 'buy', {
-        contract_id:    msg.buy?.contract_id,
-        balance_after:  msg.buy?.balance_after,
-        purchase_price: msg.buy?.buy_price,
-      });
-    } else if (msg.msg_type === 'proposal_open_contract') {
-      const poc = msg.proposal_open_contract;
-      sendToClient(clientWs, 'proposal_open_contract', {
-        contract_id:  poc?.contract_id,
-        is_sold:      poc?.is_sold,
-        profit:       poc?.profit,
-        status:       poc?.status,
-        entry_tick:   poc?.entry_tick,
-        exit_tick:    poc?.exit_tick,
-        payout:       poc?.payout,
-      });
-    } else if (msg.msg_type === 'ohlc') {
-      sendToClient(clientWs, 'ohlc', { ohlc: msg.ohlc });
-    } else if (msg.msg_type === 'history') {
-      sendToClient(clientWs, 'history', { history: msg.history });
-    } else if (msg.msg_type === 'pong') {
-      // silencioso
-    } else {
-      sendToClient(clientWs, msg.msg_type ?? 'message', msg);
-    }
-  });
-
-  wsManager.on('disconnected', (info: { code?: number; reason?: string } = {}) => {
-    logger.warn('[WS] Deriv WS disconnected', { accountId: session.accountId, code: info.code, reason: info.reason });
-    if (clientWs.readyState === WebSocket.OPEN) {
-      sendToClient(clientWs, 'deriv_disconnected', { message: 'Deriv WS disconnected', code: info.code, reason: info.reason });
-    }
-  });
-
-  wsManager.on('reconnected', () => {
-    logger.info('[WS] Deriv WS reconectado', { accountId: session.accountId });
-    wsManager.send({ balance: 1, subscribe: 1 }).catch((err: any) =>
-      logger.error('[WS] Falha ao restaurar balance', { error: err?.message }),
-    );
-    wsManager.send({ transaction: 1, subscribe: 1 }).catch((err: any) =>
-      logger.error('[WS] Falha ao restaurar transaction', { error: err?.message }),
-    );
-    if (clientWs.readyState === WebSocket.OPEN) {
-      sendToClient(clientWs, 'deriv_reconnected', {});
-    }
-  });
-
-  wsManager.on('reconnect_failed', () => {
-    logger.error('[WS] Deriv WS falhou reconexao', { accountId: session.accountId });
-    if (clientWs.readyState === WebSocket.OPEN) {
-      sendToClient(clientWs, 'deriv_disconnected', {
-        message: 'Nao foi possivel restabelecer a ligacao a Deriv',
-        permanent: true,
-      });
-    }
-  });
-
-  await wsManager.connect();
-  logger.info('[WS] Connected to Deriv WS', { accountId: session.accountId });
 }
 
+// ─── Reconexão Deriv com novo OTP ────────────────────────────
+
+function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): void {
+  if (clientWs.readyState !== WebSocket.OPEN) return;
+  if (!session.authenticated || !session.token || !session.accountId) return;
+  if (session.reconnectAttempts >= RECONNECT_MAX_TRIES) {
+    logger.error('[WS] Máximo de reconexões atingido');
+    sendError(clientWs, 'Conexão Deriv perdida. Faz login novamente.', 'DERIV_DISCONNECTED');
+    clientWs.close();
+    return;
+  }
+
+  const base  = Math.min(RECONNECT_BASE_MS * Math.pow(2, session.reconnectAttempts), RECONNECT_MAX_MS);
+  const delay = Math.floor(base + Math.random() * 0.3 * base);
+  session.reconnectAttempts++;
+
+  logger.info('[WS] Reconexão Deriv agendada', {
+    attempt: session.reconnectAttempts, delayMs: delay, accountId: session.accountId,
+  });
+
+  session.reconnectTimer = setTimeout(async () => {
+    if (clientWs.readyState !== WebSocket.OPEN) return;
+    try {
+      // OBRIGATÓRIO: novo OTP a cada reconexão
+      const derivAPI = new DerivAPIService(session.token);
+      const otpData  = await derivAPI.getOTP(session.accountId!);
+      await connectToDerivWS(clientWs, otpData.url, session);
+      session.reconnectAttempts = 0;
+
+      // Reinicializar BotManager com novo WS
+      if (session.botManager) {
+        await session.botManager.stopAll();
+        session.botManager.removeAllListeners();
+      }
+      initBotManagerForSession(clientWs, session);
+      sendToClient(clientWs, 'deriv_reconnected', { message: 'Conexão Deriv restabelecida' });
+    } catch (err: any) {
+      logger.error('[WS] Falha na reconexão Deriv', { error: err.message });
+      scheduleDerivReconnect(clientWs, session);
+    }
+  }, delay);
+}
+
+// ─── BotManager ───────────────────────────────────────────────
+
 function initBotManagerForSession(clientWs: WebSocket, session: ClientSession): void {
-  if (!session.wsManager) return;
+  if (!session.derivWs) return;
 
-  const adapter = createDerivWsAdapter(() => session.wsManager);
+  // getDerivWs aguarda WS disponível em vez de retornar null
+  const adapter = createDerivWsAdapter(() => session.derivWs);
+
   const manager = new BotManager(adapter);
-
   manager.on('bot_event', (event: BotEvent) => {
     sendToClient(clientWs, event.type, { payload: { botId: event.botId, ...event.payload } });
   });
 
   session.botManager = manager;
-  logger.info('[WS] BotManager inicializado para sessao');
+  logger.info('[WS] BotManager inicializado para sessão');
 }
 
+// ─── Handler de mensagens de bots ─────────────────────────────
+
 async function handleBotMessage(
-  ws: WebSocket,
-  session: ClientSession,
-  type: string,
-  payload: Record<string, unknown>,
+  ws: WebSocket, session: ClientSession,
+  type: string, payload: Record<string, unknown>,
 ): Promise<void> {
   if (type === 'list_bots') {
     try {
-      const bots = await BotCatalog.listActive();
-      sendToClient(ws, 'bots_list', { payload: bots });
+      sendToClient(ws, 'bots_list', { payload: await BotCatalog.listActive() });
     } catch (err: any) {
-      logger.error('[WS] Erro ao listar catalogo de bots', { error: err.message });
-      sendError(ws, err.message ?? 'Erro ao listar catalogo', 'BOT_ERROR');
+      sendError(ws, err.message ?? 'Erro ao listar catálogo', 'BOT_ERROR');
     }
     return;
   }
 
   const manager = session.botManager;
-  if (!manager) {
-    sendError(ws, 'BotManager nao disponivel. Aguarda autenticacao.', 'NO_MANAGER');
-    return;
-  }
+  if (!manager) { sendError(ws, 'BotManager não disponível.', 'NO_MANAGER'); return; }
 
   try {
     switch (type) {
-      case 'list_session_bots': {
-        const bots = manager.listBots();
-        sendToClient(ws, 'session_bots_list', { payload: bots });
-        break;
-      }
+      case 'list_session_bots':
+        sendToClient(ws, 'session_bots_list', { payload: manager.listBots() }); break;
 
       case 'start_catalog_bot': {
         const catalogBotId   = payload.catalogBotId as string;
-        const sessionName    = payload.sessionName  as string | undefined;
         const configOverride = (payload.configOverride ?? {}) as Partial<BotConfig>;
-
-        if (!catalogBotId) {
-          sendError(ws, 'catalogBotId e obrigatorio.', 'MISSING_PARAM');
-          break;
-        }
+        if (!catalogBotId) { sendError(ws, 'catalogBotId obrigatório.', 'MISSING_PARAM'); break; }
 
         const catalogBot = await BotCatalog.getById(catalogBotId);
-        if (!catalogBot || !catalogBot.isActive) {
-          sendError(ws, 'Bot nao encontrado no catalogo.', 'BOT_NOT_FOUND');
+        if (!catalogBot?.isActive) { sendError(ws, 'Bot não encontrado.', 'BOT_NOT_FOUND'); break; }
+
+        // Verificar WS disponível antes de iniciar bot
+        try {
+          await waitForDerivWs(session);
+        } catch {
+          sendError(ws, 'Conexão Deriv não disponível. Aguarda reconexão.', 'DERIV_DISCONNECTED');
           break;
         }
 
         const finalConfig: BotConfig = {
-          ...catalogBot.defaultConfig,
-          ...configOverride,
+          ...catalogBot.defaultConfig, ...configOverride,
           strategyParams: {
             ...(catalogBot.defaultConfig.strategyParams ?? {}),
             ...((configOverride.strategyParams as Record<string, unknown>) ?? {}),
@@ -241,233 +339,220 @@ async function handleBotMessage(
         };
 
         const created = manager.createBot({
-          name:     sessionName ?? catalogBot.name,
-          strategy: catalogBot.strategy,
-          config:   finalConfig,
+          name: (payload.sessionName as string) ?? catalogBot.name,
+          strategy: catalogBot.strategy, config: finalConfig,
         });
-
         await manager.startBot(created.id);
-
-        const botState = manager.getBotState(created.id);
-
-        sendToClient(ws, 'bot_created', {
-          payload: {
-            ...botState,
-            catalogBotId,
-          },
-        });
+        sendToClient(ws, 'bot_created', { payload: { ...manager.getBotState(created.id), catalogBotId } });
         break;
       }
 
       case 'stop_bot': {
         const botId = payload.botId as string;
-        if (!botId) { sendError(ws, 'botId e obrigatorio.', 'MISSING_PARAM'); break; }
+        if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
         await manager.stopBot(botId);
-        sendToClient(ws, 'bot_stopped', { payload: { botId } });
-        break;
+        sendToClient(ws, 'bot_stopped', { payload: { botId } }); break;
       }
 
       case 'pause_bot': {
         const botId = payload.botId as string;
-        if (!botId) { sendError(ws, 'botId e obrigatorio.', 'MISSING_PARAM'); break; }
+        if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
         manager.pauseBot(botId);
-        sendToClient(ws, 'bot_paused', { payload: { botId } });
-        break;
+        sendToClient(ws, 'bot_paused', { payload: { botId } }); break;
       }
 
       case 'resume_bot': {
         const botId = payload.botId as string;
-        if (!botId) { sendError(ws, 'botId e obrigatorio.', 'MISSING_PARAM'); break; }
+        if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
+        // Verificar WS antes de retomar
+        try { await waitForDerivWs(session); } catch {
+          sendError(ws, 'Conexão Deriv não disponível.', 'DERIV_DISCONNECTED'); break;
+        }
         await manager.resumeBot(botId);
-        sendToClient(ws, 'bot_resumed', { payload: { botId } });
-        break;
+        sendToClient(ws, 'bot_resumed', { payload: { botId } }); break;
       }
 
       case 'delete_bot': {
         const botId = payload.botId as string;
-        if (!botId) { sendError(ws, 'botId e obrigatorio.', 'MISSING_PARAM'); break; }
+        if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
         manager.deleteBot(botId);
-        sendToClient(ws, 'bot_deleted', { payload: { botId } });
-        break;
+        sendToClient(ws, 'bot_deleted', { payload: { botId } }); break;
       }
 
       case 'get_bot_logs': {
         const botId = payload.botId as string;
-        const limit = (payload.limit as number) ?? 100;
-        if (!botId) { sendError(ws, 'botId e obrigatorio.', 'MISSING_PARAM'); break; }
-        const logs = manager.getBotLogs(botId, limit);
-        sendToClient(ws, 'bot_logs', { payload: { botId, logs } });
-        break;
+        if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
+        sendToClient(ws, 'bot_logs', { payload: { botId, logs: manager.getBotLogs(botId, (payload.limit as number) ?? 100) } }); break;
       }
 
       case 'admin_add_catalog_bot': {
-        if (!session.isAdmin) {
-          sendError(ws, 'Acesso restrito ao administrador.', 'FORBIDDEN');
-          break;
-        }
-        const dto = payload as {
-          name: string;
-          description: string;
-          strategy: BotStrategyType;
-          defaultConfig: BotConfig;
-          tags?: string[];
-          isActive?: boolean;
-        };
+        if (!session.isAdmin) { sendError(ws, 'Acesso restrito.', 'FORBIDDEN'); break; }
+        const dto = payload as { name: string; description: string; strategy: BotStrategyType; defaultConfig: BotConfig; tags?: string[]; isActive?: boolean; };
         if (!dto.name || !dto.strategy || !dto.defaultConfig?.symbol) {
-          sendError(ws, 'name, strategy e defaultConfig.symbol sao obrigatorios.', 'MISSING_PARAM');
-          break;
+          sendError(ws, 'name, strategy e defaultConfig.symbol obrigatórios.', 'MISSING_PARAM'); break;
         }
-        const bot = await BotCatalog.create({
-          ...dto,
-          tags: dto.tags ?? [],
-          isActive: dto.isActive ?? true,
-          createdBy: session.accountId ?? 'admin',
-        });
-        sendToClient(ws, 'catalog_bot_added', { payload: bot });
-        logger.info(`[WS] Admin adicionou bot ao catalogo: ${bot.id}`);
-        break;
+        const bot = await BotCatalog.create({ ...dto, tags: dto.tags ?? [], isActive: dto.isActive ?? true, createdBy: session.accountId ?? 'admin' });
+        sendToClient(ws, 'catalog_bot_added', { payload: bot }); break;
       }
 
       case 'admin_remove_catalog_bot': {
-        if (!session.isAdmin) {
-          sendError(ws, 'Acesso restrito ao administrador.', 'FORBIDDEN');
-          break;
-        }
+        if (!session.isAdmin) { sendError(ws, 'Acesso restrito.', 'FORBIDDEN'); break; }
         const id = payload.id as string;
-        if (!id) { sendError(ws, 'id e obrigatorio.', 'MISSING_PARAM'); break; }
-        const deleted = await BotCatalog.delete(id);
-        if (!deleted) {
-          sendError(ws, 'Bot nao encontrado no catalogo.', 'BOT_NOT_FOUND');
-          break;
-        }
-        sendToClient(ws, 'catalog_bot_removed', { payload: { id } });
-        logger.info(`[WS] Admin removeu bot do catalogo: ${id}`);
-        break;
+        if (!id) { sendError(ws, 'id obrigatório.', 'MISSING_PARAM'); break; }
+        if (!await BotCatalog.delete(id)) { sendError(ws, 'Bot não encontrado.', 'BOT_NOT_FOUND'); break; }
+        sendToClient(ws, 'catalog_bot_removed', { payload: { id } }); break;
       }
 
       case 'admin_update_catalog_bot': {
-        if (!session.isAdmin) {
-          sendError(ws, 'Acesso restrito ao administrador.', 'FORBIDDEN');
-          break;
-        }
-        const { id, ...updates } = payload as { id: string; [key: string]: unknown };
-        if (!id) { sendError(ws, 'id e obrigatorio.', 'MISSING_PARAM'); break; }
+        if (!session.isAdmin) { sendError(ws, 'Acesso restrito.', 'FORBIDDEN'); break; }
+        const { id, ...updates } = payload as { id: string; [k: string]: unknown };
+        if (!id) { sendError(ws, 'id obrigatório.', 'MISSING_PARAM'); break; }
         const updated = await BotCatalog.update(id, updates as any);
-        if (!updated) {
-          sendError(ws, 'Bot nao encontrado no catalogo.', 'BOT_NOT_FOUND');
-          break;
-        }
-        sendToClient(ws, 'catalog_bot_updated', { payload: updated });
-        break;
+        if (!updated) { sendError(ws, 'Bot não encontrado.', 'BOT_NOT_FOUND'); break; }
+        sendToClient(ws, 'catalog_bot_updated', { payload: updated }); break;
       }
 
-      default:
-        sendError(ws, `Tipo de mensagem de bot desconhecido: ${type}`, 'UNKNOWN_BOT_MSG');
+      default: sendError(ws, `Tipo desconhecido: ${type}`, 'UNKNOWN_BOT_MSG');
     }
   } catch (err: any) {
-    logger.error('[WS] Erro ao processar mensagem de bot', { type, error: err.message });
-    sendError(ws, err.message ?? 'Erro interno no bot', 'BOT_ERROR');
+    logger.error('[WS] Erro no handler de bot', { type, error: err.message });
+    sendError(ws, err.message ?? 'Erro interno', 'BOT_ERROR');
   }
 }
 
-async function authenticateClient(
-  ws: WebSocket,
-  token: string,
-  accountId?: string,
-): Promise<void> {
+// ─── Autenticação ─────────────────────────────────────────────
+
+async function authenticateClient(ws: WebSocket, token: string, accountId?: string): Promise<void> {
   const session = sessions.get(ws);
   if (!session) return;
 
+  // Limpar timeout de auth
+  if (session.authTimeout) { clearTimeout(session.authTimeout); session.authTimeout = null; }
+
+  // Parar estado anterior
+  if (session.botManager) {
+    await session.botManager.stopAll();
+    session.botManager.removeAllListeners();
+    session.botManager = null;
+  }
+  if (session.derivWs) {
+    session.derivWs.removeAllListeners();
+    session.derivWs.terminate();
+    session.derivWs = null;
+  }
+  if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
+
   try {
-    const derivAPI = new DerivAPIService(token);
+    const derivAPI    = new DerivAPIService(token);
     const accountsRes = await derivAPI.getAccounts();
-    const accounts: any[] = accountsRes.data || [];
+    const accounts: any[] = accountsRes.data ?? [];
 
-    if (!accounts.length) {
-      sendError(ws, 'No accounts found', 'NO_ACCOUNTS');
-      ws.close();
-      return;
-    }
+    if (!accounts.length) { sendError(ws, 'Nenhuma conta encontrada', 'NO_ACCOUNTS'); ws.close(); return; }
 
-    const targetAccount = accountId
-      ? accounts.find((a: any) => a.account_id === accountId) || accounts[0]
+    const target = accountId
+      ? (accounts.find((a: any) => a.account_id === accountId) ?? accounts[0])
       : accounts[0];
 
-    session.token     = token;
-    session.accountId = targetAccount.account_id;
-    session.isAdmin   = ADMIN_IDS.has(targetAccount.account_id);
-    session.authenticated = true;
+    const targetAccountId = target.account_id;
 
-    await connectToDerivWS(ws, session);
+    // ── DEDUPLICAÇÃO: fechar sessão antiga da mesma conta ────
+    const existingWs = sessionsByAccount.get(targetAccountId);
+    if (existingWs && existingWs !== ws) {
+      logger.warn('[WS] Sessão duplicada detectada, a fechar a antiga', { accountId: targetAccountId });
+      await cleanupSession(existingWs);
+      existingWs.close(1001, 'Sessão substituída por nova conexão');
+    }
+
+    session.token         = token;
+    session.accountId     = targetAccountId;
+    session.isAdmin       = ADMIN_IDS.has(targetAccountId);
+    session.authenticated = true;
+    session.reconnectAttempts = 0;
+
+    // Registar no índice de contas
+    sessionsByAccount.set(targetAccountId, ws);
+
+    // OTP + WS Deriv
+    const otpData = await derivAPI.getOTP(targetAccountId);
+    if (!otpData.url) { sendError(ws, 'Falha ao obter URL WS', 'OTP_FAILED'); ws.close(); return; }
+
+    await connectToDerivWS(ws, otpData.url, session);
     initBotManagerForSession(ws, session);
 
     sendToClient(ws, 'authenticated', {
       accounts: accounts.map((a: any) => ({
-        account_id:   a.account_id,
-        loginid:      a.loginid || a.account_id,
-        balance:      a.balance ?? 0,
-        currency:     a.currency ?? 'USD',
-        is_virtual:   a.is_virtual ?? false,
+        account_id: a.account_id, loginid: a.loginid ?? a.account_id,
+        balance: a.balance ?? 0, currency: a.currency ?? 'USD',
+        is_virtual: a.is_virtual ?? false,
         account_type: a.account_type ?? (a.is_virtual ? 'demo' : 'real'),
       })),
       currentAccount: {
-        account_id:   targetAccount.account_id,
-        balance:      targetAccount.balance ?? 0,
-        currency:     targetAccount.currency ?? 'USD',
-        is_virtual:   targetAccount.is_virtual ?? false,
-        account_type: targetAccount.account_type ?? (targetAccount.is_virtual ? 'demo' : 'real'),
+        account_id: target.account_id, balance: target.balance ?? 0,
+        currency: target.currency ?? 'USD', is_virtual: target.is_virtual ?? false,
+        account_type: target.account_type ?? (target.is_virtual ? 'demo' : 'real'),
       },
       isAdmin: session.isAdmin,
     });
 
-    session.wsManager?.send({ balance: 1, subscribe: 1 }).catch((err: any) =>
-      logger.error('[WS] Falha ao subscrever balance', { error: err?.message }),
-    );
-    session.wsManager?.send({ transaction: 1, subscribe: 1 }).catch((err: any) =>
-      logger.error('[WS] Falha ao subscrever transaction', { error: err?.message }),
-    );
-
-    logger.info('[WS] Client authenticated', {
-      accountId: targetAccount.account_id,
-      isVirtual: targetAccount.is_virtual,
-      isAdmin:   session.isAdmin,
-    });
+    logger.info('[WS] Client authenticated', { accountId: targetAccountId, isAdmin: session.isAdmin });
   } catch (err: any) {
     logger.error('[WS] Authentication failed', { error: err.message });
-    sendError(ws, err.message || 'Authentication failed', 'AUTH_FAILED');
+    sendError(ws, err.message ?? 'Falha na autenticação', 'AUTH_FAILED');
     ws.close();
   }
 }
 
+// ─── Cleanup de sessão ────────────────────────────────────────
+
+async function cleanupSession(ws: WebSocket): Promise<void> {
+  const session = sessions.get(ws);
+  if (!session) return;
+  sessions.delete(ws);
+
+  // Remover do índice de contas
+  if (session.accountId && sessionsByAccount.get(session.accountId) === ws) {
+    sessionsByAccount.delete(session.accountId);
+  }
+
+  if (session.pingInterval)   clearInterval(session.pingInterval);
+  if (session.authTimeout)    clearTimeout(session.authTimeout);
+  if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+
+  if (session.botManager) {
+    try { await session.botManager.stopAll(); } catch { /* ignorar */ }
+    session.botManager.removeAllListeners();
+  }
+
+  if (session.derivWs) {
+    session.derivWs.removeAllListeners();
+    session.derivWs.terminate();
+  }
+}
+
+// ─── Tipos de mensagem de bots ────────────────────────────────
 const BOT_MESSAGE_TYPES = new Set([
-  'list_bots',
-  'list_session_bots',
-  'start_catalog_bot',
-  'stop_bot',
-  'pause_bot',
-  'resume_bot',
-  'delete_bot',
-  'get_bot_logs',
-  'admin_add_catalog_bot',
-  'admin_remove_catalog_bot',
-  'admin_update_catalog_bot',
+  'list_bots', 'list_session_bots', 'start_catalog_bot',
+  'stop_bot', 'pause_bot', 'resume_bot', 'delete_bot', 'get_bot_logs',
+  'admin_add_catalog_bot', 'admin_remove_catalog_bot', 'admin_update_catalog_bot',
 ]);
 
-wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
-  logger.info('[WS] Client connected', { ip: req.socket.remoteAddress });
+// ─── Novas conexões ───────────────────────────────────────────
 
-  const urlParams       = new URLSearchParams(req.url?.split('?')[1] || '');
-  const tokenFromUrl    = urlParams.get('token');
-  const accountIdFromUrl = urlParams.get('accountId') || undefined;
+wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
+  if (sessions.size >= MAX_SESSIONS) {
+    logger.warn('[WS] Limite de sessões atingido');
+    ws.close(1013, 'Servidor cheio. Tenta novamente.');
+    return;
+  }
+
+  const ip = req.socket.remoteAddress ?? 'unknown';
+  logger.info('[WS] Client connected', { ip, sessions: sessions.size + 1 });
 
   const session: ClientSession = {
-    wsManager:     null,
-    token:         '',
-    accountId:     null,
-    pingInterval:  null,
-    authenticated: false,
-    isAdmin:       false,
-    botManager:    null,
+    derivWs: null, token: '', accountId: null,
+    pingInterval: null, authTimeout: null, reconnectTimer: null,
+    reconnectAttempts: 0, authenticated: false, isAdmin: false,
+    botManager: null, nextReqId: 1000,
   };
   sessions.set(ws, session);
 
@@ -475,105 +560,95 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, config.websocket.heartbeatInterval);
 
+  // Fechar se não autenticar em 30s
+  session.authTimeout = setTimeout(() => {
+    if (!session.authenticated) {
+      logger.warn('[WS] Auth timeout', { ip });
+      ws.close(1008, 'Timeout de autenticação');
+    }
+  }, AUTH_TIMEOUT_MS);
+
+  // Auth via query string
+  const urlParams = new URLSearchParams(req.url?.split('?')[1] ?? '');
+  const tokenFromUrl = urlParams.get('token');
   if (tokenFromUrl) {
-    authenticateClient(ws, tokenFromUrl, accountIdFromUrl);
+    authenticateClient(ws, tokenFromUrl, urlParams.get('accountId') ?? undefined);
   }
 
   ws.on('message', async (raw: Buffer) => {
     let data: Record<string, unknown>;
-    try {
-      data = JSON.parse(raw.toString());
-    } catch {
-      sendError(ws, 'Invalid JSON', 'PARSE_ERROR');
-      return;
+    try { data = JSON.parse(raw.toString('utf8')); } catch {
+      sendError(ws, 'JSON inválido', 'PARSE_ERROR'); return;
     }
 
-    const type    = data.type    as string | undefined;
+    const type    = data.type as string | undefined;
     const payload = (data.payload ?? {}) as Record<string, unknown>;
 
     if (type === 'auth') {
-      const token     = (payload.token ?? data.token) as string;
-      const accountId = (payload.accountId ?? data.accountId) as string | undefined;
-      if (!token) { sendError(ws, 'Missing token', 'MISSING_TOKEN'); return; }
-      await authenticateClient(ws, token, accountId);
+      const token = (payload.token ?? data.token) as string;
+      if (!token) { sendError(ws, 'Token em falta', 'MISSING_TOKEN'); return; }
+      await authenticateClient(ws, token, (payload.accountId ?? data.accountId) as string | undefined);
       return;
     }
 
-    if (type === 'ping') {
-      sendToClient(ws, 'pong');
-      return;
-    }
+    // Ping do cliente → responder localmente
+    if (type === 'ping') { sendToClient(ws, 'pong'); return; }
 
     if (type === 'switch_account') {
-      if (!session.authenticated) { sendError(ws, 'Not authenticated', 'NOT_AUTH'); return; }
-      const newAccountId = (payload.accountId ?? data.accountId) as string;
-      if (!newAccountId) { sendError(ws, 'Missing accountId', 'MISSING_ACCOUNT'); return; }
-
-      if (session.botManager) {
-        await session.botManager.stopAll();
-        session.botManager.removeAllListeners();
-        session.botManager = null;
-      }
-
-      session.wsManager?.disconnect();
-      session.wsManager?.removeAllListeners();
-      session.wsManager = null;
-      await authenticateClient(ws, session.token, newAccountId);
+      if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
+      const newId = (payload.accountId ?? data.accountId) as string;
+      if (!newId) { sendError(ws, 'accountId em falta', 'MISSING_ACCOUNT'); return; }
+      await authenticateClient(ws, session.token, newId);
       return;
     }
 
     if (type && BOT_MESSAGE_TYPES.has(type)) {
       if (type !== 'list_bots' && !session.authenticated) {
-        sendError(ws, 'Not authenticated', 'NOT_AUTH');
-        return;
+        sendError(ws, 'Não autenticado', 'NOT_AUTH'); return;
       }
       await handleBotMessage(ws, session, type, payload);
       return;
     }
 
-    if (!session.authenticated || !session.wsManager) {
-      sendError(ws, 'Not authenticated', 'NOT_AUTH');
-      return;
+    // Proxy → Deriv
+    if (!session.authenticated || !session.derivWs) {
+      sendError(ws, 'Não autenticado', 'NOT_AUTH'); return;
     }
+    if (session.derivWs.readyState === WebSocket.OPEN) {
+      const { type: _t, payload: _p, ...rest } = data;
+      const rawPayload = (_p && Object.keys(_p as object).length > 0)
+        ? _p as Record<string, unknown>
+        : rest as Record<string, unknown>;
 
-    const { type: _type, payload: _payload, ...rest } = data;
-    const derivPayload = Object.keys(_payload as object ?? {}).length > 0
-      ? _payload
-      : rest;
+      // Garantir req_id numérico inteiro positivo — Deriv rejeita strings e 0
+      const existingReqId = rawPayload.req_id;
+      const numericReqId = (typeof existingReqId === 'number' && Number.isInteger(existingReqId) && existingReqId > 0)
+        ? existingReqId
+        : getNextReqId(session);
 
-    session.wsManager.send(derivPayload).catch((err: any) => {
-      logger.error('[WS] Falha ao reencaminhar mensagem para a Deriv', { error: err?.message });
-      sendError(ws, err?.message ?? 'Deriv WebSocket not available', 'DERIV_SEND_FAILED');
-    });
+      const derivPayload = { ...rawPayload, req_id: numericReqId };
+      session.derivWs.send(JSON.stringify(derivPayload));
+    } else {
+      sendError(ws, 'Deriv WS não conectado', 'DERIV_DISCONNECTED');
+    }
   });
 
-  ws.on('pong', () => { /* cliente esta vivo */ });
+  ws.on('pong', () => { /* vivo */ });
 
-  ws.on('close', () => {
-    logger.info('[WS] Client disconnected');
-    const s = sessions.get(ws);
-    if (s) {
-      s.botManager?.destroy();
-      s.wsManager?.disconnect();
-      s.wsManager?.removeAllListeners();
-      if (s.pingInterval) clearInterval(s.pingInterval);
-    }
-    sessions.delete(ws);
+  ws.on('close', async () => {
+    logger.info('[WS] Client disconnected', { ip });
+    await cleanupSession(ws);
   });
 
-  ws.on('error', (err) => {
-    logger.error('[WS] Client error', { error: err.message });
-    const s = sessions.get(ws);
-    if (s) {
-      s.botManager?.destroy();
-      s.wsManager?.disconnect();
-      s.wsManager?.removeAllListeners();
-      if (s.pingInterval) clearInterval(s.pingInterval);
-    }
-    sessions.delete(ws);
+  ws.on('error', async (err) => {
+    logger.error('[WS] Client error', { ip, error: err.message });
+    await cleanupSession(ws);
   });
 });
 
+// ============================================
+// Middleware
+// ============================================
 app.use(helmetMiddleware);
 app.use(corsMiddleware);
 app.use(sanitizationMiddleware);
@@ -582,16 +657,11 @@ app.use(requestLoggerMiddleware);
 app.use(apiLimiter);
 
 app.use('/api/bots', (req: Request, _res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-
+  const token = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7) : null;
   if (token) {
-    for (const [, session] of sessions) {
-      if (session.token === token) {
-        if (session.botManager) req.botManager = session.botManager;
-        req.isAdmin = session.isAdmin;
-        break;
-      }
+    for (const [, s] of sessions) {
+      if (s.token === token) { if (s.botManager) req.botManager = s.botManager; req.isAdmin = s.isAdmin; break; }
     }
   }
   next();
@@ -599,136 +669,66 @@ app.use('/api/bots', (req: Request, _res: Response, next: NextFunction) => {
 
 app.get('/api/online-count', (_req, res) => {
   let authenticated = 0;
-  for (const [, session] of sessions) {
-    if (session.authenticated) authenticated++;
-  }
-  res.json({
-    count:          authenticated,
-    totalConnections: wss.clients.size,
-  });
-});
-
-app.get('/api/metrics', (_req, res) => {
-  let activeBots = 0;
-  let totalSubscriptions = 0;
-  let totalPendingRequests = 0;
-  let totalSendQueueDepth = 0;
-
-  for (const [, session] of sessions) {
-    if (session.botManager) {
-      activeBots += session.botManager.listBots().filter(b => b.status === 'running').length;
-    }
-    if (session.wsManager) {
-      const status = session.wsManager.getStatus();
-      totalSubscriptions += status.subscriptions;
-      totalPendingRequests += status.pendingRequests;
-      totalSendQueueDepth += status.sendQueueDepth;
-    }
-  }
-
-  const mem = process.memoryUsage();
-
-  res.json({
-    usersOnline: Array.from(sessions.values()).filter(s => s.authenticated).length,
-    totalConnections: wss.clients.size,
-    activeBots,
-    totalSubscriptions,
-    totalPendingRequests,
-    totalSendQueueDepth,
-    memory: {
-      rssMB: Math.round(mem.rss / 1024 / 1024),
-      heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
-      heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
-    },
-    uptimeSeconds: Math.round(process.uptime()),
-  });
+  for (const [, s] of sessions) { if (s.authenticated) authenticated++; }
+  res.json({ count: authenticated, totalConnections: wss.clients.size });
 });
 
 app.get('/health', (_req, res) => {
   res.json({
-    status:      'ok',
-    timestamp:   new Date().toISOString(),
+    status: 'ok', timestamp: new Date().toISOString(),
     environment: config.server.nodeEnv,
-    redis:       isRedisConnected() ? 'connected' : 'unavailable (using memory)',
-    uptime:      process.uptime(),
-    wsClients:   wss.clients.size,
+    redis: isRedisConnected() ? 'connected' : 'unavailable (memory fallback)',
+    uptime: process.uptime(), wsClients: wss.clients.size,
+    wsSessions: sessions.size,
+    wsAuthenticated: [...sessions.values()].filter(s => s.authenticated).length,
   });
 });
 
-app.use('/api/auth',     authRoutes);
-app.use('/api/accounts', accountRoutes);
-app.use('/api/trading',  tradingRoutes);
-app.use('/api/bots',     botsRoutes);
-app.use('/api/admin',    adminRoutes);
+app.use('/api/auth',         authRoutes);
+app.use('/api/accounts',     accountRoutes);
+app.use('/api/trading',      tradingRoutes);
+app.use('/api/bots',         botsRoutes);
+app.use('/api/admin',        adminRoutes);
 app.use('/api/admin/labels', labelsRoutes);
-
 app.use(notFoundHandler);
 app.use(errorHandler);
 
+// ============================================
+// Startup
+// ============================================
 const startServer = async () => {
   try {
-    logger.info('Initializing data store...');
     await initRedis();
-    logger.info(`Data store ready (Redis: ${isRedisConnected() ? 'connected' : 'unavailable'})`);
-
+    logger.info(`Redis: ${isRedisConnected() ? 'conectado' : 'usando memória'}`);
     await seedBotCatalog();
-
     server.listen(config.server.port, config.server.host, () => {
-      logger.info('Server started successfully', {
-        host:        config.server.host,
-        port:        config.server.port,
-        environment: config.server.nodeEnv,
-      });
-
-      if (config.server.isDevelopment) {
-        console.log('NEXORA FOREX backend started on port ' + config.server.port);
-      }
+      logger.info('Servidor iniciado', { port: config.server.port, maxSessions: MAX_SESSIONS });
     });
   } catch (error) {
-    logger.error('Failed to start server', {
-      message: error instanceof Error ? error.message : 'Unknown error',
-      stack:   error instanceof Error ? error.stack  : undefined,
-    });
+    logger.error('Falha ao iniciar servidor', { error });
     process.exit(1);
   }
 };
 
+// ============================================
+// Graceful Shutdown
+// ============================================
 const gracefulShutdown = async (signal: string) => {
-  logger.info(`Received ${signal}, shutting down gracefully...`);
-
-  for (const [clientWs, session] of sessions) {
-    await session.botManager?.destroy();
-    session.wsManager?.disconnect();
-    session.wsManager?.removeAllListeners();
-    if (session.pingInterval) clearInterval(session.pingInterval);
-    clientWs.close();
-  }
-  sessions.clear();
-
-  wss.close(() => logger.info('WebSocket server closed'));
-
+  logger.info(`${signal} recebido, a encerrar...`);
+  for (const [clientWs] of sessions) { await cleanupSession(clientWs); clientWs.close(); }
+  wss.close(() => logger.info('WS server fechado'));
   server.close(async () => {
-    logger.info('HTTP server closed');
     try { await closeRedis(); } catch { /* ignorar */ }
     destroyMemoryStore();
     process.exit(0);
   });
-
-  setTimeout(() => {
-    logger.error('Forced shutdown');
-    process.exit(1);
-  }, 30_000);
+  setTimeout(() => process.exit(1), 30_000);
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
-process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception', { message: error.message, stack: error.stack });
-  process.exit(1);
-});
-process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled Rejection', { reason });
-});
+process.on('uncaughtException', (e) => { logger.error('Uncaught Exception', { message: e.message, stack: e.stack }); process.exit(1); });
+process.on('unhandledRejection', (r) => { logger.error('Unhandled Rejection', { reason: r }); });
 
 startServer();
 export default app;

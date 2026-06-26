@@ -207,11 +207,19 @@ export class WebSocketManager extends EventEmitter {
         });
       }
 
-      if (message.msg_type === 'ping') {
-        this.send({ pong: 1 }).catch(() => { /* pong não precisa de confirmação */ });
-        return;
-      }
-
+      // ── ORDEM CRÍTICA ────────────────────────────────────
+      // A resposta da Deriv ao NOSSO PRÓPRIO `send({ ping: 1 })` vem
+      // com `msg_type: 'ping'` E o mesmo `req_id` que enviámos (a
+      // Deriv nomeia o campo de resposta segundo o método pedido).
+      // Se verificássemos `msg_type === 'ping'` antes de `req_id`,
+      // essa resposta seria sempre desviada para o ramo de "ping
+      // iniciado pela Deriv" e a nossa Promise de heartbeat NUNCA
+      // resolvia — causando heartbeatTimeout e reconexão em ciclo,
+      // mesmo com a ligação saudável. Por isso resolvemos sempre
+      // por req_id primeiro; só tratamos como ping nosso a iniciar
+      // (sem req_id correspondente a um pedido pendente nosso) no
+      // ramo seguinte.
+      let resolvedAsPending = false;
       if (message.req_id) {
         const pending = this.pendingRequests.get(String(message.req_id));
         if (pending) {
@@ -220,7 +228,15 @@ export class WebSocketManager extends EventEmitter {
           }
           pending.resolve(message);
           this.pendingRequests.delete(String(message.req_id));
+          resolvedAsPending = true;
         }
+      }
+
+      // Ping iniciado pela DERIV (sem req_id nosso à espera) — aqui
+      // sim respondemos com pong, como pedido pela API.
+      if (!resolvedAsPending && message.msg_type === 'ping') {
+        this.send({ pong: 1 }).catch(() => { /* pong não precisa de confirmação */ });
+        return;
       }
 
       if (message.subscription?.id) {
@@ -400,21 +416,19 @@ export class WebSocketManager extends EventEmitter {
         const idleMs = Date.now() - this.lastMessageAt;
         logger.debug('Heartbeat tick', { idleMs });
 
-        this.send({ ping: 1 }).then(() => {
-          if (this.heartbeatTimeout) {
-            clearTimeout(this.heartbeatTimeout);
-            this.heartbeatTimeout = null;
-          }
-        }).catch((error: any) => {
-          logger.warn('Heartbeat failed', { error: error?.message });
-        });
-
-        this.heartbeatTimeout = setTimeout(() => {
-          logger.warn('Heartbeat timeout, reconnecting...', {
+        // O próprio send() já tem o seu timeout interno (aqui 8s,
+        // explícito) — não precisamos de um segundo timer paralelo a
+        // competir com ele. Antes, um setTimeout(5000) corria ao
+        // lado do timeout de 15s do send(), e por vezes disparava
+        // PRIMEIRO, reconectando uma ligação saudável só porque a
+        // resposta da Deriv ainda não tinha chegado dentro de 5s.
+        this.send({ ping: 1 }, 8000).catch((error: any) => {
+          logger.warn('Heartbeat failed, reconnecting...', {
+            error: error?.message,
             idleMs: Date.now() - this.lastMessageAt,
           });
           this.reconnect();
-        }, 5000);
+        });
       }
     }, this.options.heartbeatInterval);
 

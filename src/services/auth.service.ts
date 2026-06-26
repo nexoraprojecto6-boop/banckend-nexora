@@ -8,6 +8,13 @@
 //   ✅ TTL de 10 minutos no Redis para sessões PKCE
 //   ✅ exchangeCodeForToken: tratamento de erros melhorado
 //   ✅ getOtpUrl: novo método para obter URL WS privada com OTP
+//
+// ─── Correção de build ────────────────────────────────────────
+// Trocado `redisClient` (não exportado por @utils/redis.js — só as
+// funções helper o são) por redisGet/redisSet/redisDel. Vantagem
+// extra: estas funções já fazem fallback automático para o
+// memory-store quando o Redis está indisponível, em vez de o fluxo
+// PKCE falhar com erro não tratado nesse cenário.
 // ============================================================
 
 import crypto from 'crypto';
@@ -16,7 +23,7 @@ import axios from 'axios';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
 import { AuthenticationError } from '../types/errors.js';
-import { redisClient } from '@utils/redis.js';
+import { redisGet, redisSet, redisDel } from '@utils/redis.js';
 
 // ─── Tipos ───────────────────────────────────────────────────
 
@@ -78,10 +85,14 @@ export class AuthService {
 
     // Guardar em Redis com TTL de 10 minutos
     // (era global.authSessions — perde-se ao reiniciar Railway)
-    await redisClient.set(
+    // redisSet(key, value, ttlSegundos) — TTL passado como número,
+    // não como { EX: ... } (isso é específico da API nativa do
+    // cliente `redis`; redisSet já trata o TTL internamente, com
+    // setEx quando o Redis está disponível).
+    await redisSet(
       `pkce:${state}`,
       JSON.stringify({ codeVerifier: pkce.codeVerifier, state }),
-      { EX: 600 }, // 10 minutos
+      600, // 10 minutos
     );
 
     const params = new URLSearchParams({
@@ -108,8 +119,8 @@ export class AuthService {
     code: string,
     state: string,
   ): Promise<TokenResponse> {
-    // Recuperar codeVerifier do Redis
-    const raw = await redisClient.get(`pkce:${state}`);
+    // Recuperar codeVerifier do Redis (ou memória, via fallback)
+    const raw = await redisGet(`pkce:${state}`);
     if (!raw) {
       throw new AuthenticationError('State inválido ou expirado');
     }
@@ -117,7 +128,7 @@ export class AuthService {
     const { codeVerifier } = JSON.parse(raw) as { codeVerifier: string };
 
     // Apagar imediatamente (uso único)
-    await redisClient.del(`pkce:${state}`);
+    await redisDel(`pkce:${state}`);
 
     try {
       const tokenResponse = await axios.post(
@@ -160,7 +171,10 @@ export class AuthService {
 
   /**
    * Obtém a URL WebSocket privada com OTP para uma conta.
-   * Deve ser chamado SEMPRE antes de criar/reconectar o WebSocket.
+   * Deve ser chamado SEMPRE antes de criar/reconectar o WebSocket —
+   * o OTP é de uso único, por isso este método deve ser invocado de
+   * novo em cada tentativa de ligação, nunca reaproveitando uma URL
+   * já usada (ver WebSocketManager.getUrl no manager.ts).
    *
    * POST https://api.derivws.com/trading/v1/options/accounts/{accountId}/otp
    * Authorization: Bearer {accessToken}

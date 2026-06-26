@@ -1,27 +1,41 @@
 // ============================================================
-// NEXORA FOREX — Deriv WS Adapter (Privado)
+// NEXORA FOREX — Deriv WS Adapter
 // ============================================================
-// Adaptador que usa a conexão privada (autenticada) gerida pelo
-// WebSocketManager. Não cria WebSockets próprios — recebe o WS
-// da sessão via getDerivWs().
+// Fluxo correcto da API Deriv para comprar um contrato:
+//   1. Enviar "proposal" com os parâmetros do contrato
+//   2. Aguardar resposta "proposal" com o id da proposta
+//   3. Enviar "buy" com o proposalId + ask_price
+//   4. Aguardar resposta "buy" com o contract_id
+//   5. Subscrever "proposal_open_contract" para acompanhar
+//   6. Resolver quando contract fecha (is_sold / status=sold)
 //
-// Correcções aplicadas vs versão anterior:
-//   ✅ buy usa ask_price da resposta proposal (não params.stake)
-//   ✅ req_id numérico incremental (não aleatório — pode colidir)
-//   ✅ waitForContract: forget usa subscription.id do servidor
-//   ✅ subscribeToTicks: filtra por symbol E req_id inicial
-//   ✅ Todos os cleanup paths garantidos (settled flag)
-//   ✅ Detecção de fuga de listeners com limite configurável
+// ─── Versão migrada para o WebSocketManager ───────────────────
+// Esta versão NÃO regista listeners 'message' diretamente no
+// socket bruto. Em vez disso usa wsManager.send() (que já devolve
+// a resposta correspondente ao req_id, via pendingRequests) e
+// wsManager.subscribe()/unsubscribe() (que já tratam o
+// subscription.id real da Deriv).
+//
+// Isto resolve de raiz o problema de listeners acumulados:
+// antes, cada chamada a buyContract/waitForContract/subscribeToTicks
+// registava o seu próprio handler 'message' no WebSocket — com
+// muitos bots simultâneos, o mesmo evento 'message' do socket era
+// testado contra dezenas de listeners (custo O(n) por mensagem).
+// Agora, há um único ponto de entrada de mensagens por sessão (o
+// WebSocketManager), e o roteamento para o pedido/subscrição certa
+// é feito internamente por req_id / subscription.id — O(1) por
+// mensagem, independentemente de quantas operações estão em curso.
 // ============================================================
 
-import { WebSocket } from 'ws';
+import { WebSocketManager } from '@websocket/manager.js';
 import { DerivWsAdapter } from './bot.types.js';
 import logger from '@utils/logger.js';
 
-// ─── Erro tipado da Deriv ────────────────────────────────────
-
+// Preserva o código de erro da Deriv (ex: "InsufficientBalance",
+// "InputValidationFailed") para que as estratégias possam reagir de
+// forma específica, em vez de fazer parsing frágil da mensagem.
 export class DerivApiError extends Error {
-  readonly code: string;
+  code: string;
   constructor(message: string, code: string) {
     super(message);
     this.name = 'DerivApiError';
@@ -29,47 +43,45 @@ export class DerivApiError extends Error {
   }
 }
 
-// ─── req_id incremental (por adapter instance) ───────────────
-// Usar um contador por adapter evita colisões quando múltiplos
-// bots partilham a mesma conexão WS.
-
-let globalReqIdCounter = 100_000;
-function nextReqId(): number {
-  return ++globalReqIdCounter;
-}
-
-// ─── Mapeamento durationUnit ─────────────────────────────────
-
+// ─── Mapeamento durationUnit → duration_unit da Deriv ────────
 const DURATION_UNIT_MAP: Record<string, string> = {
   ticks: 't',
-  s: 's',
-  m: 'm',
-  h: 'h',
-  d: 'd',
-  t: 't',
+  s:     's',
+  m:     'm',
+  h:     'h',
+  d:     'd',
+  t:     't',
 };
 
-// ─── Detecção de fuga de listeners ───────────────────────────
+export function createDerivWsAdapter(getWsManager: () => WebSocketManager | null): DerivWsAdapter {
 
-const MAX_SAFE_LISTENERS = 50;
-
-function warnIfListenerLeak(ws: WebSocket, context: string): void {
-  const count = ws.listenerCount('message');
-  if (count > MAX_SAFE_LISTENERS) {
-    logger.warn('[DerivAdapter] ⚠ Possível fuga de listeners', { context, count });
+  function requireManager(): WebSocketManager {
+    const manager = getWsManager();
+    if (!manager) {
+      throw new Error('Deriv WebSocket não está disponível');
+    }
+    return manager;
   }
-}
 
-// ─── Factory ─────────────────────────────────────────────────
+  // Lê o código de erro Deriv de uma resposta, se existir, e lança
+  // DerivApiError em vez de devolver a mensagem crua — mantém o
+  // mesmo comportamento que as estratégias já esperam.
+  function throwIfError(msg: any, fallbackMessage: string): void {
+    if (msg?.error) {
+      throw new DerivApiError(
+        msg.error.message ?? fallbackMessage,
+        msg.error.code ?? 'UNKNOWN',
+      );
+    }
+  }
 
-export function createDerivWsAdapter(
-  getDerivWs: () => WebSocket | null,
-): DerivWsAdapter {
-
-  // ──────────────────────────────────────────────────────────
-  // buyContract
-  // Fluxo: proposal → (captura ask_price) → buy → contractId
-  // ──────────────────────────────────────────────────────────
+  // ─── buyContract ──────────────────────────────────────────
+  // Fluxo: proposal → buy → contractId
+  // Cada send() é isolado por req_id dentro do WebSocketManager —
+  // múltiplos bots a comprar em simultâneo na mesma sessão não
+  // podem cruzar respostas entre si, porque não há estado global
+  // partilhado: o manager devolve exatamente a resposta do req_id
+  // que esta chamada enviou.
 
   async function buyContract(params: {
     symbol: string;
@@ -79,167 +91,65 @@ export function createDerivWsAdapter(
     durationUnit: string;
     currency: string;
   }): Promise<{ contractId: string }> {
-
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível');
-    }
-
+    const manager = requireManager();
     const durationUnit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
 
-    // ── Passo 1: proposal ───────────────────────────────────
-    // Captura proposalId E ask_price para usar no buy.
+    // ── Passo 1: pedir proposal ─────────────────────────────
+    const proposalResponse = await manager.send({
+      proposal:          1,
+      amount:            params.stake,
+      basis:             'stake',
+      contract_type:     params.contractType,
+      currency:          params.currency,
+      duration:          params.duration,
+      duration_unit:     durationUnit,
+      underlying_symbol: params.symbol,
+    }, 15_000);
 
-    const { proposalId, askPrice } = await new Promise<{
-      proposalId: string;
-      askPrice: number;
-    }>((resolve, reject) => {
-      const reqId = nextReqId();
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout>;
+    throwIfError(proposalResponse, 'Erro na proposta');
 
-      function cleanup() {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        ws.removeListener('message', handler);
-      }
-
-      function handler(raw: Buffer | string) {
-        if (settled) return;
-        let msg: Record<string, unknown>;
-        try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-        if (msg.req_id !== reqId) return;
-
-        if (msg.error) {
-          const err = msg.error as Record<string, unknown>;
-          cleanup();
-          reject(new DerivApiError(
-            String(err.message ?? 'Erro na proposta'),
-            String(err.code ?? 'UNKNOWN'),
-          ));
-          return;
-        }
-
-        if (msg.msg_type === 'proposal') {
-          const proposal = msg.proposal as Record<string, unknown> | undefined;
-          if (proposal?.id) {
-            cleanup();
-            resolve({
-              proposalId: String(proposal.id),
-              // ask_price é o preço real a pagar — NUNCA usar params.stake aqui
-              askPrice: Number(proposal.ask_price ?? params.stake),
-            });
-            return;
-          }
-        }
-
-        cleanup();
-        reject(new Error('Resposta de proposal inválida ou sem id'));
-      }
-
-      timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Timeout ao obter proposta (15s)'));
-      }, 15_000);
-
-      ws.on('message', handler);
-      warnIfListenerLeak(ws, 'buyContract:proposal');
-
-      ws.send(JSON.stringify({
-        proposal:          1,
-        amount:            params.stake,
-        basis:             'stake',
-        contract_type:     params.contractType,
-        currency:          params.currency,
-        duration:          params.duration,
-        duration_unit:     durationUnit,
-        underlying_symbol: params.symbol,
-        req_id:            reqId,
-      }));
-
-      logger.debug('[DerivAdapter] proposal enviada', {
-        reqId, symbol: params.symbol, stake: params.stake,
-        contractType: params.contractType, duration: params.duration, durationUnit,
-      });
-    });
-
-    // ── Passo 2: buy ────────────────────────────────────────
-    // Reler WS — pode ter mudado se a sessão trocou de conta.
-
-    const ws2 = getDerivWs();
-    if (!ws2 || ws2.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível (após proposal)');
+    const proposalId = proposalResponse?.proposal?.id;
+    if (!proposalId) {
+      throw new Error('Resposta de proposal inválida');
     }
 
-    return new Promise((resolve, reject) => {
-      const reqId = nextReqId();
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout>;
-
-      function cleanup() {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        ws2.removeListener('message', handler);
-      }
-
-      function handler(raw: Buffer | string) {
-        if (settled) return;
-        let msg: Record<string, unknown>;
-        try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-        if (msg.req_id !== reqId) return;
-
-        if (msg.error) {
-          const err = msg.error as Record<string, unknown>;
-          cleanup();
-          reject(new DerivApiError(
-            String(err.message ?? 'Erro ao comprar contrato'),
-            String(err.code ?? 'UNKNOWN'),
-          ));
-          return;
-        }
-
-        if (msg.msg_type === 'buy') {
-          const buy = msg.buy as Record<string, unknown> | undefined;
-          if (buy?.contract_id) {
-            cleanup();
-            resolve({ contractId: String(buy.contract_id) });
-            return;
-          }
-        }
-
-        cleanup();
-        reject(new Error('Resposta buy inválida'));
-      }
-
-      timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Timeout ao comprar contrato (15s)'));
-      }, 15_000);
-
-      ws2.on('message', handler);
-      warnIfListenerLeak(ws2, 'buyContract:buy');
-
-      // CRÍTICO: price = ask_price da resposta proposal, NÃO params.stake
-      ws2.send(JSON.stringify({
-        buy:    proposalId,
-        price:  askPrice,
-        req_id: reqId,
-      }));
-
-      logger.debug('[DerivAdapter] buy enviado', {
-        reqId, proposalId, askPrice,
-      });
+    logger.debug('[DerivAdapter] proposal recebida', {
+      proposalId, symbol: params.symbol, stake: params.stake,
+      contractType: params.contractType, duration: params.duration,
+      durationUnit,
     });
+
+    // ── Passo 2: comprar com o proposalId ──────────────────
+    // Reler requireManager() — se a sessão trocou de conta entre o
+    // passo 1 e aqui, o manager antigo pode já não ser o ativo.
+    const manager2 = requireManager();
+
+    const buyResponse = await manager2.send({
+      buy:   proposalId,
+      price: params.stake,
+    }, 15_000);
+
+    throwIfError(buyResponse, 'Erro ao comprar contrato');
+
+    const contractId = buyResponse?.buy?.contract_id;
+    if (!contractId) {
+      throw new Error('Resposta buy inválida');
+    }
+
+    logger.debug('[DerivAdapter] buy concluído', { proposalId, contractId });
+    return { contractId: String(contractId) };
   }
 
-  // ──────────────────────────────────────────────────────────
-  // waitForContract
-  // Subscreve proposal_open_contract e resolve quando fecha.
-  // ──────────────────────────────────────────────────────────
+  // ─── waitForContract ──────────────────────────────────────
+  // Subscreve proposal_open_contract e resolve quando fechar.
+  // Usa wsManager.subscribe(), que já trata o subscription.id real
+  // da Deriv internamente — aqui só filtramos pelo contract_id certo
+  // dentro do handler, e cancelamos a subscrição com unsubscribe()
+  // assim que tivermos o resultado (equivalente ao "forget" antigo,
+  // mas sem qualquer listener registado manualmente no socket).
+  //
+  // Timeout de 35s — contratos de duração curta (ticks/segundos, o
+  // caso comum dos bots do catálogo) resolvem bem dentro disto.
 
   async function waitForContract(contractId: string): Promise<{
     profit: number;
@@ -247,159 +157,103 @@ export function createDerivWsAdapter(
     entryTick: number;
     exitTick: number;
   }> {
-
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível');
-    }
+    const manager = requireManager();
 
     return new Promise((resolve, reject) => {
-      const reqId = nextReqId();
       let settled = false;
+      let subscriptionId: string | null = null;
       let timer: ReturnType<typeof setTimeout>;
-      let subscriptionServerId: string | null = null;
 
       function cleanup() {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        ws.removeListener('message', handler);
-
-        // Cancelar subscrição no servidor Deriv
-        if (subscriptionServerId && ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(JSON.stringify({ forget: subscriptionServerId, req_id: nextReqId() }));
-          } catch { /* ignorar */ }
-        }
-      }
-
-      function handler(raw: Buffer | string) {
-        if (settled) return;
-        let msg: Record<string, unknown>;
-        try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-        // Erros com o nosso req_id
-        if (msg.error && msg.req_id === reqId) {
-          const err = msg.error as Record<string, unknown>;
-          cleanup();
-          reject(new DerivApiError(
-            String(err.message ?? 'Erro ao acompanhar contrato'),
-            String(err.code ?? 'UNKNOWN'),
-          ));
-          return;
-        }
-
-        const poc = msg.proposal_open_contract as Record<string, unknown> | undefined;
-        if (!poc) return;
-
-        // Filtrar pelo contractId correcto
-        if (String(poc.contract_id) !== contractId) return;
-
-        // Capturar serverId na primeira mensagem
-        const sub = msg.subscription as Record<string, unknown> | undefined;
-        if (sub?.id && !subscriptionServerId) {
-          subscriptionServerId = String(sub.id);
-        }
-
-        // Contrato fechou?
-        const isClosed =
-          poc.status === 'sold' ||
-          poc.is_sold === 1 ||
-          poc.is_expired === 1 ||
-          poc.is_settleable === 1;
-
-        if (isClosed) {
-          cleanup();
-          const profit = Number(poc.profit ?? 0);
-          resolve({
-            profit,
-            won:       profit > 0,
-            entryTick: Number(poc.entry_tick  ?? 0),
-            exitTick:  Number(poc.exit_tick   ?? 0),
+        if (subscriptionId) {
+          manager.unsubscribe(subscriptionId).catch((err: any) => {
+            logger.warn('[DerivAdapter] Falha ao cancelar subscrição de contrato', {
+              contractId, error: err?.message,
+            });
           });
         }
       }
 
-      // Timeout de 35s — adequado para contratos curtos (ticks/segundos).
-      // Evita listeners mortos a acumular sob carga alta.
+      function handler(msg: any) {
+        if (settled) return;
+        try {
+          if (msg.error) {
+            cleanup();
+            reject(new DerivApiError(
+              msg.error.message ?? 'Erro ao acompanhar contrato',
+              msg.error.code ?? 'UNKNOWN',
+            ));
+            return;
+          }
+
+          const poc = msg.proposal_open_contract;
+          if (!poc || String(poc.contract_id) !== contractId) return;
+
+          if (poc.status === 'sold' || poc.is_sold || poc.is_expired || poc.is_settleable) {
+            cleanup();
+            const profit = parseFloat(poc.profit ?? '0');
+            resolve({
+              profit,
+              won:       profit > 0,
+              entryTick: poc.entry_tick ?? 0,
+              exitTick:  poc.exit_tick  ?? 0,
+            });
+          }
+        } catch (err) {
+          logger.warn('[DerivAdapter] Erro ao processar update de contrato', { contractId, err });
+        }
+      }
+
       timer = setTimeout(() => {
         cleanup();
-        reject(new Error('Timeout aguardando resultado do contrato (35s)'));
+        reject(new Error('Timeout aguardando resultado do contrato'));
       }, 35_000);
 
-      ws.on('message', handler);
-      warnIfListenerLeak(ws, 'waitForContract');
-
-      ws.send(JSON.stringify({
-        proposal_open_contract: 1,
-        contract_id:            Number(contractId),
-        subscribe:              1,
-        req_id:                 reqId,
-      }));
-
-      logger.debug('[DerivAdapter] A aguardar contrato', { reqId, contractId });
+      subscriptionId = manager.subscribe(
+        'proposal_open_contract',
+        { proposal_open_contract: 1, contract_id: parseInt(contractId, 10) },
+        handler,
+      );
     });
   }
 
-  // ──────────────────────────────────────────────────────────
-  // subscribeToTicks
-  // Subscrição contínua de ticks para um símbolo.
-  // Filtra por symbol E pelo req_id da primeira mensagem.
-  // ──────────────────────────────────────────────────────────
+  // ─── subscribeToTicks ─────────────────────────────────────
+  // Mesma lógica: wsManager.subscribe() trata o subscription.id
+  // real, e unsubscribe() faz o "forget" correto.
 
   function subscribeToTicks(
     symbol: string,
     onTick: (price: number) => void,
   ): { unsubscribe: () => void } {
-
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      logger.warn('[DerivAdapter] WebSocket indisponível para ticks', { symbol });
+    const manager = getWsManager();
+    if (!manager) {
+      logger.warn('[DerivAdapter] WebSocket indisponível para ticks');
       return { unsubscribe: () => {} };
     }
 
-    const reqId = nextReqId();
-    let serverId: string | null = null;
     let unsubscribed = false;
 
-    function handler(raw: Buffer | string) {
+    function handler(msg: any) {
       if (unsubscribed) return;
-      let msg: Record<string, unknown>;
-      try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-      if (msg.msg_type !== 'tick') return;
-
-      const tick = msg.tick as Record<string, unknown> | undefined;
-      if (!tick) return;
-
-      // Filtrar pelo símbolo correcto
-      if (tick.symbol !== symbol) return;
-
-      // Capturar serverId na primeira mensagem para poder cancelar
-      if (!serverId) {
-        const sub = msg.subscription as Record<string, unknown> | undefined;
-        if (sub?.id) serverId = String(sub.id);
+      if (msg.msg_type === 'tick' && msg.tick?.symbol === symbol) {
+        onTick(parseFloat(msg.tick.quote));
       }
-
-      onTick(Number(tick.quote));
     }
 
-    ws.on('message', handler);
-    warnIfListenerLeak(ws, 'subscribeToTicks');
-
-    ws.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: reqId }));
-    logger.debug('[DerivAdapter] Subscrito a ticks', { symbol, reqId });
+    const subscriptionId = manager.subscribe('tick', { ticks: symbol }, handler);
+    logger.debug('[DerivAdapter] Subscrito a ticks', { symbol });
 
     return {
       unsubscribe: () => {
         if (unsubscribed) return;
         unsubscribed = true;
-        ws.removeListener('message', handler);
-
-        if (serverId && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ forget: serverId, req_id: nextReqId() }));
-          logger.debug('[DerivAdapter] Tick unsubscribe enviado', { symbol, serverId });
-        }
+        manager.unsubscribe(subscriptionId).catch((err: any) => {
+          logger.warn('[DerivAdapter] Falha ao cancelar subscrição de ticks', { symbol, error: err?.message });
+        });
+        logger.debug('[DerivAdapter] Tick subscription cancelada', { symbol });
       },
     };
   }

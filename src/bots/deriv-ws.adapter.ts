@@ -5,11 +5,13 @@
 // WebSocketManager. Não cria WebSockets próprios — recebe o WS
 // da sessão via getDerivWs().
 //
-// Correcções aplicadas vs versão anterior:
+// Correcções aplicadas:
+//   ✅ req_id começa em 500_000 — range separado do server.ts
+//      (que começa em 1000) para evitar colisões quando ambos
+//      partilham o mesmo WebSocket Deriv
 //   ✅ buy usa ask_price da resposta proposal (não params.stake)
-//   ✅ req_id numérico incremental (não aleatório — pode colidir)
 //   ✅ waitForContract: forget usa subscription.id do servidor
-//   ✅ subscribeToTicks: filtra por symbol E req_id inicial
+//   ✅ subscribeToTicks: filtra por symbol para evitar cross-talk
 //   ✅ Todos os cleanup paths garantidos (settled flag)
 //   ✅ Detecção de fuga de listeners com limite configurável
 // ============================================================
@@ -29,24 +31,27 @@ export class DerivApiError extends Error {
   }
 }
 
-// ─── req_id incremental (por adapter instance) ───────────────
-// Usar um contador por adapter evita colisões quando múltiplos
-// bots partilham a mesma conexão WS.
+// ─── req_id incremental ───────────────────────────────────────
+// Range 500_000+ para não colidir com:
+//   - server.ts nextReqId (começa em 1000, incrementa por sessão)
+//   - manager.ts nextManagerReqId (começa em 1, incrementa global)
+// Todos os WS partilhados da mesma conta recebem estas mensagens,
+// por isso os req_ids TÊM de ser únicos globalmente.
 
-let globalReqIdCounter = 100_000;
+let _adapterReqId = 500_000;
 function nextReqId(): number {
-  return ++globalReqIdCounter;
+  return ++_adapterReqId;
 }
 
 // ─── Mapeamento durationUnit ─────────────────────────────────
 
 const DURATION_UNIT_MAP: Record<string, string> = {
   ticks: 't',
-  s: 's',
-  m: 'm',
-  h: 'h',
-  d: 'd',
-  t: 't',
+  s:     's',
+  m:     'm',
+  h:     'h',
+  d:     'd',
+  t:     't',
 };
 
 // ─── Detecção de fuga de listeners ───────────────────────────
@@ -88,7 +93,6 @@ export function createDerivWsAdapter(
     const durationUnit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
 
     // ── Passo 1: proposal ───────────────────────────────────
-    // Captura proposalId E ask_price para usar no buy.
 
     const { proposalId, askPrice } = await new Promise<{
       proposalId: string;
@@ -117,7 +121,7 @@ export function createDerivWsAdapter(
           cleanup();
           reject(new DerivApiError(
             String(err.message ?? 'Erro na proposta'),
-            String(err.code ?? 'UNKNOWN'),
+            String(err.code   ?? 'UNKNOWN'),
           ));
           return;
         }
@@ -197,7 +201,7 @@ export function createDerivWsAdapter(
           cleanup();
           reject(new DerivApiError(
             String(err.message ?? 'Erro ao comprar contrato'),
-            String(err.code ?? 'UNKNOWN'),
+            String(err.code   ?? 'UNKNOWN'),
           ));
           return;
         }
@@ -230,9 +234,7 @@ export function createDerivWsAdapter(
         req_id: reqId,
       }));
 
-      logger.debug('[DerivAdapter] buy enviado', {
-        reqId, proposalId, askPrice,
-      });
+      logger.debug('[DerivAdapter] buy enviado', { reqId, proposalId, askPrice });
     });
   }
 
@@ -265,7 +267,6 @@ export function createDerivWsAdapter(
         clearTimeout(timer);
         ws.removeListener('message', handler);
 
-        // Cancelar subscrição no servidor Deriv
         if (subscriptionServerId && ws.readyState === WebSocket.OPEN) {
           try {
             ws.send(JSON.stringify({ forget: subscriptionServerId, req_id: nextReqId() }));
@@ -278,13 +279,12 @@ export function createDerivWsAdapter(
         let msg: Record<string, unknown>;
         try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-        // Erros com o nosso req_id
         if (msg.error && Number(msg.req_id) === reqId) {
           const err = msg.error as Record<string, unknown>;
           cleanup();
           reject(new DerivApiError(
             String(err.message ?? 'Erro ao acompanhar contrato'),
-            String(err.code ?? 'UNKNOWN'),
+            String(err.code   ?? 'UNKNOWN'),
           ));
           return;
         }
@@ -292,20 +292,17 @@ export function createDerivWsAdapter(
         const poc = msg.proposal_open_contract as Record<string, unknown> | undefined;
         if (!poc) return;
 
-        // Filtrar pelo contractId correcto
         if (String(poc.contract_id) !== contractId) return;
 
-        // Capturar serverId na primeira mensagem
         const sub = msg.subscription as Record<string, unknown> | undefined;
         if (sub?.id && !subscriptionServerId) {
           subscriptionServerId = String(sub.id);
         }
 
-        // Contrato fechou?
         const isClosed =
-          poc.status === 'sold' ||
-          poc.is_sold === 1 ||
-          poc.is_expired === 1 ||
+          poc.status       === 'sold' ||
+          poc.is_sold      === 1      ||
+          poc.is_expired   === 1      ||
           poc.is_settleable === 1;
 
         if (isClosed) {
@@ -314,14 +311,12 @@ export function createDerivWsAdapter(
           resolve({
             profit,
             won:       profit > 0,
-            entryTick: Number(poc.entry_tick  ?? 0),
-            exitTick:  Number(poc.exit_tick   ?? 0),
+            entryTick: Number(poc.entry_tick ?? 0),
+            exitTick:  Number(poc.exit_tick  ?? 0),
           });
         }
       }
 
-      // Timeout de 35s — adequado para contratos curtos (ticks/segundos).
-      // Evita listeners mortos a acumular sob carga alta.
       timer = setTimeout(() => {
         cleanup();
         reject(new Error('Timeout aguardando resultado do contrato (35s)'));
@@ -344,7 +339,6 @@ export function createDerivWsAdapter(
   // ──────────────────────────────────────────────────────────
   // subscribeToTicks
   // Subscrição contínua de ticks para um símbolo.
-  // Filtra por symbol E pelo req_id da primeira mensagem.
   // ──────────────────────────────────────────────────────────
 
   function subscribeToTicks(
@@ -372,10 +366,8 @@ export function createDerivWsAdapter(
       const tick = msg.tick as Record<string, unknown> | undefined;
       if (!tick) return;
 
-      // Filtrar pelo símbolo correcto
       if (tick.symbol !== symbol) return;
 
-      // Capturar serverId na primeira mensagem para poder cancelar
       if (!serverId) {
         const sub = msg.subscription as Record<string, unknown> | undefined;
         if (sub?.id) serverId = String(sub.id);

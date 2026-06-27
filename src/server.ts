@@ -2,10 +2,12 @@
 // NEXORA FOREX — Server
 // ============================================================
 // CORRECÇÕES DESTA VERSÃO:
-//   ✅ Deduplicação de sessões por accountId — fecha sessão
-//      antiga antes de criar nova (evita múltiplos WS Deriv
-//      para a mesma conta e o limite de 5 conexões da Deriv)
-//   ✅ auth.service usa redisGet/redisSet (sem erro Redis)
+//   ✅ setupDerivMessageHandler: remove listener 'message' antigo
+//      antes de adicionar novo — evita acumulação de listeners em
+//      cada reconexão (cada reconexão criava um novo handler mas
+//      nunca removia o anterior, causando mensagens duplicadas e
+//      fuga de memória)
+//   ✅ Deduplicação de sessões por accountId
 //   ✅ Reconexão Deriv com novo OTP obrigatório
 //   ✅ Bot aguarda WS disponível (waitForDerivWs)
 //   ✅ Limite de sessões simultâneas (DoS protection)
@@ -45,7 +47,7 @@ const AUTH_TIMEOUT_MS     = 30_000;
 const RECONNECT_BASE_MS   = 3_000;
 const RECONNECT_MAX_MS    = 30_000;
 const RECONNECT_MAX_TRIES = 8;
-const WS_WAIT_TIMEOUT_MS  = 20_000; // tempo max para bot aguardar WS
+const WS_WAIT_TIMEOUT_MS  = 20_000;
 
 // ─── Admins ───────────────────────────────────────────────────
 const ADMIN_IDS = new Set<string>(
@@ -59,24 +61,22 @@ const wss = new WebSocketServer({ server });
 
 // ─── Sessão ───────────────────────────────────────────────────
 interface ClientSession {
-  derivWs:           WebSocket | null;
-  token:             string;
-  accountId:         string | null;
-  pingInterval:      NodeJS.Timeout | null;
-  authTimeout:       NodeJS.Timeout | null;
-  reconnectTimer:    NodeJS.Timeout | null;
-  reconnectAttempts: number;
-  authenticated:     boolean;
-  isAdmin:           boolean;
-  botManager:        BotManager | null;
-  nextReqId:         number;
+  derivWs:              WebSocket | null;
+  // Handler actual registado no derivWs para poder remover depois
+  derivMessageHandler:  ((raw: Buffer) => void) | null;
+  token:                string;
+  accountId:            string | null;
+  pingInterval:         NodeJS.Timeout | null;
+  authTimeout:          NodeJS.Timeout | null;
+  reconnectTimer:       NodeJS.Timeout | null;
+  reconnectAttempts:    number;
+  authenticated:        boolean;
+  isAdmin:              boolean;
+  botManager:           BotManager | null;
+  nextReqId:            number;
 }
 
-// Mapa principal: clientWs → sessão
 const sessions = new Map<WebSocket, ClientSession>();
-
-// Índice por accountId → clientWs (para deduplicação)
-// Garante que nunca há 2 sessões activas para a mesma conta
 const sessionsByAccount = new Map<string, WebSocket>();
 
 // ─── Helpers ──────────────────────────────────────────────────
@@ -96,15 +96,12 @@ function getNextReqId(session: ClientSession): number {
 }
 
 // ─── Aguardar WS disponível ───────────────────────────────────
-// Bots chamam isto antes de operar — se o WS está a reconectar,
-// aguarda até estar disponível ou atingir timeout.
 
 function waitForDerivWs(
   session: ClientSession,
   timeoutMs = WS_WAIT_TIMEOUT_MS,
 ): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    // Já disponível
     if (session.derivWs?.readyState === WebSocket.OPEN) {
       return resolve(session.derivWs);
     }
@@ -134,9 +131,18 @@ function subscribeAutomatic(derivWs: WebSocket, session: ClientSession): void {
 }
 
 // ─── Proxy Deriv → Frontend ───────────────────────────────────
+// CORRECÇÃO CRÍTICA: a função devolve o handler criado para que
+// connectToDerivWS possa guardá-lo em session.derivMessageHandler
+// e removê-lo antes de registar um novo em cada reconexão.
+// Sem isto, cada reconexão acumulava um novo listener 'message' no
+// mesmo derivWs (que é um objecto novo, mas o padrão era reutilizar
+// o socket antigo em algumas versões) — causando mensagens
+// duplicadas enviadas ao frontend e fuga de memória.
 
-function setupDerivMessageHandler(clientWs: WebSocket, derivWs: WebSocket): void {
-  derivWs.on('message', (raw: Buffer) => {
+function buildDerivMessageHandler(
+  clientWs: WebSocket,
+): (raw: Buffer) => void {
+  return (raw: Buffer) => {
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
 
@@ -152,8 +158,8 @@ function setupDerivMessageHandler(clientWs: WebSocket, derivWs: WebSocket): void
         break;
       case 'tick':
         sendToClient(clientWs, 'tick', {
-          quote: (msg.tick as any)?.quote,
-          epoch: (msg.tick as any)?.epoch,
+          quote:  (msg.tick as any)?.quote,
+          epoch:  (msg.tick as any)?.epoch,
           symbol: (msg.tick as any)?.symbol,
         });
         break;
@@ -185,7 +191,7 @@ function setupDerivMessageHandler(clientWs: WebSocket, derivWs: WebSocket): void
       case 'history': sendToClient(clientWs, 'history', { history: msg.history }); break;
       default: sendToClient(clientWs, (msg.msg_type as string) ?? 'message', msg);
     }
-  });
+  };
 }
 
 // ─── Conectar ao Deriv WS ─────────────────────────────────────
@@ -209,7 +215,18 @@ async function connectToDerivWS(
     derivWs.once('open', () => {
       clearTimeout(timeout);
       logger.info('[WS] Connected to Deriv WS');
-      setupDerivMessageHandler(clientWs, derivWs);
+
+      // CORRECÇÃO: construir handler e guardá-lo na sessão.
+      // Se já havia um handler antigo registado neste socket (não
+      // deve acontecer pois é um novo WebSocket, mas por segurança),
+      // removê-lo antes de registar o novo.
+      if (session.derivMessageHandler) {
+        derivWs.removeListener('message', session.derivMessageHandler);
+      }
+      const handler = buildDerivMessageHandler(clientWs);
+      session.derivMessageHandler = handler;
+      derivWs.on('message', handler);
+
       subscribeAutomatic(derivWs, session);
       resolve();
     });
@@ -221,6 +238,11 @@ async function connectToDerivWS(
     });
 
     derivWs.once('close', (code, reason) => {
+      // Limpar handler para não ficar pendurado
+      if (session.derivMessageHandler) {
+        derivWs.removeListener('message', session.derivMessageHandler);
+        session.derivMessageHandler = null;
+      }
       session.derivWs = null;
       logger.warn('[WS] Deriv WS disconnected', { code, reason: reason?.toString() });
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -260,7 +282,6 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
       await connectToDerivWS(clientWs, otpData.url, session);
       session.reconnectAttempts = 0;
 
-      // Reinicializar BotManager com novo WS
       if (session.botManager) {
         await session.botManager.stopAll();
         session.botManager.removeAllListeners();
@@ -279,7 +300,6 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
 function initBotManagerForSession(clientWs: WebSocket, session: ClientSession): void {
   if (!session.derivWs) return;
 
-  // getDerivWs aguarda WS disponível em vez de retornar null
   const adapter = createDerivWsAdapter(() => session.derivWs);
 
   const manager = new BotManager(adapter);
@@ -322,7 +342,6 @@ async function handleBotMessage(
         const catalogBot = await BotCatalog.getById(catalogBotId);
         if (!catalogBot?.isActive) { sendError(ws, 'Bot não encontrado.', 'BOT_NOT_FOUND'); break; }
 
-        // Verificar WS disponível antes de iniciar bot
         try {
           await waitForDerivWs(session);
         } catch {
@@ -364,7 +383,6 @@ async function handleBotMessage(
       case 'resume_bot': {
         const botId = payload.botId as string;
         if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
-        // Verificar WS antes de retomar
         try { await waitForDerivWs(session); } catch {
           sendError(ws, 'Conexão Deriv não disponível.', 'DERIV_DISCONNECTED'); break;
         }
@@ -426,16 +444,19 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
   const session = sessions.get(ws);
   if (!session) return;
 
-  // Limpar timeout de auth
   if (session.authTimeout) { clearTimeout(session.authTimeout); session.authTimeout = null; }
 
-  // Parar estado anterior
   if (session.botManager) {
     await session.botManager.stopAll();
     session.botManager.removeAllListeners();
     session.botManager = null;
   }
   if (session.derivWs) {
+    // Remover handler antes de terminar o socket
+    if (session.derivMessageHandler) {
+      session.derivWs.removeListener('message', session.derivMessageHandler);
+      session.derivMessageHandler = null;
+    }
     session.derivWs.removeAllListeners();
     session.derivWs.terminate();
     session.derivWs = null;
@@ -455,7 +476,6 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
 
     const targetAccountId = target.account_id;
 
-    // ── DEDUPLICAÇÃO: fechar sessão antiga da mesma conta ────
     const existingWs = sessionsByAccount.get(targetAccountId);
     if (existingWs && existingWs !== ws) {
       logger.warn('[WS] Sessão duplicada detectada, a fechar a antiga', { accountId: targetAccountId });
@@ -469,10 +489,8 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     session.authenticated = true;
     session.reconnectAttempts = 0;
 
-    // Registar no índice de contas
     sessionsByAccount.set(targetAccountId, ws);
 
-    // OTP + WS Deriv
     const otpData = await derivAPI.getOTP(targetAccountId);
     if (!otpData.url) { sendError(ws, 'Falha ao obter URL WS', 'OTP_FAILED'); ws.close(); return; }
 
@@ -481,14 +499,18 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
 
     sendToClient(ws, 'authenticated', {
       accounts: accounts.map((a: any) => ({
-        account_id: a.account_id, loginid: a.loginid ?? a.account_id,
-        balance: a.balance ?? 0, currency: a.currency ?? 'USD',
-        is_virtual: a.is_virtual ?? false,
+        account_id:   a.account_id,
+        loginid:      a.loginid ?? a.account_id,
+        balance:      a.balance ?? 0,
+        currency:     a.currency ?? 'USD',
+        is_virtual:   a.is_virtual ?? false,
         account_type: a.account_type ?? (a.is_virtual ? 'demo' : 'real'),
       })),
       currentAccount: {
-        account_id: target.account_id, balance: target.balance ?? 0,
-        currency: target.currency ?? 'USD', is_virtual: target.is_virtual ?? false,
+        account_id:   target.account_id,
+        balance:      target.balance ?? 0,
+        currency:     target.currency ?? 'USD',
+        is_virtual:   target.is_virtual ?? false,
         account_type: target.account_type ?? (target.is_virtual ? 'demo' : 'real'),
       },
       isAdmin: session.isAdmin,
@@ -509,7 +531,6 @@ async function cleanupSession(ws: WebSocket): Promise<void> {
   if (!session) return;
   sessions.delete(ws);
 
-  // Remover do índice de contas
   if (session.accountId && sessionsByAccount.get(session.accountId) === ws) {
     sessionsByAccount.delete(session.accountId);
   }
@@ -524,6 +545,10 @@ async function cleanupSession(ws: WebSocket): Promise<void> {
   }
 
   if (session.derivWs) {
+    if (session.derivMessageHandler) {
+      session.derivWs.removeListener('message', session.derivMessageHandler);
+      session.derivMessageHandler = null;
+    }
     session.derivWs.removeAllListeners();
     session.derivWs.terminate();
   }
@@ -549,7 +574,8 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   logger.info('[WS] Client connected', { ip, sessions: sessions.size + 1 });
 
   const session: ClientSession = {
-    derivWs: null, token: '', accountId: null,
+    derivWs: null, derivMessageHandler: null,
+    token: '', accountId: null,
     pingInterval: null, authTimeout: null, reconnectTimer: null,
     reconnectAttempts: 0, authenticated: false, isAdmin: false,
     botManager: null, nextReqId: 1000,
@@ -560,7 +586,6 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, config.websocket.heartbeatInterval);
 
-  // Fechar se não autenticar em 30s
   session.authTimeout = setTimeout(() => {
     if (!session.authenticated) {
       logger.warn('[WS] Auth timeout', { ip });
@@ -568,7 +593,6 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     }
   }, AUTH_TIMEOUT_MS);
 
-  // Auth via query string
   const urlParams = new URLSearchParams(req.url?.split('?')[1] ?? '');
   const tokenFromUrl = urlParams.get('token');
   if (tokenFromUrl) {
@@ -591,7 +615,6 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       return;
     }
 
-    // Ping do cliente → responder localmente
     if (type === 'ping') { sendToClient(ws, 'pong'); return; }
 
     if (type === 'switch_account') {
@@ -610,7 +633,6 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       return;
     }
 
-    // Proxy → Deriv
     if (!session.authenticated || !session.derivWs) {
       sendError(ws, 'Não autenticado', 'NOT_AUTH'); return;
     }
@@ -620,7 +642,6 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
         ? _p as Record<string, unknown>
         : rest as Record<string, unknown>;
 
-      // Garantir req_id numérico inteiro positivo — Deriv rejeita strings e 0
       const existingReqId = rawPayload.req_id;
       const numericReqId = (typeof existingReqId === 'number' && Number.isInteger(existingReqId) && existingReqId > 0)
         ? existingReqId
@@ -727,7 +748,7 @@ const gracefulShutdown = async (signal: string) => {
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
-process.on('uncaughtException', (e) => { logger.error('Uncaught Exception', { message: e.message, stack: e.stack }); process.exit(1); });
+process.on('uncaughtException',  (e) => { logger.error('Uncaught Exception',  { message: e.message, stack: e.stack }); process.exit(1); });
 process.on('unhandledRejection', (r) => { logger.error('Unhandled Rejection', { reason: r }); });
 
 startServer();

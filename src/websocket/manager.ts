@@ -1,13 +1,24 @@
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
-import { v4 as uuidv4 } from 'uuid';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
+
+// ─── req_id numérico incremental ─────────────────────────────
+// CRÍTICO: a Deriv rejeita req_id como string (UUID).
+// Usar contador global garante unicidade entre manager e adapter.
+// Começa em 1 para evitar colisão com o nextReqId do server.ts
+// (que começa em 1000) — mas o range é diferente o suficiente.
+let _globalReqId = 0;
+function nextManagerReqId(): number {
+  return ++_globalReqId;
+}
 
 interface WebSocketSubscription {
   id: string;
   derivSubscriptionId?: string;
   type: string;
+  // originalPayload guardado para re-subscribe após reconexão
+  originalPayload: any;
   handler: (data: any) => void;
   expiresAt?: number;
 }
@@ -40,7 +51,6 @@ interface QueuedSend {
   resolve: (value: any) => void;
   reject: (reason: any) => void;
   timeout: number;
-  hasReqId: boolean;
 }
 
 export class WebSocketManager extends EventEmitter {
@@ -54,8 +64,7 @@ export class WebSocketManager extends EventEmitter {
   private isConnected = false;
   private reconnectAttempts = 0;
   private isManualReconnect = false;
-  private heartbeatInterval: NodeJS.Timeout | null = null;
-  private heartbeatTimeout: NodeJS.Timeout | null = null;
+  private heartbeatIntervalHandle: NodeJS.Timeout | null = null;
   private connectionTimeout: NodeJS.Timeout | null = null;
   private lastMessageAt = Date.now();
   private readonly options: Required<Omit<WebSocketOptions, 'rateLimitPerSecond' | 'url' | 'getUrl'>> & { rateLimitPerSecond: number };
@@ -65,6 +74,7 @@ export class WebSocketManager extends EventEmitter {
   private rateLimiterDrainInterval: NodeJS.Timeout | null = null;
   private sentInCurrentWindow = 0;
 
+  // Mapa reqId → internalSubscriptionId (para linkar serverId)
   private pendingSubscriptionLinks = new Map<string, string>();
 
   constructor(options: WebSocketOptions) {
@@ -117,7 +127,7 @@ export class WebSocketManager extends EventEmitter {
             this.ws?.close();
             reject(new Error('WebSocket connection timeout'));
           }
-        }, 10000);
+        }, 10_000);
 
         this.ws.onopen = () => {
           clearTimeout(this.connectionTimeout!);
@@ -154,10 +164,8 @@ export class WebSocketManager extends EventEmitter {
         // Códigos comuns que explicam "desconecta logo a seguir":
         //   1000  Normal closure (servidor decidiu fechar)
         //   1006  Abnormal closure (rede/proxy cortou, sem close frame)
-        //   1008  Policy violation (payload malformado, auth inválida,
-        //         ou — como descobrimos — OTP já consumido/expirado)
+        //   1008  Policy violation (OTP já consumido/expirado)
         //   1011  Internal server error (do lado da Deriv)
-        //   4xxx  Códigos específicos de apps Deriv
         (this.ws as any).onclose = (event: any) => {
           const code = event?.code;
           const reason = event?.reason ? event.reason.toString() : '';
@@ -172,10 +180,6 @@ export class WebSocketManager extends EventEmitter {
           this.emit('disconnected', { code, reason });
 
           if (this.isManualReconnect) {
-            // Este fecho foi deliberado (reconnect() manual / heartbeat
-            // timeout) — connect() já vai ser chamado a seguir pelo
-            // próprio reconnect(). Evita disparar um segundo ciclo de
-            // attemptReconnect em paralelo.
             this.isManualReconnect = false;
             return;
           }
@@ -193,11 +197,6 @@ export class WebSocketManager extends EventEmitter {
     try {
       const message = JSON.parse(data);
 
-      // DIAGNÓSTICO: erros de nível de mensagem (não de ligação) vêm
-      // em `message.error`, com req_id correspondente. Se isto
-      // acontecer logo após auth, é a causa mais provável de
-      // "autenticado mas cai logo a seguir" — ex: payload inválido no
-      // primeiro pedido enviado (balance/transaction).
       if (message.error) {
         logger.warn('[Deriv] Mensagem de erro recebida', {
           code: message.error.code,
@@ -208,34 +207,31 @@ export class WebSocketManager extends EventEmitter {
       }
 
       // ── ORDEM CRÍTICA ────────────────────────────────────
-      // A resposta da Deriv ao NOSSO PRÓPRIO `send({ ping: 1 })` vem
-      // com `msg_type: 'ping'` E o mesmo `req_id` que enviámos (a
-      // Deriv nomeia o campo de resposta segundo o método pedido).
-      // Se verificássemos `msg_type === 'ping'` antes de `req_id`,
-      // essa resposta seria sempre desviada para o ramo de "ping
-      // iniciado pela Deriv" e a nossa Promise de heartbeat NUNCA
-      // resolvia — causando heartbeatTimeout e reconexão em ciclo,
-      // mesmo com a ligação saudável. Por isso resolvemos sempre
-      // por req_id primeiro; só tratamos como ping nosso a iniciar
-      // (sem req_id correspondente a um pedido pendente nosso) no
-      // ramo seguinte.
+      // Resolver por req_id PRIMEIRO.
+      // Se verificássemos msg_type === 'ping' antes de req_id,
+      // a resposta ao nosso próprio { ping: 1 } seria desviada
+      // e a Promise do heartbeat nunca resolvia → reconexão em ciclo.
       let resolvedAsPending = false;
-      if (message.req_id) {
-        const pending = this.pendingRequests.get(String(message.req_id));
+      if (message.req_id != null) {
+        const key = String(message.req_id);
+        const pending = this.pendingRequests.get(key);
         if (pending) {
           if (message.subscription?.id) {
-            this.linkDerivSubscriptionId(String(message.req_id), message.subscription.id);
+            this.linkDerivSubscriptionId(key, message.subscription.id);
           }
           pending.resolve(message);
-          this.pendingRequests.delete(String(message.req_id));
+          this.pendingRequests.delete(key);
           resolvedAsPending = true;
         }
       }
 
-      // Ping iniciado pela DERIV (sem req_id nosso à espera) — aqui
-      // sim respondemos com pong, como pedido pela API.
+      // ── PING DA DERIV ────────────────────────────────────
+      // A Deriv privada envia { msg_type: 'ping' } para verificar
+      // se a ligação está viva. Não precisamos responder com pong —
+      // a Deriv não espera isso. Basta ignorar (o lastMessageAt já
+      // foi actualizado acima). NÃO enviar { pong: 1 } aqui.
       if (!resolvedAsPending && message.msg_type === 'ping') {
-        this.send({ pong: 1 }).catch(() => { /* pong não precisa de confirmação */ });
+        // Não faz nada — só actualizar lastMessageAt (já feito em onmessage)
         return;
       }
 
@@ -264,47 +260,39 @@ export class WebSocketManager extends EventEmitter {
     this.pendingSubscriptionLinks.delete(reqId);
   }
 
-  send(payload: any, timeout = 15000): Promise<any> {
+  send(payload: any, timeout = 15_000): Promise<any> {
     return new Promise((resolve, reject) => {
-      const message = {
-        ...payload,
-        req_id: payload.req_id || uuidv4(),
-      };
+      // CRÍTICO: req_id DEVE ser numérico inteiro positivo.
+      // A Deriv rejeita UUIDs e strings — nunca usar uuidv4() aqui.
+      const reqId = (typeof payload.req_id === 'number' && payload.req_id > 0)
+        ? payload.req_id
+        : nextManagerReqId();
+
+      const message = { ...payload, req_id: reqId };
 
       const timeoutId = setTimeout(() => {
-        this.pendingRequests.delete(String(message.req_id));
-        this.messageQueue = this.messageQueue.filter((m) => m.message.req_id !== message.req_id);
-        this.sendQueue = this.sendQueue.filter((q) => q.message.req_id !== message.req_id);
-        reject(new Error(`Request ${message.req_id} timed out${this.isConnected ? '' : ' (ligação indisponível)'}`));
+        this.pendingRequests.delete(String(reqId));
+        this.messageQueue = this.messageQueue.filter((m) => m.message.req_id !== reqId);
+        this.sendQueue = this.sendQueue.filter((q) => q.message.req_id !== reqId);
+        reject(new Error(`Request ${reqId} timed out${this.isConnected ? '' : ' (ligação indisponível)'}`));
       }, timeout);
 
-      const wrappedResolve = (data: any) => {
-        clearTimeout(timeoutId);
-        resolve(data);
-      };
-      const wrappedReject = (err: any) => {
-        clearTimeout(timeoutId);
-        reject(err);
-      };
+      const wrappedResolve = (data: any) => { clearTimeout(timeoutId); resolve(data); };
+      const wrappedReject  = (err: any)  => { clearTimeout(timeoutId); reject(err);   };
 
       if (!this.isConnected) {
         this.messageQueue.push({ message, resolve: wrappedResolve, reject: wrappedReject, timeout });
-        logger.warn('WebSocket not connected, message queued (a aguardar reconexão)', { reqId: message.req_id });
+        logger.warn('WebSocket not connected, message queued', { reqId });
         return;
       }
 
-      this.sendQueue.push({
-        message,
-        resolve: wrappedResolve,
-        reject: wrappedReject,
-        timeout,
-        hasReqId: true,
-      });
+      this.sendQueue.push({ message, resolve: wrappedResolve, reject: wrappedReject, timeout });
     });
   }
 
   private startRateLimiter() {
     const intervalMs = Math.max(1, Math.floor(1000 / this.options.rateLimitPerSecond));
+
     this.rateLimiterInterval = setInterval(() => {
       this.sentInCurrentWindow = 0;
       this.drainSendQueue();
@@ -339,33 +327,35 @@ export class WebSocketManager extends EventEmitter {
   subscribe(
     type: string,
     payload: any,
-    handler: (data: any) => void
+    handler: (data: any) => void,
   ): string {
-    const subscriptionId = uuidv4();
-    const reqId = payload.req_id || uuidv4();
+    // CORRECÇÃO: req_id numérico, gerado AQUI e passado ao send()
+    // para que o pendingSubscriptionLinks use o mesmo key que
+    // o pendingRequests vai resolver.
+    const internalId = `sub_${nextManagerReqId()}`;
+    const reqId = nextManagerReqId();
 
     const subscription: WebSocketSubscription = {
-      id: subscriptionId,
+      id: internalId,
       type,
       handler,
+      originalPayload: { ...payload, subscribe: 1 },
       expiresAt: Date.now() + 24 * 60 * 60 * 1000,
     };
 
-    this.subscriptions.set(subscriptionId, subscription);
-    this.pendingSubscriptionLinks.set(String(reqId), subscriptionId);
+    this.subscriptions.set(internalId, subscription);
+    // Registar ANTES de send() para que linkDerivSubscriptionId
+    // encontre a entrada quando a resposta chegar.
+    this.pendingSubscriptionLinks.set(String(reqId), internalId);
 
-    this.send({
-      ...payload,
-      subscribe: 1,
-      req_id: reqId,
-    }).catch((error: any) => {
+    this.send({ ...payload, subscribe: 1, req_id: reqId }).catch((error: any) => {
       logger.error('Subscription failed', { error, type });
-      this.subscriptions.delete(subscriptionId);
+      this.subscriptions.delete(internalId);
       this.pendingSubscriptionLinks.delete(String(reqId));
     });
 
-    logger.info('WebSocket subscription created', { subscriptionId, type });
-    return subscriptionId;
+    logger.info('WebSocket subscription created', { internalId, type });
+    return internalId;
   }
 
   async unsubscribe(subscriptionId: string): Promise<void> {
@@ -394,9 +384,11 @@ export class WebSocketManager extends EventEmitter {
       const targets = type ? allSubs.filter(s => s.type === type) : allSubs;
       const types = type
         ? [type]
-        : Array.from(new Set(allSubs.map((s: WebSocketSubscription) => s.type)));
+        : Array.from(new Set(allSubs.map((s) => s.type)));
 
-      await this.send({ forget_all: types });
+      if (types.length > 0) {
+        await this.send({ forget_all: types });
+      }
 
       targets.forEach(s => {
         if (s.derivSubscriptionId) this.derivSubToInternal.delete(s.derivSubscriptionId);
@@ -410,19 +402,35 @@ export class WebSocketManager extends EventEmitter {
     }
   }
 
+  // ── Re-subscribe após reconexão ───────────────────────────
+  // Reenvia todos os originalPayload das subscrições activas com
+  // novos req_ids. Necessário depois de abrir novo WS com novo OTP.
+  private resubscribeAll() {
+    if (this.subscriptions.size === 0) return;
+
+    logger.info('Re-subscribing all active subscriptions', { count: this.subscriptions.size });
+
+    for (const [internalId, sub] of this.subscriptions) {
+      // Limpar serverId antigo — vai chegar um novo
+      sub.derivSubscriptionId = undefined;
+
+      const reqId = nextManagerReqId();
+      this.pendingSubscriptionLinks.set(String(reqId), internalId);
+
+      this.send({ ...sub.originalPayload, req_id: reqId }).catch((err: any) => {
+        logger.error('Re-subscribe failed', { internalId, type: sub.type, error: err.message });
+        this.pendingSubscriptionLinks.delete(String(reqId));
+      });
+    }
+  }
+
   private startHeartbeat() {
-    this.heartbeatInterval = setInterval(() => {
+    this.heartbeatIntervalHandle = setInterval(() => {
       if (this.isConnected) {
         const idleMs = Date.now() - this.lastMessageAt;
         logger.debug('Heartbeat tick', { idleMs });
 
-        // O próprio send() já tem o seu timeout interno (aqui 8s,
-        // explícito) — não precisamos de um segundo timer paralelo a
-        // competir com ele. Antes, um setTimeout(5000) corria ao
-        // lado do timeout de 15s do send(), e por vezes disparava
-        // PRIMEIRO, reconectando uma ligação saudável só porque a
-        // resposta da Deriv ainda não tinha chegado dentro de 5s.
-        this.send({ ping: 1 }, 8000).catch((error: any) => {
+        this.send({ ping: 1 }, 8_000).catch((error: any) => {
           logger.warn('Heartbeat failed, reconnecting...', {
             error: error?.message,
             idleMs: Date.now() - this.lastMessageAt,
@@ -436,21 +444,15 @@ export class WebSocketManager extends EventEmitter {
   }
 
   private stopHeartbeat() {
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = null;
-    }
-    if (this.heartbeatTimeout) {
-      clearTimeout(this.heartbeatTimeout);
-      this.heartbeatTimeout = null;
+    if (this.heartbeatIntervalHandle) {
+      clearInterval(this.heartbeatIntervalHandle);
+      this.heartbeatIntervalHandle = null;
     }
   }
 
   private attemptReconnect() {
     if (this.reconnectAttempts >= this.options.reconnectMaxAttempts) {
-      logger.error('Max reconnection attempts reached', {
-        attempts: this.reconnectAttempts,
-      });
+      logger.error('Max reconnection attempts reached', { attempts: this.reconnectAttempts });
       this.emit('reconnect_failed');
       return;
     }
@@ -466,15 +468,11 @@ export class WebSocketManager extends EventEmitter {
 
     setTimeout(() => {
       this.connect().then(() => {
+        // Reenviar subscrições activas com novos req_ids
+        this.resubscribeAll();
         this.emit('reconnected');
       }).catch((error: any) => {
-        // Se getUrl() falhar (ex: token expirou, conta desativada),
-        // o erro chega aqui. Tentamos de novo até ao limite, mas
-        // registamos claramente para distinguir de uma falha de rede.
-        logger.error('Reconnection failed', {
-          error: error?.message,
-          attempt: this.reconnectAttempts,
-        });
+        logger.error('Reconnection failed', { error: error?.message, attempt: this.reconnectAttempts });
         this.attemptReconnect();
       });
     }, delay);
@@ -486,7 +484,13 @@ export class WebSocketManager extends EventEmitter {
       this.ws.close();
     }
     this.reconnectAttempts = 0;
-    this.connect();
+    this.connect().then(() => {
+      this.resubscribeAll();
+      this.emit('reconnected');
+    }).catch((err: any) => {
+      logger.error('Manual reconnect failed', { error: err?.message });
+      this.attemptReconnect();
+    });
   }
 
   private flushMessageQueue() {
@@ -497,7 +501,6 @@ export class WebSocketManager extends EventEmitter {
         resolve: item.resolve,
         reject: item.reject,
         timeout: item.timeout,
-        hasReqId: true,
       });
       logger.debug('Queued message moved to send queue', { reqId: item.message.req_id });
     }

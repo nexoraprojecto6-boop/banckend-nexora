@@ -1,25 +1,18 @@
 // ============================================================
 // NEXORA FOREX — Auth Service (OAuth2 + PKCE via Cookie)
 //
-// CORRECÇÃO: substituído Redis por cookie HttpOnly assinado.
+// CORRECÇÃO: SameSite=None (era Lax) para funcionar com
+// frontend Vercel + backend Railway (domínios diferentes).
 //
-// Problema anterior: o Redis falhava frequentemente no Railway,
-// fazendo o fallback para memory-store. Com múltiplas instâncias
-// ou restarts, o pkce:{state} gravado numa instância não existia
-// noutra, causando "State inválido ou expirado" no callback.
+// SameSite=Lax bloqueia cookies em redirects cross-origin —
+// exactamente o que acontece no callback OAuth:
+//   Deriv → Railway /api/auth/callback (cross-origin redirect)
+// O browser descartava o cookie antes de o Railway o conseguir
+// ler, causando "Cookie PKCE não encontrado".
 //
-// Solução: o codeVerifier é guardado num cookie HttpOnly assinado
-// com HMAC-SHA256 (usando JWT_SECRET). O browser devolve-o
-// automaticamente no callback — sem storage no servidor, funciona
-// com qualquer número de instâncias e sobrevive a restarts.
-//
-// Segurança:
-//   - HttpOnly: inacessível a JavaScript no browser
-//   - SameSite=Lax: protege contra CSRF
-//   - Secure: só enviado em HTTPS (produção)
-//   - HMAC assinado: não pode ser falsificado sem JWT_SECRET
-//   - TTL de 10 minutos via Max-Age
-//   - Uso único: apagado imediatamente após exchangeCodeForToken
+// SameSite=None requer Secure=true (só HTTPS) — o que é sempre
+// o caso em Railway + Vercel em produção.
+// Em desenvolvimento (HTTP), usamos SameSite=Lax como fallback.
 // ============================================================
 
 import crypto from 'crypto';
@@ -69,13 +62,12 @@ function sign(payload: string): string {
 function verify(signed: string): string | null {
   const idx = signed.lastIndexOf(HMAC_SEP);
   if (idx === -1) return null;
-  const payload = signed.slice(0, idx);
+  const payload  = signed.slice(0, idx);
   const expected = crypto
     .createHmac('sha256', config.security.jwtSecret)
     .update(payload)
     .digest('base64url');
   const actual = signed.slice(idx + 1);
-  // Comparação em tempo constante para evitar timing attacks
   if (actual.length !== expected.length) return null;
   if (!crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return null;
   return payload;
@@ -83,32 +75,31 @@ function verify(signed: string): string | null {
 
 // ─── Cookie helpers ───────────────────────────────────────────
 
-/**
- * Grava o cookie PKCE na resposta HTTP.
- * Chamado em /login e /signup antes de redirecionar para a Deriv.
- */
 export function setPkceCookie(
   res: Response,
   codeVerifier: string,
   state: string,
 ): void {
-  // Payload: codeVerifier:state (state incluído para bind extra)
   const payload = `${codeVerifier}:${state}`;
   const signed  = sign(payload);
 
+  // CORRECÇÃO CRÍTICA: SameSite=None para cross-origin OAuth redirect.
+  // Railway (backend) e Vercel (frontend) são domínios diferentes —
+  // o redirect da Deriv para o callback é cross-origin, por isso
+  // SameSite=Lax/Strict impede o browser de enviar o cookie.
+  // SameSite=None requer sempre Secure=true (apenas HTTPS).
+  // Em dev (HTTP local), usamos Lax como fallback seguro.
+  const isProduction = config.server.isProduction;
+
   res.cookie(COOKIE_NAME, signed, {
     httpOnly: true,
-    secure:   config.server.isProduction,
-    sameSite: 'lax',
-    maxAge:   COOKIE_MAX_AGE * 1000, // maxAge em ms
+    secure:   isProduction,           // HTTPS obrigatório em produção
+    sameSite: isProduction ? 'none' : 'lax', // none para cross-origin em prod
+    maxAge:   COOKIE_MAX_AGE * 1000,
     path:     '/api/auth',
   });
 }
 
-/**
- * Lê e valida o cookie PKCE da requisição.
- * Devolve { codeVerifier, state } ou lança AuthenticationError.
- */
 export function readAndClearPkceCookie(
   req: Request,
   res: Response,
@@ -123,23 +114,26 @@ export function readAndClearPkceCookie(
   }
 
   // Apagar imediatamente — uso único
-  res.clearCookie(COOKIE_NAME, { path: '/api/auth' });
+  res.clearCookie(COOKIE_NAME, {
+    path:     '/api/auth',
+    httpOnly: true,
+    secure:   config.server.isProduction,
+    sameSite: config.server.isProduction ? 'none' : 'lax',
+  });
 
   const payload = verify(raw);
   if (!payload) {
     throw new AuthenticationError('Cookie PKCE inválido ou adulterado.');
   }
 
-  // Formato: codeVerifier:state
   const separatorIdx = payload.indexOf(':');
   if (separatorIdx === -1) {
     throw new AuthenticationError('Formato de cookie PKCE inválido.');
   }
 
-  const codeVerifier  = payload.slice(0, separatorIdx);
-  const cookieState   = payload.slice(separatorIdx + 1);
+  const codeVerifier = payload.slice(0, separatorIdx);
+  const cookieState  = payload.slice(separatorIdx + 1);
 
-  // Bind: garante que o state do cookie corresponde ao da query string
   if (cookieState !== expectedState) {
     throw new AuthenticationError('State PKCE não corresponde. Possível ataque CSRF.');
   }
@@ -150,8 +144,6 @@ export function readAndClearPkceCookie(
 // ─── AuthService ─────────────────────────────────────────────
 
 export class AuthService {
-
-  // ── PKCE ─────────────────────────────────────────────────
 
   static generatePKCE(): PKCEPair {
     const codeVerifier = Array.from(crypto.getRandomValues(new Uint8Array(64)))
@@ -172,10 +164,7 @@ export class AuthService {
     return crypto.randomBytes(16).toString('hex');
   }
 
-  // ── URL de autorização ───────────────────────────────────
-  // Devolve { url, codeVerifier, state } — o route handler é
-  // responsável por gravar o cookie com setPkceCookie().
-
+  // Síncrono — sem Redis, sem await
   static buildAuthorizationUrl(options: {
     prompt?:      'login' | 'registration';
     sidc?:        string;
@@ -207,9 +196,6 @@ export class AuthService {
       state,
     };
   }
-
-  // ── Troca de código por token ────────────────────────────
-  // codeVerifier já vem do cookie (lido pelo route handler).
 
   static async exchangeCodeForToken(
     code:         string,
@@ -252,26 +238,19 @@ export class AuthService {
     }
   }
 
-  // ── OTP → URL WS privada ─────────────────────────────────
-
   static async getOtpUrl(params: {
     accessToken: string;
     accountId:   string;
   }): Promise<string> {
     const endpoint = `${config.deriv.apiBaseUrl}/trading/v1/options/accounts/${params.accountId}/otp`;
-
     try {
-      const response = await axios.post(
-        endpoint,
-        {},
-        {
-          headers: {
-            Authorization:  `Bearer ${params.accessToken}`,
-            'Content-Type': 'application/json',
-          },
-          timeout: 10_000,
+      const response = await axios.post(endpoint, {}, {
+        headers: {
+          Authorization:  `Bearer ${params.accessToken}`,
+          'Content-Type': 'application/json',
         },
-      );
+        timeout: 10_000,
+      });
 
       const url = response.data?.data?.url as string | undefined;
       if (!url || !url.startsWith('wss://')) {
@@ -294,8 +273,6 @@ export class AuthService {
       throw error;
     }
   }
-
-  // ── Sessão de utilizador ─────────────────────────────────
 
   static createSession(accessToken: string, expiresIn: number): UserSession {
     const userId    = uuidv4();

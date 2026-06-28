@@ -1,48 +1,150 @@
 // ============================================================
-// NEXORA FOREX — Auth Service (OAuth2 + PKCE)
-// ============================================================
-// Correcções vs versão anterior:
-//   ✅ Sessões PKCE guardadas em Redis (não global.authSessions)
-//      → Sobrevive a reinícios do Railway e funciona com múltiplas
-//        instâncias em paralelo
-//   ✅ TTL de 10 minutos no Redis para sessões PKCE
-//   ✅ exchangeCodeForToken: tratamento de erros melhorado
-//   ✅ getOtpUrl: novo método para obter URL WS privada com OTP
+// NEXORA FOREX — Auth Service (OAuth2 + PKCE via Cookie)
 //
-// ─── Correção de build ────────────────────────────────────────
-// Trocado `redisClient` (não exportado por @utils/redis.js — só as
-// funções helper o são) por redisGet/redisSet/redisDel. Vantagem
-// extra: estas funções já fazem fallback automático para o
-// memory-store quando o Redis está indisponível, em vez de o fluxo
-// PKCE falhar com erro não tratado nesse cenário.
+// CORRECÇÃO: substituído Redis por cookie HttpOnly assinado.
+//
+// Problema anterior: o Redis falhava frequentemente no Railway,
+// fazendo o fallback para memory-store. Com múltiplas instâncias
+// ou restarts, o pkce:{state} gravado numa instância não existia
+// noutra, causando "State inválido ou expirado" no callback.
+//
+// Solução: o codeVerifier é guardado num cookie HttpOnly assinado
+// com HMAC-SHA256 (usando JWT_SECRET). O browser devolve-o
+// automaticamente no callback — sem storage no servidor, funciona
+// com qualquer número de instâncias e sobrevive a restarts.
+//
+// Segurança:
+//   - HttpOnly: inacessível a JavaScript no browser
+//   - SameSite=Lax: protege contra CSRF
+//   - Secure: só enviado em HTTPS (produção)
+//   - HMAC assinado: não pode ser falsificado sem JWT_SECRET
+//   - TTL de 10 minutos via Max-Age
+//   - Uso único: apagado imediatamente após exchangeCodeForToken
 // ============================================================
 
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import axios from 'axios';
+import { Request, Response } from 'express';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
 import { AuthenticationError } from '../types/errors.js';
-import { redisGet, redisSet, redisDel } from '@utils/redis.js';
 
 // ─── Tipos ───────────────────────────────────────────────────
 
 interface PKCEPair {
-  codeVerifier: string;
+  codeVerifier:  string;
   codeChallenge: string;
 }
 
 export interface TokenResponse {
   accessToken: string;
-  expiresIn: number;
-  tokenType: string;
+  expiresIn:   number;
+  tokenType:   string;
 }
 
 export interface UserSession {
-  accessToken: string;
-  expiresAt: number;
-  userId: string;
+  accessToken:   string;
+  expiresAt:     number;
+  userId:        string;
   refreshToken?: string;
+}
+
+// ─── Constantes ───────────────────────────────────────────────
+
+const COOKIE_NAME    = 'nexora_pkce';
+const COOKIE_MAX_AGE = 600; // 10 minutos em segundos
+const HMAC_SEP       = '.';
+
+// ─── HMAC helpers ─────────────────────────────────────────────
+
+function sign(payload: string): string {
+  const sig = crypto
+    .createHmac('sha256', config.security.jwtSecret)
+    .update(payload)
+    .digest('base64url');
+  return `${payload}${HMAC_SEP}${sig}`;
+}
+
+function verify(signed: string): string | null {
+  const idx = signed.lastIndexOf(HMAC_SEP);
+  if (idx === -1) return null;
+  const payload = signed.slice(0, idx);
+  const expected = crypto
+    .createHmac('sha256', config.security.jwtSecret)
+    .update(payload)
+    .digest('base64url');
+  const actual = signed.slice(idx + 1);
+  // Comparação em tempo constante para evitar timing attacks
+  if (actual.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return null;
+  return payload;
+}
+
+// ─── Cookie helpers ───────────────────────────────────────────
+
+/**
+ * Grava o cookie PKCE na resposta HTTP.
+ * Chamado em /login e /signup antes de redirecionar para a Deriv.
+ */
+export function setPkceCookie(
+  res: Response,
+  codeVerifier: string,
+  state: string,
+): void {
+  // Payload: codeVerifier:state (state incluído para bind extra)
+  const payload = `${codeVerifier}:${state}`;
+  const signed  = sign(payload);
+
+  res.cookie(COOKIE_NAME, signed, {
+    httpOnly: true,
+    secure:   config.server.isProduction,
+    sameSite: 'lax',
+    maxAge:   COOKIE_MAX_AGE * 1000, // maxAge em ms
+    path:     '/api/auth',
+  });
+}
+
+/**
+ * Lê e valida o cookie PKCE da requisição.
+ * Devolve { codeVerifier, state } ou lança AuthenticationError.
+ */
+export function readAndClearPkceCookie(
+  req: Request,
+  res: Response,
+  expectedState: string,
+): { codeVerifier: string } {
+  const raw = req.cookies?.[COOKIE_NAME] as string | undefined;
+
+  if (!raw) {
+    throw new AuthenticationError(
+      'Cookie PKCE não encontrado. O fluxo de login pode ter expirado (>10 min) ou o browser bloqueou cookies.',
+    );
+  }
+
+  // Apagar imediatamente — uso único
+  res.clearCookie(COOKIE_NAME, { path: '/api/auth' });
+
+  const payload = verify(raw);
+  if (!payload) {
+    throw new AuthenticationError('Cookie PKCE inválido ou adulterado.');
+  }
+
+  // Formato: codeVerifier:state
+  const separatorIdx = payload.indexOf(':');
+  if (separatorIdx === -1) {
+    throw new AuthenticationError('Formato de cookie PKCE inválido.');
+  }
+
+  const codeVerifier  = payload.slice(0, separatorIdx);
+  const cookieState   = payload.slice(separatorIdx + 1);
+
+  // Bind: garante que o state do cookie corresponde ao da query string
+  if (cookieState !== expectedState) {
+    throw new AuthenticationError('State PKCE não corresponde. Possível ataque CSRF.');
+  }
+
+  return { codeVerifier };
 }
 
 // ─── AuthService ─────────────────────────────────────────────
@@ -52,9 +154,8 @@ export class AuthService {
   // ── PKCE ─────────────────────────────────────────────────
 
   static generatePKCE(): PKCEPair {
-    // code_verifier: 64 bytes aleatórios, chars seguros para URL
     const codeVerifier = Array.from(crypto.getRandomValues(new Uint8Array(64)))
-      .map((v) => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[v % 66])
+      .map(v => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[v % 66])
       .join('');
 
     const hash = crypto.createHash('sha256').update(codeVerifier).digest();
@@ -72,28 +173,18 @@ export class AuthService {
   }
 
   // ── URL de autorização ───────────────────────────────────
+  // Devolve { url, codeVerifier, state } — o route handler é
+  // responsável por gravar o cookie com setPkceCookie().
 
-  static async buildAuthorizationUrl(options: {
-    prompt?: 'login' | 'registration';
-    sidc?: string;
+  static buildAuthorizationUrl(options: {
+    prompt?:      'login' | 'registration';
+    sidc?:        string;
     utmCampaign?: string;
-    utmMedium?: string;
-    utmSource?: string;
-  } = {}): Promise<string> {
-    const pkce = this.generatePKCE();
+    utmMedium?:   string;
+    utmSource?:   string;
+  } = {}): { url: string; codeVerifier: string; state: string } {
+    const pkce  = this.generatePKCE();
     const state = this.generateState();
-
-    // Guardar em Redis com TTL de 10 minutos
-    // (era global.authSessions — perde-se ao reiniciar Railway)
-    // redisSet(key, value, ttlSegundos) — TTL passado como número,
-    // não como { EX: ... } (isso é específico da API nativa do
-    // cliente `redis`; redisSet já trata o TTL internamente, com
-    // setEx quando o Redis está disponível).
-    await redisSet(
-      `pkce:${state}`,
-      JSON.stringify({ codeVerifier: pkce.codeVerifier, state }),
-      600, // 10 minutos
-    );
 
     const params = new URLSearchParams({
       response_type:         'code',
@@ -103,33 +194,27 @@ export class AuthService {
       state,
       code_challenge:        pkce.codeChallenge,
       code_challenge_method: 'S256',
-      ...(options.prompt       && { prompt:        options.prompt }),
-      ...(options.sidc         && { sidc:          options.sidc }),
-      ...(options.utmCampaign  && { utm_campaign:  options.utmCampaign }),
-      ...(options.utmMedium    && { utm_medium:    options.utmMedium }),
-      ...(options.utmSource    && { utm_source:    options.utmSource }),
+      ...(options.prompt      && { prompt:       options.prompt }),
+      ...(options.sidc        && { sidc:         options.sidc }),
+      ...(options.utmCampaign && { utm_campaign: options.utmCampaign }),
+      ...(options.utmMedium   && { utm_medium:   options.utmMedium }),
+      ...(options.utmSource   && { utm_source:   options.utmSource }),
     });
 
-    return `${config.deriv.authBaseUrl}/auth?${params.toString()}`;
+    return {
+      url:          `${config.deriv.authBaseUrl}/auth?${params.toString()}`,
+      codeVerifier: pkce.codeVerifier,
+      state,
+    };
   }
 
   // ── Troca de código por token ────────────────────────────
+  // codeVerifier já vem do cookie (lido pelo route handler).
 
   static async exchangeCodeForToken(
-    code: string,
-    state: string,
+    code:         string,
+    codeVerifier: string,
   ): Promise<TokenResponse> {
-    // Recuperar codeVerifier do Redis (ou memória, via fallback)
-    const raw = await redisGet(`pkce:${state}`);
-    if (!raw) {
-      throw new AuthenticationError('State inválido ou expirado');
-    }
-
-    const { codeVerifier } = JSON.parse(raw) as { codeVerifier: string };
-
-    // Apagar imediatamente (uso único)
-    await redisDel(`pkce:${state}`);
-
     try {
       const tokenResponse = await axios.post(
         `${config.deriv.authBaseUrl}/token`,
@@ -169,21 +254,9 @@ export class AuthService {
 
   // ── OTP → URL WS privada ─────────────────────────────────
 
-  /**
-   * Obtém a URL WebSocket privada com OTP para uma conta.
-   * Deve ser chamado SEMPRE antes de criar/reconectar o WebSocket —
-   * o OTP é de uso único, por isso este método deve ser invocado de
-   * novo em cada tentativa de ligação, nunca reaproveitando uma URL
-   * já usada (ver WebSocketManager.getUrl no manager.ts).
-   *
-   * POST https://api.derivws.com/trading/v1/options/accounts/{accountId}/otp
-   * Authorization: Bearer {accessToken}
-   *
-   * Resposta: { data: { url: "wss://api.derivws.com/trading/v1/options/ws/...?otp=..." } }
-   */
   static async getOtpUrl(params: {
     accessToken: string;
-    accountId: string;
+    accountId:   string;
   }): Promise<string> {
     const endpoint = `${config.deriv.apiBaseUrl}/trading/v1/options/accounts/${params.accountId}/otp`;
 
@@ -193,7 +266,7 @@ export class AuthService {
         {},
         {
           headers: {
-            Authorization: `Bearer ${params.accessToken}`,
+            Authorization:  `Bearer ${params.accessToken}`,
             'Content-Type': 'application/json',
           },
           timeout: 10_000,
@@ -205,11 +278,7 @@ export class AuthService {
         throw new Error('URL OTP inválida recebida da Deriv');
       }
 
-      logger.debug('[AuthService] OTP URL obtida', {
-        accountId: params.accountId,
-        // nunca logar a URL completa (contém OTP)
-      });
-
+      logger.debug('[AuthService] OTP URL obtida', { accountId: params.accountId });
       return url;
     } catch (error) {
       if (axios.isAxiosError(error)) {
@@ -229,14 +298,13 @@ export class AuthService {
   // ── Sessão de utilizador ─────────────────────────────────
 
   static createSession(accessToken: string, expiresIn: number): UserSession {
-    const userId = uuidv4();
+    const userId    = uuidv4();
     const expiresAt = Date.now() + expiresIn * 1_000;
     logger.info('[AuthService] Sessão criada', { userId });
     return { accessToken, expiresAt, userId };
   }
 
   static isTokenExpired(session: UserSession): boolean {
-    // Considera expirado 60s antes para dar margem
     return Date.now() > session.expiresAt - 60_000;
   }
 

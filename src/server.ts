@@ -13,11 +13,15 @@
 //   ✅ Limite de sessões simultâneas (DoS protection)
 //   ✅ Timeout de autenticação (30s)
 //   ✅ Cleanup completo em todos os caminhos
+//   ✅ NOVO: trust proxy + cookie-parser — corrige "Cookie PKCE
+//      não encontrado" no fluxo OAuth entre Vercel (frontend) e
+//      Render (backend, atrás de proxy reverso)
 // ============================================================
 
 import 'express-async-errors';
 import express, { Application, Request, Response, NextFunction } from 'express';
 import http from 'http';
+import cookieParser from 'cookie-parser';
 import { WebSocketServer, WebSocket } from 'ws';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
@@ -56,13 +60,23 @@ const ADMIN_IDS = new Set<string>(
 
 // ─── App & HTTP Server ────────────────────────────────────────
 const app: Application = express();
+
+// CRÍTICO: trust proxy ANTES de qualquer middleware que dependa
+// de detecção correta de HTTPS (cookies secure, req.protocol,
+// req.ip, etc.). O Render (como o Railway) fica atrás de um
+// proxy reverso — sem isto, o Express não confia no header
+// X-Forwarded-Proto e pode tratar a ligação como HTTP mesmo
+// sendo HTTPS real, fazendo cookies com `secure: true` falharem
+// silenciosamente. Isto era a causa de "Cookie PKCE não
+// encontrado" no fluxo de login.
+app.set('trust proxy', 1);
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // ─── Sessão ───────────────────────────────────────────────────
 interface ClientSession {
   derivWs:              WebSocket | null;
-  // Handler actual registado no derivWs para poder remover depois
   derivMessageHandler:  ((raw: Buffer) => void) | null;
   token:                string;
   accountId:            string | null;
@@ -131,13 +145,6 @@ function subscribeAutomatic(derivWs: WebSocket, session: ClientSession): void {
 }
 
 // ─── Proxy Deriv → Frontend ───────────────────────────────────
-// CORRECÇÃO CRÍTICA: a função devolve o handler criado para que
-// connectToDerivWS possa guardá-lo em session.derivMessageHandler
-// e removê-lo antes de registar um novo em cada reconexão.
-// Sem isto, cada reconexão acumulava um novo listener 'message' no
-// mesmo derivWs (que é um objecto novo, mas o padrão era reutilizar
-// o socket antigo em algumas versões) — causando mensagens
-// duplicadas enviadas ao frontend e fuga de memória.
 
 function buildDerivMessageHandler(
   clientWs: WebSocket,
@@ -216,10 +223,6 @@ async function connectToDerivWS(
       clearTimeout(timeout);
       logger.info('[WS] Connected to Deriv WS');
 
-      // CORRECÇÃO: construir handler e guardá-lo na sessão.
-      // Se já havia um handler antigo registado neste socket (não
-      // deve acontecer pois é um novo WebSocket, mas por segurança),
-      // removê-lo antes de registar o novo.
       if (session.derivMessageHandler) {
         derivWs.removeListener('message', session.derivMessageHandler);
       }
@@ -238,7 +241,6 @@ async function connectToDerivWS(
     });
 
     derivWs.once('close', (code, reason) => {
-      // Limpar handler para não ficar pendurado
       if (session.derivMessageHandler) {
         derivWs.removeListener('message', session.derivMessageHandler);
         session.derivMessageHandler = null;
@@ -276,7 +278,6 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
   session.reconnectTimer = setTimeout(async () => {
     if (clientWs.readyState !== WebSocket.OPEN) return;
     try {
-      // OBRIGATÓRIO: novo OTP a cada reconexão
       const derivAPI = new DerivAPIService(session.token);
       const otpData  = await derivAPI.getOTP(session.accountId!);
       await connectToDerivWS(clientWs, otpData.url, session);
@@ -452,7 +453,6 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     session.botManager = null;
   }
   if (session.derivWs) {
-    // Remover handler antes de terminar o socket
     if (session.derivMessageHandler) {
       session.derivWs.removeListener('message', session.derivMessageHandler);
       session.derivMessageHandler = null;
@@ -672,6 +672,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
 // ============================================
 app.use(helmetMiddleware);
 app.use(corsMiddleware);
+app.use(cookieParser());
 app.use(sanitizationMiddleware);
 app.use(urlEncodedMiddleware);
 app.use(requestLoggerMiddleware);

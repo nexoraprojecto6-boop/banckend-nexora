@@ -18,7 +18,7 @@ const configSchema = z.object({
     authBaseUrl: z.string().url().default('https://auth.deriv.com/oauth2'),
     clientId: z.string().min(1, 'DERIV_CLIENT_ID is required'),
     clientSecret: z.string().min(1, 'DERIV_CLIENT_SECRET is required'),
-    redirectUri: z.string().url().default('http://localhost:3001/api/auth/callback'),
+    redirectUri: z.string().url().default('https://banckend-nexora.onrender.com/api/auth/callback'),
     appId: z.string().min(1, 'DERIV_APP_ID is required'),
   }),
   // ─── Afiliado ─────────────────────────────────────────────
@@ -79,11 +79,11 @@ const envConfig = {
     authBaseUrl: process.env.DERIV_AUTH_BASE_URL || 'https://auth.deriv.com/oauth2',
     clientId: process.env.DERIV_CLIENT_ID || '',
     clientSecret: process.env.DERIV_CLIENT_SECRET || '',
-    redirectUri: process.env.DERIV_REDIRECT_URI || 'http://localhost:3001/api/auth/callback',
+    redirectUri: process.env.DERIV_REDIRECT_URI || 'https://banckend-nexora.onrender.com/api/auth/callback',
     appId: process.env.DERIV_APP_ID || '',
   },
   // Valores por defeito já preenchidos com os dados confirmados.
-  // Podem ser sobrepostos via env vars no Railway sem precisar de rebuild.
+  // Podem ser sobrepostos via env vars no Render sem precisar de rebuild.
   affiliate: {
     sidc: process.env.DERIV_AFFILIATE_SIDC || 'C52M9QNQNANN',
     utmSource: process.env.DERIV_AFFILIATE_UTM_SOURCE || '3224',
@@ -95,7 +95,7 @@ const envConfig = {
     prodUrl: process.env.FRONTEND_PROD_URL || 'https://yourdomain.com',
   },
   redis: {
-    // Usa REDIS_URL diretamente (Railway injeta isso automaticamente)
+    // Usa REDIS_URL diretamente (Render injeta isso automaticamente, se usares Redis da Render)
     url: process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`,
     db: parseInt(process.env.REDIS_DB || '0', 10),
     password: process.env.REDIS_PASSWORD,

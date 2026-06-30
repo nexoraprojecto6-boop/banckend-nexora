@@ -4,6 +4,7 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { config } from '@config/index.js';
 import logger from '@utils/logger.js';
+
 // Helmet middleware
 export const helmetMiddleware = helmet({
   contentSecurityPolicy: {
@@ -23,6 +24,7 @@ export const helmetMiddleware = helmet({
   noSniff: true,
   xssFilter: true,
 });
+
 // CORS middleware
 export const corsMiddleware = cors({
   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
@@ -54,6 +56,7 @@ export const corsMiddleware = cors({
   ],
   maxAge: 86400,
 });
+
 // Rate limiting
 const createRateLimiter = (windowMs: number, max: number) =>
   rateLimit({
@@ -67,7 +70,7 @@ const createRateLimiter = (windowMs: number, max: number) =>
       return (req.headers['x-forwarded-for'] as string) || req.ip || 'unknown';
     },
     handler: (req: Request, res: Response) => {
-      logger.warn('Rate limit exceeded', { ip: req.ip });
+      logger.warn('Rate limit exceeded', { ip: req.ip, path: req.path });
       const rl = (req as any).rateLimit;
       res.status(429).json({
         error: 'Too many requests',
@@ -75,18 +78,40 @@ const createRateLimiter = (windowMs: number, max: number) =>
       });
     },
   });
+
 export const apiLimiter = createRateLimiter(
   config.rateLimit.windowMs,
   config.rateLimit.maxRequests
 );
+
+// ============================================================
+// CORRECÇÃO: authLimiter estava em 5 requisições / 15 minutos.
+//
+// Isso é baixo demais para uso normal — o fluxo de autenticação
+// real (login → callback → validate, mais reconexões automáticas
+// do hook de WebSocket no frontend, troca de conta, recarregar a
+// página, etc.) facilmente ultrapassa 5 chamadas a estas rotas
+// numa única sessão de uso legítimo. Quando o limite estourava,
+// o handler do express-rate-limit respondia com JSON puro
+// (res.status(429).json(...)) em vez de redirecionar para o
+// frontend — e como /api/auth/callback normalmente faz um
+// res.redirect(...), o browser ficava preso esperando um redirect
+// que nunca chegava, travando a tela de "A processar autenticação...".
+//
+// Aumentado para 30 tentativas / 15 minutos: ainda protege contra
+// abuso/força bruta, mas comporta o tráfego normal de autenticação
+// de um único utilizador sem bloqueá-lo a meio do próprio login.
+// ============================================================
 export const authLimiter = createRateLimiter(
   15 * 60 * 1000,
-  5
+  30
 );
+
 export const wsLimiter = createRateLimiter(
   1000,
   10
 );
+
 // Request logging middleware
 export const requestLoggerMiddleware = (
   req: Request,
@@ -106,9 +131,11 @@ export const requestLoggerMiddleware = (
   });
   next();
 };
+
 export const sanitizationMiddleware: RequestHandler = express.json({
   limit: '10mb',
 });
+
 export const urlEncodedMiddleware: RequestHandler = express.urlencoded({
   extended: true,
   limit: '10mb',

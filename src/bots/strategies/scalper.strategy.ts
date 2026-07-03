@@ -1,65 +1,73 @@
 // ============================================================
-// NEXORA FOREX — Digit Over Martingale Strategy
+// NEXORA FOREX — Scalper Strategy (Digit Over + Gale)
 // ============================================================
 // Contrato: DIGITOVER (aposta que o último dígito do tick será
 // MAIOR que `predictDigit`). Duração fixa de 1 tick.
 //
-// Diferença estrutural em relação à MartingaleStrategy "clássica":
-// esta estratégia é orientada a EVENTOS DE TICK, não ao timer fixo
-// da BaseStrategy. Cada tick que chega via subscribeToTicks:
-//   1) actualiza o histórico de dígitos
-//   2) verifica a condição de entrada (dígitos de referência "baixos")
-//   3) se bater a condição e não houver trade pendente, compra
+// Orientada a EVENTOS DE TICK (não ao timer fixo da BaseStrategy):
+// cada tick que chega via subscribeToTicks é avaliado; se o último
+// dígito observado for "baixo" (< predictDigit + 1), compra.
 //
-// O método tick() (chamado pelo loop da BaseStrategy) fica como
-// no-op — ele existe só para satisfazer o contrato abstrato; toda a
-// acção real acontece no callback de onTick.
+// Parâmetros expostos ao utilizador (cartão de configuração) —
+// apenas o que é realmente necessário ajustar:
+//   predictDigit        barreira do DIGITOVER
+//   gale                multiplicador do stake por perda
+//   lossesToStartGale   nº de perdas seguidas antes do Gale começar a multiplicar
+//   maxMartingaleSteps  nº de níveis de Gale antes de resetar o stake
+//   pauseLossLimit      perda acumulada (no ciclo) que pausa o bot temporariamente
+//   pauseSeconds        duração da pausa automática, em segundos
 //
-// AVISO (documentar para o utilizador final no frontend): dígitos em
-// índices sintéticos são próximos de uniformes e independentes entre
-// ticks — esta análise de "dígitos de referência" não constitui uma
-// vantagem estatística comprovada. É uma estratégia de alto risco por
-// usar martingale. Recomendado apenas em conta demo.
+// STOP LOSS e TAKE PROFIT NÃO ficam aqui — já são cobertos por
+// config.maxLoss / config.maxProfit, tratados pela BaseStrategy.
+//
+// AVISO: dígitos em índices sintéticos são próximos de uniformes e
+// independentes entre ticks — esta estratégia não tem vantagem
+// estatística comprovada, e o uso de Gale (martingale) aumenta o
+// risco a cada perda. Recomendado apenas em conta demo.
 // ============================================================
 
 import {
   BotConfig,
-  DigitOverMartingaleParams,
+  ScalperParams,
   TradeResult,
   DerivWsAdapter,
 } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
 
 export class ScalperStrategy extends BaseStrategy {
-  private params: DigitOverMartingaleParams;
+  private params: ScalperParams;
   private pending = false;
-  private digitHistory: number[] = [];
   private lossCount = 0;
+  private lossAccum = 0;          // perda acumulada desde o último reset/pausa
+  private martingaleSteps = 0;
+  private paused = false;
   private tickSub: { unsubscribe: () => void } | null = null;
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
     const params = (config.strategyParams ?? {
       predictDigit: 3,
-      winStake: config.initialStake,
-      martingaleStep: 2,
-      stp1: 2,
-      stp2: 2,
-      digitThreshold: 4, // "baixo" = dígito < digitThreshold (predictDigit + 1)
-    }) as unknown as DigitOverMartingaleParams;
+      gale: 2,
+      lossesToStartGale: 0,
+      maxMartingaleSteps: 10,
+      pauseLossLimit: 20,
+      pauseSeconds: 10,
+    }) as unknown as ScalperParams;
 
-    super(id, name, 'digit_over_martingale', config, derivWs);
+    super(id, name, 'scalper', config, derivWs);
     this.params = params;
   }
 
   protected async onStart(): Promise<void> {
     this.state.stats.currentStake = this.state.config.initialStake;
-    this.digitHistory = [];
     this.lossCount = 0;
+    this.lossAccum = 0;
+    this.martingaleSteps = 0;
+    this.paused = false;
 
     this.log(
       'info',
-      `DigitOver Martingale — symbol: ${this.state.config.symbol}, predict: ${this.params.predictDigit}, ` +
-      `stake inicial: $${this.state.config.initialStake}, martingaleStep: ${this.params.martingaleStep}`,
+      `Scalper — symbol: ${this.state.config.symbol}, predict: over ${this.params.predictDigit}, ` +
+      `stake inicial: $${this.state.config.initialStake}, gale: ${this.params.gale}x`,
     );
 
     this.tickSub = this.derivWs.subscribeToTicks(this.state.config.symbol, (price) => {
@@ -73,34 +81,25 @@ export class ScalperStrategy extends BaseStrategy {
     this.tickSub = null;
   }
 
-  // O loop fixo da BaseStrategy não é usado para decisão — a acção
+  // O loop fixo da BaseStrategy não decide nada aqui — a acção
   // acontece em onTick(), disparada pela subscrição de ticks.
   protected async tick(): Promise<void> {
     // no-op de propósito
   }
 
   protected getTickDelay(): number {
-    return 2000; // só controla a frequência do loop "morto" acima
+    return 2000;
   }
 
   // ─── Lógica orientada a tick ──────────────────────────────
 
   private onTick(price: number): void {
+    if (!this.active || this.pending || this.paused) return;
+
     const digit = this.getLastDigit(price);
-    this.digitHistory.push(digit);
-    if (this.digitHistory.length > 50) this.digitHistory.shift();
+    const threshold = this.params.predictDigit + 1;
 
-    if (!this.active || this.pending) return;
-
-    const { stp1, stp2, digitThreshold } = this.params;
-    const need = Math.max(stp1, stp2);
-    if (this.digitHistory.length < need) return;
-
-    // Equivalente ao "GET FROM_END STP1 / STP2" do DBot
-    const t1 = this.digitHistory[this.digitHistory.length - stp1];
-    const t2 = this.digitHistory[this.digitHistory.length - stp2];
-
-    if (t1 < digitThreshold && t2 < digitThreshold) {
+    if (digit < threshold) {
       void this.placeTrade();
     }
   }
@@ -116,7 +115,7 @@ export class ScalperStrategy extends BaseStrategy {
     const { predictDigit } = this.params;
     const stake = this.state.stats.currentStake;
 
-    this.log('trade', `[DigitOver] Abrindo ${contractType} > ${predictDigit} — stake: $${stake.toFixed(2)}`, {
+    this.log('trade', `[Scalper] Abrindo ${contractType} > ${predictDigit} — stake: $${stake.toFixed(2)}`, {
       stake, lossCount: this.lossCount,
     });
 
@@ -151,7 +150,7 @@ export class ScalperStrategy extends BaseStrategy {
       };
 
       this.recordTradeResult(tradeResult);
-      this.adjustStake(result.won);
+      this.adjustStake(result.won, Math.abs(result.profit));
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
       if (result.won) {
@@ -159,32 +158,60 @@ export class ScalperStrategy extends BaseStrategy {
       } else {
         this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
       }
+
+      this.checkPauseCondition();
     } finally {
       this.pending = false;
     }
   }
 
-  // ─── Gestão de stake (martingale em N níveis, depois reseta) ─
+  // ─── Gestão de stake (Gale a partir de N perdas, teto de níveis) ─
 
-  private adjustStake(won: boolean): void {
-    const { martingaleStep, winStake } = this.params;
+  private adjustStake(won: boolean, lossValue: number): void {
+    const { gale, lossesToStartGale, maxMartingaleSteps } = this.params;
     const initial = this.state.config.initialStake;
 
     if (won) {
       this.lossCount = 0;
-      this.state.stats.currentStake = winStake;
+      this.lossAccum = 0;
+      this.martingaleSteps = 0;
+      this.state.stats.currentStake = initial;
       return;
     }
 
     this.lossCount += 1;
+    this.lossAccum += lossValue;
 
-    if (this.lossCount < martingaleStep) {
-      // progressão geométrica simples: initial * 2^lossCount
-      this.state.stats.currentStake = parseFloat((initial * Math.pow(2, this.lossCount)).toFixed(2));
+    const shouldGale = this.lossCount > lossesToStartGale && this.martingaleSteps < maxMartingaleSteps;
+
+    if (shouldGale) {
+      this.martingaleSteps += 1;
+      this.state.stats.currentStake = parseFloat((this.state.stats.currentStake * gale).toFixed(2));
     } else {
-      // atingiu o número máximo de níveis -> reseta
+      // atingiu o tecto de níveis -> reseta
       this.lossCount = 0;
+      this.lossAccum = 0;
+      this.martingaleSteps = 0;
       this.state.stats.currentStake = initial;
     }
+  }
+
+  // ─── Pausa automática temporária ──────────────────────────
+  // Diferente do Stop Loss (config.maxLoss, tratado pela BaseStrategy
+  // e que PARA o bot definitivamente): isto pausa e retoma sozinho.
+
+  private checkPauseCondition(): void {
+    const { pauseLossLimit, pauseSeconds } = this.params;
+    if (pauseLossLimit <= 0) return;
+    if (this.lossAccum < pauseLossLimit) return;
+
+    this.paused = true;
+    this.lossAccum = 0;
+    this.log('info', `Pausa automática — perda acumulada atingiu $${pauseLossLimit}. Retomando em ${pauseSeconds}s.`);
+
+    setTimeout(() => {
+      this.paused = false;
+      this.log('info', 'Pausa automática terminada — retomando operações.');
+    }, pauseSeconds * 1000);
   }
 }

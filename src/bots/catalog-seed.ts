@@ -93,9 +93,9 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // ──────────────────────────────────────────────────────────
   // BOT 3 — SCALPER (Digit Over + Martingale)
   // ──────────────────────────────────────────────────────────
-  // Analisa os 2 últimos dígitos de referência do Volatility 10
+  // Analisa os 2 últimos dígitos de referência do Volatility 100
   // (1s) Index; se ambos forem "baixos" (< digitThreshold), compra
-  // DIGITOVER 1 com duração de 1 tick. Martingale em 2 níveis,
+  // DIGITOVER 3 com duração de 1 tick. Martingale em 2 níveis,
   // depois reseta para o stake inicial.
   // ATENÇÃO: alto risco — usar apenas em conta demo. Dígitos em
   // índices sintéticos são praticamente aleatórios e independentes
@@ -103,13 +103,13 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // comprovada.
   {
     name:        'SCALPER',
-    description: 'Analisa os últimos dígitos do Volatility 10 (1s) Index e compra DIGITOVER 1 (1 tick) quando o padrão de referência aparece. Usa martingale em 2 níveis antes de resetar o stake. Recomendado apenas em conta demo — dígitos em índices sintéticos são praticamente aleatórios.',
+    description: 'Analisa os últimos dígitos do Volatility 100 (1s) Index e compra DIGITOVER 3 (1 tick) quando o padrão de referência aparece. Usa martingale em 2 níveis antes de resetar o stake. Recomendado apenas em conta demo — dígitos em índices sintéticos são praticamente aleatórios.',
     strategy:    'digit_over_martingale',
     tags:        ['digitos', 'martingale', 'risco-alto', 'demo'],
     isActive:    true,
     createdBy:   'admin',
     defaultConfig: {
-      symbol:       '1HZ10V',        // Volatility 10 (1s) Index
+      symbol:       '1HZ100V',       // Volatility 100 (1s) Index
       contractType: 'DIGITOVER',
       duration:     1,
       durationUnit: 'ticks',
@@ -119,12 +119,12 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       maxLoss:      40,
       maxProfit:    1,
       strategyParams: {
-        predictDigit:    1,          // barreira: dígito > 1
+        predictDigit:    3,          // barreira: dígito > 3
         winStake:        0.5,        // stake usado após vitória
         martingaleStep:  2,          // níveis de martingale antes de resetar
         stp1:            2,          // dígito de referência 1 (posição a partir do fim)
         stp2:            2,          // dígito de referência 2 (posição a partir do fim)
-        digitThreshold:  2,          // dígito é "baixo" se < 2
+        digitThreshold:  4,          // dígito é "baixo" se < 4 (predictDigit + 1)
       },
     },
   },

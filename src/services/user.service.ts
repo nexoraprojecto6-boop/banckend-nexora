@@ -17,7 +17,7 @@ import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import { getRedisClient, isRedisConnected } from '@utils/redis.js'
 import logger from '@utils/logger.js'
-import { AuthenticationError } from '../types/errors.js'
+import { AuthenticationError, ConflictError } from '../types/errors.js'
 import { EmailService } from './email.service.js'
 
 const SALT_ROUNDS = 12
@@ -73,7 +73,8 @@ export class UserService {
 
     const existing = await this.findByEmail(normalizedEmail)
     if (existing) {
-      throw new AuthenticationError('Este email já está registado')
+      // 409 Conflict — o email já existe, não é um problema de autenticação.
+      throw new ConflictError('Este email já está registado')
     }
 
     const isFirstUser = (await this.countAll()) === 0
@@ -94,9 +95,17 @@ export class UserService {
     await this.persist(user)
     logger.info('[UserService] Novo utilizador registado', { id: user.id, email: user.email, role: user.role })
 
-    // Dispara o email de verificação (não bloqueia o registo se falhar)
-    const token = await this.generateEmailVerificationToken(user.id)
-    await EmailService.sendVerificationEmail(user.email, user.fullName, token)
+    // Dispara o email de verificação — NUNCA deve derrubar o registo.
+    // O utilizador já foi persistido; se o email falhar, ele pode pedir
+    // reenvio depois (rota /api/auth/resend-verification).
+    try {
+      const token = await this.generateEmailVerificationToken(user.id)
+      await EmailService.sendVerificationEmail(user.email, user.fullName, token)
+    } catch (err) {
+      logger.error('[UserService] Falha ao enviar email de verificação (registo continua)', {
+        id: user.id, email: user.email, err,
+      })
+    }
 
     return toPublic(user)
   }
@@ -186,7 +195,8 @@ export class UserService {
       return
     }
     if (user.emailVerified) {
-      throw new AuthenticationError('Este email já está verificado')
+      // 409 Conflict — o email já está verificado, não é um problema de autenticação.
+      throw new ConflictError('Este email já está verificado')
     }
     const token = await this.generateEmailVerificationToken(user.id)
     await EmailService.sendVerificationEmail(user.email, user.fullName, token)

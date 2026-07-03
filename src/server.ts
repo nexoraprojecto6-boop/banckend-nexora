@@ -13,9 +13,12 @@
 //   ✅ Limite de sessões simultâneas (DoS protection)
 //   ✅ Timeout de autenticação (30s)
 //   ✅ Cleanup completo em todos os caminhos
-//   ✅ NOVO: trust proxy + cookie-parser — corrige "Cookie PKCE
+//   ✅ trust proxy + cookie-parser — corrige "Cookie PKCE
 //      não encontrado" no fluxo OAuth entre Vercel (frontend) e
 //      Render (backend, atrás de proxy reverso)
+//   ✅ NOVO: rotas de administração de utilizadores locais
+//      (/api/admin/users) — login local com email/senha,
+//      independente do fluxo OAuth Deriv
 // ============================================================
 
 import 'express-async-errors';
@@ -32,12 +35,13 @@ import {
   urlEncodedMiddleware, requestLoggerMiddleware, apiLimiter,
 } from '@middleware/security.js';
 import { errorHandler, notFoundHandler } from '@middleware/errorHandler.js';
-import authRoutes    from '@routes/auth.routes.js';
-import accountRoutes from '@routes/accounts.routes.js';
-import tradingRoutes from '@routes/trading.routes.js';
-import botsRoutes    from '@routes/bots.routes.js';
-import adminRoutes   from '@routes/admin.routes.js';
-import labelsRoutes  from '@routes/labels.routes.js';
+import authRoutes       from '@routes/auth.routes.js';
+import accountRoutes    from '@routes/accounts.routes.js';
+import tradingRoutes    from '@routes/trading.routes.js';
+import botsRoutes       from '@routes/bots.routes.js';
+import adminRoutes      from '@routes/admin.routes.js';
+import labelsRoutes     from '@routes/labels.routes.js';
+import adminUsersRoutes from '@routes/admin-users.routes.js'; // ← NOVO
 import { DerivAPIService } from '@services/deriv-api.service.js';
 import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
@@ -712,6 +716,7 @@ app.use('/api/trading',      tradingRoutes);
 app.use('/api/bots',         botsRoutes);
 app.use('/api/admin',        adminRoutes);
 app.use('/api/admin/labels', labelsRoutes);
+app.use('/api/admin/users',  adminUsersRoutes);   // ← NOVO: stats/listagem/bloqueio de utilizadores locais
 app.use(notFoundHandler);
 app.use(errorHandler);
 

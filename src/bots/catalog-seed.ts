@@ -1,4 +1,3 @@
-
 // ============================================================
 // NEXORA FOREX — Bot Catalog Seed
 // ============================================================
@@ -10,10 +9,11 @@
 //   → Remover: apaga a entrada e reinicia
 //
 // ESTRATÉGIAS DISPONÍVEIS (bot.manager.ts):
-//   'scalping'         → ScalpingStrategy  (CALL/PUT rápidos, para após N perdas seguidas)
-//   'martingale'       → MartingaleStrategy (dobra stake após perda)
-//   'anti_martingale'  → MartingaleStrategy com resetOnWin: true
-//   'trend_following'  → TrendFollowingStrategy
+//   'scalping'               → ScalpingStrategy  (CALL/PUT rápidos, para após N perdas seguidas)
+//   'martingale'             → MartingaleStrategy (dobra stake após perda)
+//   'anti_martingale'        → MartingaleStrategy com resetOnWin: true
+//   'trend_following'        → TrendFollowingStrategy
+//   'digit_over_martingale'  → DigitOverMartingaleStrategy (DIGITOVER + martingale por dígitos)
 //
 // ACESSO:
 //   Apenas o administrador gere este ficheiro.
@@ -86,6 +86,45 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
         multiplier:  2,              // dobra após perda
         maxStake:    64,             // tecto do stake
         resetOnWin:  false,          // false = Martingale | true = Anti-Martingale
+      },
+    },
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // BOT 3 — SCALPER (Digit Over + Martingale)
+  // ──────────────────────────────────────────────────────────
+  // Analisa os 2 últimos dígitos de referência do Volatility 10
+  // (1s) Index; se ambos forem "baixos" (< digitThreshold), compra
+  // DIGITOVER 1 com duração de 1 tick. Martingale em 2 níveis,
+  // depois reseta para o stake inicial.
+  // ATENÇÃO: alto risco — usar apenas em conta demo. Dígitos em
+  // índices sintéticos são praticamente aleatórios e independentes
+  // entre ticks; esta análise não constitui vantagem estatística
+  // comprovada.
+  {
+    name:        'SCALPER',
+    description: 'Analisa os últimos dígitos do Volatility 10 (1s) Index e compra DIGITOVER 1 (1 tick) quando o padrão de referência aparece. Usa martingale em 2 níveis antes de resetar o stake. Recomendado apenas em conta demo — dígitos em índices sintéticos são praticamente aleatórios.',
+    strategy:    'digit_over_martingale',
+    tags:        ['digitos', 'martingale', 'risco-alto', 'demo'],
+    isActive:    true,
+    createdBy:   'admin',
+    defaultConfig: {
+      symbol:       '1HZ10V',        // Volatility 10 (1s) Index
+      contractType: 'DIGITOVER',
+      duration:     1,
+      durationUnit: 'ticks',
+      initialStake: 0.35,
+      currency:     'USD',
+      maxTrades:    0,
+      maxLoss:      40,
+      maxProfit:    1,
+      strategyParams: {
+        predictDigit:    1,          // barreira: dígito > 1
+        winStake:        0.5,        // stake usado após vitória
+        martingaleStep:  2,          // níveis de martingale antes de resetar
+        stp1:            2,          // dígito de referência 1 (posição a partir do fim)
+        stp2:            2,          // dígito de referência 2 (posição a partir do fim)
+        digitThreshold:  2,          // dígito é "baixo" se < 2
       },
     },
   },

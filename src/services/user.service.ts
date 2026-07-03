@@ -299,6 +299,30 @@ export class UserService {
     return toPublic(user)
   }
 
+  // ─── Apagar utilizador (usado no fluxo de dev/testes) ────────
+  static async deleteByEmail(email: string): Promise<boolean> {
+    const user = await this.findByEmail(email)
+    if (!user) return false
+
+    if (isRedisConnected()) {
+      try {
+        const client = getRedisClient()
+        await client.del(userKey(user.id))
+        await client.del(emailKey(user.email))
+        await client.sRem(INDEX_KEY, user.id)
+      } catch (err) {
+        logger.warn('[UserService] Falha ao apagar no Redis, a limpar apenas memória', { err })
+      }
+    }
+
+    memUsers.delete(user.id)
+    memEmailIndex.delete(user.email)
+    memIndex.delete(user.id)
+
+    logger.info('[UserService] Utilizador apagado', { id: user.id, email: user.email })
+    return true
+  }
+
   // ─── Persistência interna ────────────────────────────────
   private static async persist(user: LocalUser): Promise<void> {
     if (isRedisConnected()) {

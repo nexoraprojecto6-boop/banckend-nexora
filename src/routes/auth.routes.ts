@@ -1,23 +1,30 @@
 // ============================================================
-// NEXORA FOREX — Auth Routes (sem cookies)
+// NEXORA FOREX — Auth Routes
 //
-// PKCE agora guardado no Redis (via AuthService.buildAuthorizationUrl
-// e AuthService.retrievePkce) — sem setPkceCookie / readAndClearPkceCookie.
-// Funciona em qualquer browser, mesmo com bloqueio de cookies
-// de terceiros activado.
+// 1) Deriv OAuth2 + PKCE — INTOCADO.
+// 2) Login local (nome, WhatsApp, email + senha) com verificação
+//    de email obrigatória antes do login funcionar.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express'
 import { AuthService } from '@services/auth.service.js'
 import { DerivAPIService } from '@services/deriv-api.service.js'
+import { UserService } from '@services/user.service.js'
 import { authLimiter } from '@middleware/security.js'
+import { signLocalToken, requireLocalAuth } from '@middleware/auth-local.middleware.js'
 import { config } from '@config/index.js'
 import logger from '@utils/logger.js'
+import {
+  RegisterSchema, LocalLoginSchema, VerifyEmailSchema, ResendVerificationSchema,
+} from '../types/schemas.js'
 
 const router: Router = Router()
 const FRONTEND_URL   = config.frontend.url
 
-// ── GET /api/auth/login ───────────────────────────────────────
+// ============================================================
+// 1) DERIV OAUTH — sem alterações
+// ============================================================
+
 router.get('/login', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const prompt    = (req.query.prompt as 'login' | 'registration') || 'login'
@@ -28,7 +35,6 @@ router.get('/login', authLimiter, async (req: Request, res: Response, next: Next
     const utmMedium   = (req.query.utm_medium   as string | undefined) ?? (isSignup ? config.affiliate.utmMedium   : undefined)
     const utmSource   = (req.query.utm_source   as string | undefined) ?? (isSignup ? config.affiliate.utmSource   : undefined)
 
-    // buildAuthorizationUrl agora é async — guarda o PKCE no Redis
     const { url: authUrl } = await AuthService.buildAuthorizationUrl({
       prompt, sidc, utmCampaign, utmMedium, utmSource,
     })
@@ -41,7 +47,6 @@ router.get('/login', authLimiter, async (req: Request, res: Response, next: Next
   }
 })
 
-// ── GET /api/auth/callback ────────────────────────────────────
 router.get('/callback', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const code  = req.query.code  as string | undefined
@@ -58,7 +63,6 @@ router.get('/callback', authLimiter, async (req: Request, res: Response, next: N
       return res.redirect(`${FRONTEND_URL}/?error=missing_params`)
     }
 
-    // Recupera e apaga o codeVerifier do Redis — uso único
     let codeVerifier: string
     try {
       codeVerifier = await AuthService.retrievePkce(state)
@@ -81,7 +85,6 @@ router.get('/callback', authLimiter, async (req: Request, res: Response, next: N
   }
 })
 
-// ── GET /api/auth/signup ──────────────────────────────────────
 router.get('/signup', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sidc        = (req.query.sidc        as string | undefined) ?? config.affiliate.sidc
@@ -101,7 +104,6 @@ router.get('/signup', authLimiter, async (req: Request, res: Response, next: Nex
   }
 })
 
-// ── POST /api/auth/logout ─────────────────────────────────────
 router.post('/logout', (_req: Request, res: Response, next: NextFunction) => {
   try {
     logger.info('[Auth] User logged out')
@@ -112,7 +114,6 @@ router.post('/logout', (_req: Request, res: Response, next: NextFunction) => {
   }
 })
 
-// ── GET /api/auth/validate ────────────────────────────────────
 router.get('/validate', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const token    = AuthService.extractBearerToken(req.headers.authorization)
@@ -125,12 +126,103 @@ router.get('/validate', async (req: Request, res: Response, next: NextFunction) 
   }
 })
 
-// ── POST /api/auth/refresh-token ──────────────────────────────
 router.post('/refresh-token', authLimiter, (_req: Request, res: Response) => {
   res.status(501).json({
     error:   'Token refresh not yet implemented',
     message: 'Please re-authenticate using the login endpoint',
   })
+})
+
+// ============================================================
+// 2) LOGIN LOCAL (nome, WhatsApp, email + senha)
+// ============================================================
+
+// ── POST /api/auth/register ───────────────────────────────────
+router.post('/register', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { fullName, whatsapp, email, password } = RegisterSchema.parse(req.body)
+    const user = await UserService.register({ fullName, whatsapp, email, password })
+
+    logger.info('[Auth] Registo local concluído, aguarda verificação de email', { id: user.id })
+    res.status(201).json({
+      success: true,
+      message: 'Conta criada. Verifica o teu email para poderes entrar.',
+      user,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// ── GET /api/auth/verify-email?token=... ───────────────────────
+// Aberto via link no email. Redireciona para o frontend com resultado.
+router.get('/verify-email', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const token = req.query.token as string | undefined
+    if (!token) {
+      return res.redirect(`${FRONTEND_URL}/verify-email?status=missing_token`)
+    }
+
+    const user  = await UserService.verifyEmailToken(token)
+    const authToken = signLocalToken({ sub: user.id, email: user.email, role: user.role })
+
+    return res.redirect(
+      `${FRONTEND_URL}/verify-email?status=success&token=${encodeURIComponent(authToken)}`,
+    )
+  } catch (error: any) {
+    logger.warn('[Auth] Falha na verificação de email', { message: error.message })
+    return res.redirect(`${FRONTEND_URL}/verify-email?status=error&message=${encodeURIComponent(error.message)}`)
+  }
+})
+
+// ── POST /api/auth/verify-email ─────────────────────────────────
+// Alternativa em JSON, caso o frontend prefira chamar via fetch
+// em vez de seguir o redirect do link do email.
+router.post('/verify-email', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token } = VerifyEmailSchema.parse(req.body)
+    const user = await UserService.verifyEmailToken(token)
+    const authToken = signLocalToken({ sub: user.id, email: user.email, role: user.role })
+    res.json({ success: true, token: authToken, user })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// ── POST /api/auth/resend-verification ──────────────────────────
+router.post('/resend-verification', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email } = ResendVerificationSchema.parse(req.body)
+    await UserService.resendVerification(email)
+    // Resposta genérica, não confirma se o email existe (evita enumeração de contas)
+    res.json({ success: true, message: 'Se o email existir e não estiver verificado, foi enviado um novo link.' })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// ── POST /api/auth/login-local ────────────────────────────────
+router.post('/login-local', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email, password } = LocalLoginSchema.parse(req.body)
+    const user  = await UserService.login(email, password)
+    const token = signLocalToken({ sub: user.id, email: user.email, role: user.role })
+    res.json({ success: true, token, user })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// ── GET /api/auth/me ────────────────────────────────────────────
+router.get('/me', requireLocalAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const user = await UserService.findById(req.localUser!.sub)
+    if (!user) return res.status(404).json({ error: 'Utilizador não encontrado' })
+    const { passwordHash, ...publicUser } = user
+    res.json({ success: true, user: publicUser })
+  } catch (error) {
+    next(error)
+  }
 })
 
 export default router

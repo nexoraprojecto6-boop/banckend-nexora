@@ -27,6 +27,7 @@ import { ScalpingStrategy } from './strategies/scalping.strategy.js';
 import { MartingaleStrategy } from './strategies/martingale.strategy.js';
 import { TrendFollowingStrategy } from './strategies/trend-following.strategy.js';
 import { ScalperStrategy } from './strategies/scalper.strategy.js';
+import { AlfhaStrategy } from './strategies/alfha.strategy.js';
 import logger from '@utils/logger.js';
 
 // Todos os eventos emitidos pelas estratégias.
@@ -152,8 +153,10 @@ export class BotManager extends EventEmitter {
         return new MartingaleStrategy(id, name, config, this.derivWs);
       case 'trend_following':
         return new TrendFollowingStrategy(id, name, config, this.derivWs);
-      case 'digit_over_martingale':
+      case 'scalper':
         return new ScalperStrategy(id, name, config, this.derivWs);
+      case 'alfha':
+        return new AlfhaStrategy(id, name, config, this.derivWs);
       default:
         throw new Error(`Estratégia desconhecida: ${strategy}`);
     }

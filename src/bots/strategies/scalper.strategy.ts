@@ -39,12 +39,12 @@ export class ScalperStrategy extends BaseStrategy {
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
     const params = (config.strategyParams ?? {
-      predictDigit: 1,
+      predictDigit: 3,
       winStake: config.initialStake,
       martingaleStep: 2,
       stp1: 2,
       stp2: 2,
-      digitThreshold: 2, // "baixo" = dígito < digitThreshold
+      digitThreshold: 4, // "baixo" = dígito < digitThreshold (predictDigit + 1)
     }) as unknown as DigitOverMartingaleParams;
 
     super(id, name, 'digit_over_martingale', config, derivWs);

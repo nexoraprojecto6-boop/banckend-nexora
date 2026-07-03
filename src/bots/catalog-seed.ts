@@ -13,7 +13,8 @@
 //   'martingale'             → MartingaleStrategy (dobra stake após perda)
 //   'anti_martingale'        → MartingaleStrategy com resetOnWin: true
 //   'trend_following'        → TrendFollowingStrategy
-//   'digit_over_martingale'  → DigitOverMartingaleStrategy (DIGITOVER + martingale por dígitos)
+//   'scalper'                → ScalperStrategy (DIGITOVER + Gale)
+//   'alfha'                  → AlfhaStrategy (DIGITOVER/DIGITUNDER conforme o dígito + Gale)
 //
 // ACESSO:
 //   Apenas o administrador gere este ficheiro.
@@ -91,21 +92,21 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   },
 
   // ──────────────────────────────────────────────────────────
-  // BOT 3 — SCALPER (Digit Over + Martingale)
+  // BOT 3 — SCALPER (Digit Over + Gale)
   // ──────────────────────────────────────────────────────────
-  // Analisa os 2 últimos dígitos de referência do Volatility 100
-  // (1s) Index; se ambos forem "baixos" (< digitThreshold), compra
-  // DIGITOVER 3 com duração de 1 tick. Martingale em 2 níveis,
-  // depois reseta para o stake inicial.
+  // Compra DIGITOVER 3 (1 tick) sempre que o último dígito observado
+  // for baixo (<= 3). Gale (martingale) desde a 1ª perda, com teto
+  // de níveis, e pausa automática temporária ao atingir uma perda
+  // acumulada.
   // ATENÇÃO: alto risco — usar apenas em conta demo. Dígitos em
   // índices sintéticos são praticamente aleatórios e independentes
   // entre ticks; esta análise não constitui vantagem estatística
   // comprovada.
   {
     name:        'SCALPER',
-    description: 'Analisa os últimos dígitos do Volatility 100 (1s) Index e compra DIGITOVER 3 (1 tick) quando o padrão de referência aparece. Usa martingale em 2 níveis antes de resetar o stake. Recomendado apenas em conta demo — dígitos em índices sintéticos são praticamente aleatórios.',
-    strategy:    'digit_over_martingale',
-    tags:        ['digitos', 'martingale', 'risco-alto', 'demo'],
+    description: 'Compra DIGITOVER 3 (1 tick) no Volatility 100 (1s) Index sempre que o último dígito é baixo. Usa Gale (martingale) desde a 1ª perda, com pausa automática temporária ao atingir uma perda acumulada. Recomendado apenas em conta demo.',
+    strategy:    'scalper',
+    tags:        ['digitos', 'gale', 'risco-alto', 'demo'],
     isActive:    true,
     createdBy:   'admin',
     defaultConfig: {
@@ -119,12 +120,49 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       maxLoss:      40,
       maxProfit:    1,
       strategyParams: {
-        predictDigit:    3,          // barreira: dígito > 3
-        winStake:        0.5,        // stake usado após vitória
-        martingaleStep:  2,          // níveis de martingale antes de resetar
-        stp1:            2,          // dígito de referência 1 (posição a partir do fim)
-        stp2:            2,          // dígito de referência 2 (posição a partir do fim)
-        digitThreshold:  4,          // dígito é "baixo" se < 4 (predictDigit + 1)
+        predictDigit:        3,      // barreira: dígito > 3
+        gale:                2,      // multiplicador do stake por perda
+        lossesToStartGale:   0,      // Gale começa já na 1ª perda
+        maxMartingaleSteps:  10,     // teto de níveis antes de resetar
+        pauseLossLimit:      20,     // pausa temporária ao acumular $20 de perda
+        pauseSeconds:        10,     // duração da pausa automática
+      },
+    },
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // BOT 4 — ALFHA (Digit Over/Under + Gale)
+  // ──────────────────────────────────────────────────────────
+  // Compra DIGITOVER 2 quando o último dígito é baixo (<= 2), ou
+  // DIGITUNDER 7 quando é alto (>= 7). Gale desde a 1ª perda, com
+  // teto de níveis, e pausa automática temporária ao atingir uma
+  // perda acumulada.
+  // ATENÇÃO: alto risco — usar apenas em conta demo.
+  {
+    name:        'ALFHA',
+    description: 'Compra DIGITOVER 2 ou DIGITUNDER 7 (1 tick) no Volatility 100 Index conforme o último dígito observado. Usa Gale (martingale) desde a 1ª perda, com pausa automática temporária ao atingir uma perda acumulada. Recomendado apenas em conta demo.',
+    strategy:    'alfha',
+    tags:        ['digitos', 'gale', 'risco-alto', 'demo'],
+    isActive:    true,
+    createdBy:   'admin',
+    defaultConfig: {
+      symbol:       'R_100',         // Volatility 100 Index
+      contractType: 'DIGITOVER',     // trocado dinamicamente para DIGITUNDER conforme o sinal
+      duration:     1,
+      durationUnit: 'ticks',
+      initialStake: 0.4,
+      currency:     'USD',
+      maxTrades:    0,
+      maxLoss:      20,
+      maxProfit:    1,
+      strategyParams: {
+        digitOver:           2,      // entra em Over quando o dígito é <= 2
+        digitUnder:          7,      // entra em Under quando o dígito é >= 7
+        gale:                2,      // multiplicador do stake por perda
+        lossesToStartGale:   0,      // Gale começa já na 1ª perda
+        maxMartingaleSteps:  10,     // teto de níveis antes de resetar
+        pauseLossLimit:      20,     // pausa temporária ao acumular $20 de perda
+        pauseSeconds:        10,     // duração da pausa automática
       },
     },
   },

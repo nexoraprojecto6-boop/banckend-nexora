@@ -19,6 +19,7 @@
 //   ✅ req_id numérico incremental (não aleatório — pode colidir)
 //   ✅ waitForContract: forget usa subscription.id do servidor
 //   ✅ subscribeToTicks: filtra por symbol E pela subscrição
+//   ✅ buyContract aceita barrier opcional (contratos de dígitos)
 // ============================================================
 
 import { WebSocket } from 'ws';
@@ -87,6 +88,7 @@ export function createDerivWsAdapter(
     duration: number;
     durationUnit: string;
     currency: string;
+    barrier?: string;
   }): Promise<{ contractId: string }> {
 
     const ws = getDerivWs();
@@ -111,6 +113,7 @@ export function createDerivWsAdapter(
         duration:          params.duration,
         duration_unit:     durationUnit,
         underlying_symbol: params.symbol,
+        ...(params.barrier !== undefined ? { barrier: params.barrier } : {}),
       }, proposalReqId, 15_000);
     } catch (err) {
       throw toDerivApiError(err, 'Erro na proposta');
@@ -128,6 +131,7 @@ export function createDerivWsAdapter(
     logger.debug('[DerivAdapter] proposal recebida', {
       reqId: proposalReqId, symbol: params.symbol, stake: params.stake,
       contractType: params.contractType, duration: params.duration, durationUnit, askPrice,
+      barrier: params.barrier,
     });
 
     // ── Passo 2: buy ────────────────────────────────────────

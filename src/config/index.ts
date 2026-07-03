@@ -21,11 +21,6 @@ const configSchema = z.object({
     redirectUri: z.string().url().default('https://banckend-nexora.onrender.com/api/auth/callback'),
     appId: z.string().min(1, 'DERIV_APP_ID is required'),
   }),
-  // ─── Afiliado ─────────────────────────────────────────────
-  // Aplicados por defeito em todos os pedidos de signup
-  // (prompt=registration), para atribuir novos registos à conta
-  // de parceiro Deriv. O frontend pode sobrepor via query params
-  // se precisar de uma campanha diferente; estes são só o fallback.
   affiliate: z.object({
     sidc: z.string().default(''),
     utmSource: z.string().default(''),
@@ -44,6 +39,19 @@ const configSchema = z.object({
   security: z.object({
     jwtSecret: z.string().min(1, 'JWT_SECRET is required'),
     corsOrigin: z.string().default('http://localhost:3000'),
+  }),
+  // ─── Email (verificação de conta local) ────────────────────
+  // Se smtpHost não estiver definido, o email.service.ts faz
+  // fallback e apenas regista o link de verificação nos logs —
+  // assim o fluxo de registo não fica bloqueado em desenvolvimento
+  // sem SMTP configurado.
+  email: z.object({
+    smtpHost: z.string().optional(),
+    smtpPort: z.number().default(587),
+    smtpUser: z.string().optional(),
+    smtpPass: z.string().optional(),
+    smtpSecure: z.boolean().default(false),
+    from: z.string().default('NEXORA <no-reply@nexora.app>'),
   }),
   logging: z.object({
     level: z.string().default('info'),
@@ -82,8 +90,6 @@ const envConfig = {
     redirectUri: process.env.DERIV_REDIRECT_URI || 'https://banckend-nexora.onrender.com/api/auth/callback',
     appId: process.env.DERIV_APP_ID || '',
   },
-  // Valores por defeito já preenchidos com os dados confirmados.
-  // Podem ser sobrepostos via env vars no Render sem precisar de rebuild.
   affiliate: {
     sidc: process.env.DERIV_AFFILIATE_SIDC || 'C52M9QNQNANN',
     utmSource: process.env.DERIV_AFFILIATE_UTM_SOURCE || '3224',
@@ -95,7 +101,6 @@ const envConfig = {
     prodUrl: process.env.FRONTEND_PROD_URL || 'https://yourdomain.com',
   },
   redis: {
-    // Usa REDIS_URL diretamente (Render injeta isso automaticamente, se usares Redis da Render)
     url: process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`,
     db: parseInt(process.env.REDIS_DB || '0', 10),
     password: process.env.REDIS_PASSWORD,
@@ -103,6 +108,14 @@ const envConfig = {
   security: {
     jwtSecret: process.env.JWT_SECRET || 'dev-secret-key',
     corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  },
+  email: {
+    smtpHost: process.env.SMTP_HOST || undefined,
+    smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
+    smtpUser: process.env.SMTP_USER || undefined,
+    smtpPass: process.env.SMTP_PASS || undefined,
+    smtpSecure: process.env.SMTP_SECURE === 'true',
+    from: process.env.EMAIL_FROM || 'NEXORA <no-reply@nexora.app>',
   },
   logging: {
     level: process.env.LOG_LEVEL || 'info',
@@ -122,6 +135,5 @@ const envConfig = {
 
 export const config = configSchema.parse(envConfig);
 
-// Mantém exports diretos para compatibilidade
 export const isDevelopment = config.server.isDevelopment;
 export const isProduction = config.server.isProduction;

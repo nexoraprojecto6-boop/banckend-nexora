@@ -3,7 +3,7 @@
 // ============================================================
 
 export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
-export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'digit_over_martingale';
+export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha';
 export type TradeDirection = 'CALL' | 'PUT';
 
 // ─── Configuração base (comum a todas as estratégias) ────────
@@ -38,13 +38,27 @@ export interface TrendFollowingParams {
   trendThreshold: number;      // variação % mínima para confirmar tendência (ex: 0.002)
 }
 
-export interface DigitOverMartingaleParams {
-  predictDigit: number;      // barreira DIGITOVER (ex: 1 = "over 1")
-  winStake: number;          // stake usado logo após uma vitória
-  martingaleStep: number;    // níveis de martingale antes de resetar
-  stp1: number;              // posição (a partir do fim) do dígito de referência 1
-  stp2: number;              // posição (a partir do fim) do dígito de referência 2
-  digitThreshold: number;    // valor abaixo do qual um dígito é considerado "baixo"
+// Parâmetros do bot SCALPER — apenas o necessário para configurar.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface ScalperParams {
+  predictDigit: number;        // barreira do DIGITOVER (ex: 3 = "over 3")
+  gale: number;                // multiplicador do stake por perda
+  lossesToStartGale: number;   // nº de perdas seguidas antes do Gale começar
+  maxMartingaleSteps: number;  // nº de níveis de Gale antes de resetar o stake
+  pauseLossLimit: number;      // perda acumulada que pausa o bot temporariamente (0 = desactivado)
+  pauseSeconds: number;        // duração da pausa automática, em segundos
+}
+
+// Parâmetros do bot ALFHA — opera Over e Under conforme o último dígito.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface AlfhaParams {
+  digitOver: number;            // barreira para entrar em DIGITOVER
+  digitUnder: number;           // barreira para entrar em DIGITUNDER
+  gale: number;                 // multiplicador do stake por perda
+  lossesToStartGale: number;    // nº de perdas seguidas antes do Gale começar
+  maxMartingaleSteps: number;   // nº de níveis de Gale antes de resetar o stake
+  pauseLossLimit: number;       // perda acumulada que pausa o bot temporariamente (0 = desactivado)
+  pauseSeconds: number;         // duração da pausa automática, em segundos
 }
 
 // ─── Estatísticas do bot ─────────────────────────────────────

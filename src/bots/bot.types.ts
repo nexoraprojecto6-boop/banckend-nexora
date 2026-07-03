@@ -3,7 +3,7 @@
 // ============================================================
 
 export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
-export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following';
+export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'digit_over_martingale';
 export type TradeDirection = 'CALL' | 'PUT';
 
 // ─── Configuração base (comum a todas as estratégias) ────────
@@ -36,6 +36,15 @@ export interface MartingaleParams {
 export interface TrendFollowingParams {
   ticksWindow: number;         // quantos ticks analisar
   trendThreshold: number;      // variação % mínima para confirmar tendência (ex: 0.002)
+}
+
+export interface DigitOverMartingaleParams {
+  predictDigit: number;      // barreira DIGITOVER (ex: 1 = "over 1")
+  winStake: number;          // stake usado logo após uma vitória
+  martingaleStep: number;    // níveis de martingale antes de resetar
+  stp1: number;              // posição (a partir do fim) do dígito de referência 1
+  stp2: number;              // posição (a partir do fim) do dígito de referência 2
+  digitThreshold: number;    // valor abaixo do qual um dígito é considerado "baixo"
 }
 
 // ─── Estatísticas do bot ─────────────────────────────────────
@@ -155,6 +164,7 @@ export interface DerivWsAdapter {
     duration: number;
     durationUnit: string;
     currency: string;
+    barrier?: string;       // necessário para contratos de dígitos (DIGITOVER/DIGITUNDER)
   }): Promise<{ contractId: string }>;
 
   waitForContract(contractId: string): Promise<{

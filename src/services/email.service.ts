@@ -36,7 +36,8 @@ export class EmailService {
 
     if (!client) {
       logger.warn('[Email] RESEND_API_KEY não configurada — link de verificação apenas nos logs', {
-        to, verifyUrl,
+        to,
+        verifyUrl,
       })
       return
     }
@@ -64,12 +65,32 @@ export class EmailService {
       })
 
       if (error) {
-        throw new Error(typeof error === 'string' ? error : JSON.stringify(error))
+        // O SDK da Resend devolve um objeto { name, message, statusCode } no erro.
+        // Registamos os campos explicitamente para não perder a causa real.
+        logger.error('[Email] Resend devolveu erro ao enviar', {
+          to,
+          errorName: (error as any)?.name,
+          errorMessage: (error as any)?.message,
+          statusCode: (error as any)?.statusCode,
+          raw: JSON.stringify(error),
+        })
+        return
       }
 
       logger.info('[Email] Email de verificação enviado via Resend', { to, id: data?.id })
     } catch (err) {
-      logger.error('[Email] Falha ao enviar email de verificação', { to, err })
+      // Objetos Error não serializam bem com JSON.stringify (dá "{}").
+      // Extraímos message/stack manualmente para o log mostrar a causa real.
+      const errorMessage = err instanceof Error ? err.message : String(err)
+      const errorStack = err instanceof Error ? err.stack : undefined
+      const errorName = err instanceof Error ? err.name : undefined
+
+      logger.error('[Email] Falha ao enviar email de verificação', {
+        to,
+        errorName,
+        errorMessage,
+        errorStack,
+      })
       // Não lança erro — o registo não deve falhar por causa do provedor de email.
       // O utilizador pode pedir reenvio via /resend-verification.
     }

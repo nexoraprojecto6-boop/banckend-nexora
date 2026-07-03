@@ -41,11 +41,13 @@ const configSchema = z.object({
     corsOrigin: z.string().default('http://localhost:3000'),
   }),
   // ─── Email (verificação de conta local) ────────────────────
-  // Se smtpHost não estiver definido, o email.service.ts faz
-  // fallback e apenas regista o link de verificação nos logs —
-  // assim o fluxo de registo não fica bloqueado em desenvolvimento
-  // sem SMTP configurado.
+  // Usamos a API HTTPS da Resend (RESEND_API_KEY) em vez de SMTP,
+  // porque o Render bloqueia ligações SMTP de saída no plano
+  // gratuito (ver email.service.ts para detalhes). Os campos SMTP_*
+  // ficam mantidos como legado/fallback local, mas não são usados
+  // em produção.
   email: z.object({
+    resendApiKey: z.string().optional(),
     smtpHost: z.string().optional(),
     smtpPort: z.number().default(587),
     smtpUser: z.string().optional(),
@@ -110,6 +112,7 @@ const envConfig = {
     corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:3000',
   },
   email: {
+    resendApiKey: process.env.RESEND_API_KEY || undefined,
     smtpHost: process.env.SMTP_HOST || undefined,
     smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
     smtpUser: process.env.SMTP_USER || undefined,

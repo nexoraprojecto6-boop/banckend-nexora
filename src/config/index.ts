@@ -41,11 +41,6 @@ const configSchema = z.object({
     corsOrigin: z.string().default('http://localhost:3000'),
   }),
   // ─── Email (verificação de conta local) ────────────────────
-  // Usamos a API HTTPS da Resend (RESEND_API_KEY) em vez de SMTP,
-  // porque o Render bloqueia ligações SMTP de saída no plano
-  // gratuito (ver email.service.ts para detalhes). Os campos SMTP_*
-  // ficam mantidos como legado/fallback local, mas não são usados
-  // em produção.
   email: z.object({
     resendApiKey: z.string().optional(),
     smtpHost: z.string().optional(),
@@ -54,6 +49,14 @@ const configSchema = z.object({
     smtpPass: z.string().optional(),
     smtpSecure: z.boolean().default(false),
     from: z.string().default('NEXORA <no-reply@nexora.app>'),
+  }),
+  // ─── Admin ──────────────────────────────────────────────────
+  // Lista de emails (em minúsculas) que sempre têm role 'admin'.
+  // Definido via ADMIN_EMAILS="email1@x.com,email2@x.com" no .env.
+  // O role é recalculado a cada login para se manter em sincronia
+  // com esta lista (ver UserService.login).
+  admin: z.object({
+    emails: z.array(z.string()).default([]),
   }),
   logging: z.object({
     level: z.string().default('info'),
@@ -119,6 +122,12 @@ const envConfig = {
     smtpPass: process.env.SMTP_PASS || undefined,
     smtpSecure: process.env.SMTP_SECURE === 'true',
     from: process.env.EMAIL_FROM || 'NEXORA <no-reply@nexora.app>',
+  },
+  admin: {
+    emails: (process.env.ADMIN_EMAILS || '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean),
   },
   logging: {
     level: process.env.LOG_LEVEL || 'info',

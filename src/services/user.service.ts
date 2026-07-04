@@ -10,6 +10,11 @@
 //   user:email:{email}        -> id  (lookup rápido por email)
 //   users:index                -> SET com todos os ids (listagens/stats)
 //   email-verify:{token}       -> id  (token de verificação, TTL 24h)
+//
+// Admin: o role 'admin' é atribuído com base em config.admin.emails
+// (env var ADMIN_EMAILS, lista separada por vírgulas). É recalculado
+// a cada login para se manter em sincronia caso a lista mude depois
+// do utilizador já ter sido criado.
 // ============================================================
 
 import bcrypt from 'bcryptjs'
@@ -17,11 +22,13 @@ import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import { getRedisClient, isRedisConnected } from '@utils/redis.js'
 import logger from '@utils/logger.js'
+import { config } from '@config/index.js'
 import { AuthenticationError, ConflictError } from '../types/errors.js'
 import { EmailService } from './email.service.js'
 
 const SALT_ROUNDS = 12
 const INACTIVE_AFTER_DAYS = 30
+const ONLINE_THRESHOLD_MS = 5 * 60 * 1000 // 5 min sem atividade = offline
 const VERIFY_TOKEN_TTL_SECONDS = 24 * 60 * 60 // 24h
 
 export interface LocalUser {
@@ -35,6 +42,7 @@ export interface LocalUser {
   emailVerified: boolean
   createdAt: number
   lastLoginAt: number | null
+  lastActiveAt: number | null
 }
 
 export type PublicUser = Omit<LocalUser, 'passwordHash'>
@@ -54,6 +62,10 @@ function verifyKey(token: string): string {
   return `email-verify:${token}`
 }
 const INDEX_KEY = 'users:index'
+
+function isAdminEmail(email: string): boolean {
+  return config.admin.emails.includes(email.toLowerCase().trim())
+}
 
 // ─── Fallback em memória ──────────────────────────────────────
 const memUsers = new Map<string, LocalUser>()
@@ -77,27 +89,24 @@ export class UserService {
       throw new ConflictError('Este email já está registado')
     }
 
-    const isFirstUser = (await this.countAll()) === 0
-
     const user: LocalUser = {
       id: uuidv4(),
       fullName: input.fullName.trim(),
       whatsapp: input.whatsapp.trim(),
       email: normalizedEmail,
       passwordHash: await bcrypt.hash(input.password, SALT_ROUNDS),
-      role: isFirstUser ? 'admin' : 'user',
+      role: isAdminEmail(normalizedEmail) ? 'admin' : 'user',
       status: 'active',
       emailVerified: false,
       createdAt: Date.now(),
       lastLoginAt: null,
+      lastActiveAt: null,
     }
 
     await this.persist(user)
     logger.info('[UserService] Novo utilizador registado', { id: user.id, email: user.email, role: user.role })
 
     // Dispara o email de verificação — NUNCA deve derrubar o registo.
-    // O utilizador já foi persistido; se o email falhar, ele pode pedir
-    // reenvio depois (rota /api/auth/resend-verification).
     try {
       const token = await this.generateEmailVerificationToken(user.id)
       await EmailService.sendVerificationEmail(user.email, user.fullName, token)
@@ -128,11 +137,32 @@ export class UserService {
       throw new AuthenticationError('Confirma o teu email antes de entrares. Verifica a tua caixa de entrada.')
     }
 
+    // Recalcula o role a cada login, para refletir alterações na
+    // lista ADMIN_EMAILS sem precisar de migração manual de dados.
+    const shouldBeAdmin = isAdminEmail(user.email)
+    if (shouldBeAdmin && user.role !== 'admin') user.role = 'admin'
+    if (!shouldBeAdmin && user.role === 'admin') user.role = 'user'
+
     user.lastLoginAt = Date.now()
+    user.lastActiveAt = Date.now()
     await this.persist(user)
 
-    logger.info('[UserService] Login efetuado', { id: user.id, email: user.email })
+    logger.info('[UserService] Login efetuado', { id: user.id, email: user.email, role: user.role })
     return toPublic(user)
+  }
+
+  // Chamado a cada pedido autenticado (ver requireLocalAuth) para
+  // sabermos quem está "online agora" e quem usa o sistema com
+  // frequência. Feito em fire-and-forget, nunca bloqueia o pedido.
+  static async touchActivity(id: string): Promise<void> {
+    try {
+      const user = await this.findById(id)
+      if (!user) return
+      user.lastActiveAt = Date.now()
+      await this.persist(user)
+    } catch (err) {
+      logger.warn('[UserService] Falha ao atualizar lastActiveAt', { id, err })
+    }
   }
 
   // ─── Verificação de email ──────────────────────────────────
@@ -195,7 +225,6 @@ export class UserService {
       return
     }
     if (user.emailVerified) {
-      // 409 Conflict — o email já está verificado, não é um problema de autenticação.
       throw new ConflictError('Este email já está verificado')
     }
     const token = await this.generateEmailVerificationToken(user.id)
@@ -267,11 +296,17 @@ export class UserService {
     const now = Date.now()
     const inactiveThreshold = INACTIVE_AFTER_DAYS * 24 * 60 * 60 * 1000
 
+    const startOfDay = new Date()
+    startOfDay.setHours(0, 0, 0, 0)
+    const startOfDayMs = startOfDay.getTime()
+
     const total = users.length
     const blocked = users.filter((u) => u.status === 'blocked').length
     const verified = users.filter((u) => u.emailVerified).length
     const unverified = total - verified
     const neverLoggedIn = users.filter((u) => u.lastLoginAt === null).length
+    const newToday = users.filter((u) => u.createdAt >= startOfDayMs).length
+    const onlineNow = users.filter((u) => u.lastActiveAt !== null && now - u.lastActiveAt <= ONLINE_THRESHOLD_MS).length
     const inactive = users.filter((u) => {
       if (u.status === 'blocked') return false
       if (u.lastLoginAt === null) return now - u.createdAt > inactiveThreshold
@@ -287,6 +322,8 @@ export class UserService {
       verified,
       unverified,
       neverLoggedIn,
+      newToday,
+      onlineNow,
       inactiveAfterDays: INACTIVE_AFTER_DAYS,
     }
   }

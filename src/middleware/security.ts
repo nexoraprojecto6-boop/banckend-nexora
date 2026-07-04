@@ -43,16 +43,19 @@ export const corsMiddleware = cors({
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   // FIX: 'Deriv-App-ID' exigido pela Deriv em chamadas REST.
-  // FIX: 'x-cr' adicionado — usado por api.checkAdmin() no frontend
-  // para identificar a conta ao verificar privilégios de admin; sem
-  // estar aqui, o browser bloqueia o preflight CORS e a chamada
-  // nunca chega ao backend (erro visto: "Request header field x-cr
-  // is not allowed by Access-Control-Allow-Headers").
+  // FIX: 'x-cr' — usado por api.checkAdmin() no frontend.
+  // FIX: 'x-local-authorization' — usado por fetchWithLocalAuth()
+  // no frontend (sessão do login local: /api/auth/me e todas as
+  // rotas /api/admin/users/*). Sem estar aqui, o browser bloqueia
+  // o preflight CORS antes mesmo do pedido chegar ao backend
+  // (erro visto: "Request header field x-local-authorization is
+  // not allowed by Access-Control-Allow-Headers").
   allowedHeaders: [
     'Content-Type',
     'Authorization',
     'Deriv-App-ID',
     'x-cr',
+    'x-local-authorization',
   ],
   maxAge: 86400,
 });
@@ -84,24 +87,6 @@ export const apiLimiter = createRateLimiter(
   config.rateLimit.maxRequests
 );
 
-// ============================================================
-// CORRECÇÃO: authLimiter estava em 5 requisições / 15 minutos.
-//
-// Isso é baixo demais para uso normal — o fluxo de autenticação
-// real (login → callback → validate, mais reconexões automáticas
-// do hook de WebSocket no frontend, troca de conta, recarregar a
-// página, etc.) facilmente ultrapassa 5 chamadas a estas rotas
-// numa única sessão de uso legítimo. Quando o limite estourava,
-// o handler do express-rate-limit respondia com JSON puro
-// (res.status(429).json(...)) em vez de redirecionar para o
-// frontend — e como /api/auth/callback normalmente faz um
-// res.redirect(...), o browser ficava preso esperando um redirect
-// que nunca chegava, travando a tela de "A processar autenticação...".
-//
-// Aumentado para 30 tentativas / 15 minutos: ainda protege contra
-// abuso/força bruta, mas comporta o tráfego normal de autenticação
-// de um único utilizador sem bloqueá-lo a meio do próprio login.
-// ============================================================
 export const authLimiter = createRateLimiter(
   15 * 60 * 1000,
   30

@@ -114,6 +114,9 @@ export interface TradeResult {
   won: boolean;
   entryTick?: number;
   exitTick?: number;
+  exitDigit?: number;   // último algarismo do exitTick, já calculado pela
+                          // estratégia (evita recalcular no frontend com
+                          // casas decimais desconhecidas do símbolo)
   entryTime: Date;
   exitTime?: Date;
 }

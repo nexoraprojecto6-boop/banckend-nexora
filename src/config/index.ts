@@ -20,6 +20,10 @@ const configSchema = z.object({
     clientSecret: z.string().min(1, 'DERIV_CLIENT_SECRET is required'),
     redirectUri: z.string().url().default('https://banckend-nexora.onrender.com/api/auth/callback'),
     appId: z.string().min(1, 'DERIV_APP_ID is required'),
+    // Personal Access Token do dono da app, com scope `application_read`.
+    // Usado só para o relatório de comissão (markup-statistics) no painel
+    // admin — não é o token de sessão de um utilizador comum.
+    markupToken: z.string().optional(),
   }),
   affiliate: z.object({
     sidc: z.string().default(''),
@@ -94,6 +98,7 @@ const envConfig = {
     clientSecret: process.env.DERIV_CLIENT_SECRET || '',
     redirectUri: process.env.DERIV_REDIRECT_URI || 'https://banckend-nexora.onrender.com/api/auth/callback',
     appId: process.env.DERIV_APP_ID || '',
+    markupToken: process.env.DERIV_MARKUP_TOKEN || undefined,
   },
   affiliate: {
     sidc: process.env.DERIV_AFFILIATE_SIDC || 'C52M9QNQNANN',

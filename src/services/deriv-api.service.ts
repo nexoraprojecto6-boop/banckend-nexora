@@ -9,6 +9,13 @@
 //   ✅ Mensagens de erro mais detalhadas nos logs
 //   ✅ createPublicWebSocket: sem re-exportar — usar apenas
 //      para dados públicos (active_symbols, etc.)
+//   ✅ getMarkupStatistics — relatório de comissão da app
+//      (GET /applications/v1/markup-statistics)
+//   ✅ NOVO: DerivTokenExpiredError — erro dedicado quando o
+//      DERIV_MARKUP_TOKEN expira ou é inválido (o token de API
+//      da Deriv tem validade máxima de 90 dias), para o admin
+//      routes conseguir devolver uma mensagem clara ao frontend
+//      em vez de um erro genérico 502.
 // ============================================================
 
 import axios from 'axios';
@@ -18,6 +25,32 @@ import { config } from '@config/index.js';
 
 const DERIV_REST_BASE = 'https://api.derivws.com';
 const REQUEST_TIMEOUT = 15_000; // 15s — axios default é infinito
+
+// ─── Erros dedicados ────────────────────────────────────────
+
+/**
+ * Lançado quando a Deriv rejeita o token usado (expirado, revogado
+ * ou com scope insuficiente) — status 401/403 ou códigos de erro
+ * conhecidos da API. Distinto de outras falhas (rede, 5xx, etc.)
+ * para que o caller possa dar uma instrução clara ao admin.
+ */
+export class DerivTokenExpiredError extends Error {
+  constructor(message = 'Token da Deriv inválido, expirado ou sem permissão suficiente') {
+    super(message);
+    this.name = 'DerivTokenExpiredError';
+  }
+}
+
+function isTokenError(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const status = error.response?.status;
+  if (status === 401 || status === 403) return true;
+  const code =
+    error.response?.data?.error?.code ??
+    error.response?.data?.errors?.[0]?.code ??
+    '';
+  return ['InvalidToken', 'AuthorizationRequired', 'Unauthorized', 'PermissionDenied'].includes(code);
+}
 
 // ─── Tipos ───────────────────────────────────────────────────
 
@@ -40,6 +73,29 @@ interface OTPResponse {
 
 interface AccountsResponse {
   data: DerivAccount[];
+}
+
+export interface MarkupStatisticsBreakdown {
+  app_id:          string;
+  app_markup_usd:  number;
+  volume_usd:      number;
+  payout_usd:      number;
+  contract_count:  number;
+  client_count:    number;
+}
+
+export interface MarkupStatisticsData {
+  total_app_markup_usd: number;
+  total_volume_usd:     number;
+  total_payout_usd:     number;
+  total_contract_count: number;
+  total_client_count:   number;
+  breakdown:            MarkupStatisticsBreakdown[];
+}
+
+export interface MarkupStatisticsResponse {
+  data: MarkupStatisticsData;
+  meta: { endpoint: string; method: string; timing: number };
 }
 
 // ─── DerivAPIService ──────────────────────────────────────────
@@ -141,6 +197,55 @@ export class DerivAPIService {
       return response.data;
     } catch {
       return { status: 'error' };
+    }
+  }
+
+  // ── Relatório de Comissão (Markup Statistics) ────────────
+
+  /**
+   * GET /applications/v1/markup-statistics
+   * Estatísticas de markup/comissão da app registada na Deriv,
+   * num intervalo de datas. Requer token com scope
+   * `application_read` (normalmente o token do dono da app,
+   * não o do utilizador final — ver DERIV_MARKUP_TOKEN no .env).
+   *
+   * dateFrom / dateTo no formato "YYYY-MM-DD".
+   *
+   * Lança DerivTokenExpiredError especificamente quando a causa
+   * é o token (401/403/InvalidToken) — outras falhas (rede, 5xx
+   * da Deriv) continuam a lançar Error genérico.
+   */
+  async getMarkupStatistics(dateFrom: string, dateTo: string): Promise<MarkupStatisticsResponse> {
+    try {
+      const response = await axios.get<MarkupStatisticsResponse>(
+        `${DERIV_REST_BASE}/applications/v1/markup-statistics`,
+        {
+          headers: this.headers,
+          params:  { date_from: dateFrom, date_to: dateTo },
+          timeout: REQUEST_TIMEOUT,
+        },
+      );
+      logger.info('[DerivAPI] Markup statistics obtidas', { dateFrom, dateTo });
+      return response.data;
+    } catch (error) {
+      if (isTokenError(error)) {
+        logger.warn('[DerivAPI] Token de markup rejeitado (expirado/inválido)', {
+          status: axios.isAxiosError(error) ? error.response?.status : undefined,
+        });
+        throw new DerivTokenExpiredError();
+      }
+      if (axios.isAxiosError(error)) {
+        logger.error('[DerivAPI] Falha ao obter markup statistics', {
+          status: error.response?.status,
+          data:   error.response?.data,
+        });
+        throw new Error(
+          error.response?.data?.errors?.[0]?.message
+            ?? error.response?.data?.message
+            ?? `Falha ao obter estatísticas de comissão (HTTP ${error.response?.status})`,
+        );
+      }
+      throw error;
     }
   }
 

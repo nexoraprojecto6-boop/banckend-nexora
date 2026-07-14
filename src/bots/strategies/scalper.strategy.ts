@@ -159,6 +159,10 @@ export class ScalperStrategy extends BaseStrategy {
         won: result.won,
         entryTick: result.entryTick,
         exitTick: result.exitTick,
+        // Calculado aqui (não no frontend) porque só a estratégia sabe
+        // o decimalPlaces correcto do símbolo — evita duplicar essa
+        // lógica do lado do cliente com um valor por omissão errado.
+        exitDigit: this.getLastDigit(result.exitTick),
         entryTime,
         exitTime: new Date(),
       };

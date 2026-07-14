@@ -17,8 +17,18 @@ services:
       REDIS_PORT: 6379
     env_file:
       - .env.development
+    # NOTA: removido o volume "./src:/app/src" que existia aqui.
+    # O container só executa "node dist/server.js" (ver Dockerfile,
+    # stage de runtime) — montar ./src não tem NENHUM efeito, porque
+    # o processo nunca lê esses arquivos. Isso dava a falsa impressão
+    # de hot-reload, mas as mudanças em src/ só entram em vigor depois
+    # de reconstruir a imagem (que recompila para dist/).
+    #
+    # Sempre que alterar código em src/, rode:
+    #   pnpm run docker:rebuild
+    # (equivalente a: docker-compose build --no-cache api &&
+    #                 docker-compose up -d --force-recreate api)
     volumes:
-      - ./src:/app/src
       - ./logs:/app/logs
     depends_on:
       - redis

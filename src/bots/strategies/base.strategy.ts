@@ -192,7 +192,8 @@ export abstract class BaseStrategy extends EventEmitter {
     s.maxDrawdown = Math.max(s.maxDrawdown, s.peakProfit - s.netPnL);
 
     // contractType incluído para a UI mostrar a coluna "Tipo" (ex: CALL,
-    // PUT, DIGITOVER), e entryTick/exitTick para a coluna "Tick Final".
+    // PUT, DIGITOVER); exitTick/entryTick e exitDigit (já calculado pela
+    // estratégia, quando disponível) para a coluna "Tick Final".
     this.emit('bot:trade_closed', this.buildEvent('bot:trade_closed', {
       contractId:   result.contractId,
       profit:       result.profit,
@@ -200,6 +201,7 @@ export abstract class BaseStrategy extends EventEmitter {
       stake:        result.stake,
       entryTick:    result.entryTick,
       exitTick:     result.exitTick,
+      exitDigit:    result.exitDigit,
       contractType: this.state.config.contractType,
     }));
     this.emit('bot:stats_updated', this.buildEvent('bot:stats_updated', { stats: { ...s } }));

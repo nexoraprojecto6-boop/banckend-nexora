@@ -12,7 +12,9 @@
     "stop:pm2": "pm2 stop all",
     "logs": "pm2 logs",
     "lint": "eslint src --ext .ts",
-    "format": "prettier --write 'src/**/*.ts'"
+    "format": "prettier --write 'src/**/*.ts'",
+    "docker:rebuild": "docker-compose build --no-cache api && docker-compose up -d --force-recreate api",
+    "docker:logs": "docker-compose logs -f api"
   },
   "keywords": ["deriv", "trading", "api", "websocket", "oauth2"],
   "author": "",

@@ -10,12 +10,14 @@
 //
 // Parâmetros expostos ao utilizador (cartão de configuração) —
 // apenas o que é realmente necessário ajustar:
-//   predictDigit        barreira do DIGITOVER
+//   predictDigit        barreira do DIGITOVER (padrão: 2 -> gatilho cobre 0,1,2)
 //   gale                multiplicador do stake por perda
 //   lossesToStartGale   nº de perdas seguidas antes do Gale começar a multiplicar
 //   maxMartingaleSteps  nº de níveis de Gale antes de resetar o stake
 //   pauseLossLimit      perda acumulada (no ciclo) que pausa o bot temporariamente
 //   pauseSeconds        duração da pausa automática, em segundos
+//   decimalPlaces       nº de casas decimais do símbolo, usado para extrair
+//                        o último dígito corretamente (padrão: 2)
 //
 // STOP LOSS e TAKE PROFIT NÃO ficam aqui — já são cobertos por
 // config.maxLoss / config.maxProfit, tratados pela BaseStrategy.
@@ -42,15 +44,17 @@ export class ScalperStrategy extends BaseStrategy {
   private martingaleSteps = 0;
   private paused = false;
   private tickSub: { unsubscribe: () => void } | null = null;
+  private pauseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
     const params = (config.strategyParams ?? {
-      predictDigit: 3,
+      predictDigit: 2,
       gale: 2,
       lossesToStartGale: 0,
       maxMartingaleSteps: 10,
       pauseLossLimit: 20,
       pauseSeconds: 10,
+      decimalPlaces: 2,
     }) as unknown as ScalperParams;
 
     super(id, name, 'scalper', config, derivWs);
@@ -79,6 +83,12 @@ export class ScalperStrategy extends BaseStrategy {
     this.pending = false;
     this.tickSub?.unsubscribe();
     this.tickSub = null;
+
+    // evita que a pausa automática "acorde" o bot depois de já parado
+    if (this.pauseTimer) {
+      clearTimeout(this.pauseTimer);
+      this.pauseTimer = null;
+    }
   }
 
   // O loop fixo da BaseStrategy não decide nada aqui — a acção
@@ -105,7 +115,11 @@ export class ScalperStrategy extends BaseStrategy {
   }
 
   private getLastDigit(price: number): number {
-    const str = price.toString().replace('.', '');
+    // Usa casas decimais fixas (configuráveis) em vez de toString(),
+    // pois toString() corta zeros à direita (ex: 1.50 -> "1.5")
+    // e faria o último dígito ser lido errado.
+    const decimalPlaces = this.params.decimalPlaces ?? 2;
+    const str = price.toFixed(decimalPlaces).replace('.', '');
     return parseInt(str[str.length - 1], 10);
   }
 
@@ -160,6 +174,11 @@ export class ScalperStrategy extends BaseStrategy {
       }
 
       this.checkPauseCondition();
+    } catch (err) {
+      // Antes: erro de compra/contrato virava unhandled rejection e
+      // o bot podia seguir operando sem registrar a falha.
+      const message = err instanceof Error ? err.message : String(err);
+      this.log('error', `[Scalper] Falha ao operar: ${message}`, { stake });
     } finally {
       this.pending = false;
     }
@@ -188,7 +207,7 @@ export class ScalperStrategy extends BaseStrategy {
       this.martingaleSteps += 1;
       this.state.stats.currentStake = parseFloat((this.state.stats.currentStake * gale).toFixed(2));
     } else {
-      // atingiu o tecto de níveis -> reseta
+      // atingiu o tecto de níveis -> reseta (corte de perdas, não recuperação)
       this.lossCount = 0;
       this.lossAccum = 0;
       this.martingaleSteps = 0;
@@ -209,8 +228,9 @@ export class ScalperStrategy extends BaseStrategy {
     this.lossAccum = 0;
     this.log('info', `Pausa automática — perda acumulada atingiu $${pauseLossLimit}. Retomando em ${pauseSeconds}s.`);
 
-    setTimeout(() => {
+    this.pauseTimer = setTimeout(() => {
       this.paused = false;
+      this.pauseTimer = null;
       this.log('info', 'Pausa automática terminada — retomando operações.');
     }, pauseSeconds * 1000);
   }

@@ -41,12 +41,14 @@ export interface TrendFollowingParams {
 // Parâmetros do bot SCALPER — apenas o necessário para configurar.
 // STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
 export interface ScalperParams {
-  predictDigit: number;        // barreira do DIGITOVER (ex: 3 = "over 3")
+  predictDigit: number;        // barreira do DIGITOVER (ex: 2 = "over 2", gatilho cobre dígitos 0,1,2)
   gale: number;                // multiplicador do stake por perda
   lossesToStartGale: number;   // nº de perdas seguidas antes do Gale começar
   maxMartingaleSteps: number;  // nº de níveis de Gale antes de resetar o stake
   pauseLossLimit: number;      // perda acumulada que pausa o bot temporariamente (0 = desactivado)
   pauseSeconds: number;        // duração da pausa automática, em segundos
+  decimalPlaces?: number;      // nº de casas decimais do símbolo, usado para extrair
+                                //   o último dígito corretamente (padrão: 2 se omitido)
 }
 
 // Parâmetros do bot ALFHA — opera Over e Under conforme o último dígito.

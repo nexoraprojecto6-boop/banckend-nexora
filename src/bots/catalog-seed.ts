@@ -94,8 +94,8 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // ──────────────────────────────────────────────────────────
   // BOT 3 — SCALPER (Digit Over + Gale)
   // ──────────────────────────────────────────────────────────
-  // Compra DIGITOVER 3 (1 tick) sempre que o último dígito observado
-  // for baixo (<= 3). Gale (martingale) desde a 1ª perda, com teto
+  // Compra DIGITOVER 2 (1 tick) sempre que o último dígito observado
+  // for baixo (<= 2). Gale (martingale) desde a 1ª perda, com teto
   // de níveis, e pausa automática temporária ao atingir uma perda
   // acumulada.
   // ATENÇÃO: alto risco — usar apenas em conta demo. Dígitos em
@@ -104,7 +104,7 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // comprovada.
   {
     name:        'SCALPER',
-    description: 'Compra DIGITOVER 3 (1 tick) no Volatility 100 (1s) Index sempre que o último dígito é baixo. Usa Gale (martingale) desde a 1ª perda, com pausa automática temporária ao atingir uma perda acumulada. Recomendado apenas em conta demo.',
+    description: 'Compra DIGITOVER 2 (1 tick) no Volatility 100 (1s) Index sempre que o último dígito é baixo. Usa Gale (martingale) desde a 1ª perda, com pausa automática temporária ao atingir uma perda acumulada. Recomendado apenas em conta demo.',
     strategy:    'scalper',
     tags:        ['digitos', 'gale', 'risco-alto', 'demo'],
     isActive:    true,
@@ -120,12 +120,13 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       maxLoss:      40,
       maxProfit:    1,
       strategyParams: {
-        predictDigit:        3,      // barreira: dígito > 3
+        predictDigit:        2,      // barreira: dígito > 2 (gatilho cobre 0,1,2)
         gale:                2,      // multiplicador do stake por perda
         lossesToStartGale:   0,      // Gale começa já na 1ª perda
         maxMartingaleSteps:  10,     // teto de níveis antes de resetar
         pauseLossLimit:      20,     // pausa temporária ao acumular $20 de perda
         pauseSeconds:        10,     // duração da pausa automática
+        decimalPlaces:       2,      // casas decimais do símbolo, para extrair o dígito certo
       },
     },
   },

@@ -53,6 +53,27 @@ interface QueuedSend {
   timeout: number;
 }
 
+// ─── NOTA SOBRE A CORREÇÃO APLICADA EM server.ts ──────────────
+// Este ficheiro (manager.ts) NÃO sofre do mesmo bug de uncaught
+// exception que existia em server.ts (removeAllListeners() +
+// terminate() num socket ainda CONNECTING).
+//
+// Motivo: aqui o listener de 'error' é atribuído via propriedade
+// (`this.ws.onerror = ...`) logo a seguir à criação do WebSocket,
+// de forma síncrona, dentro de connect(). Esse listener nunca é
+// removido explicitamente — permanece anexado durante toda a vida
+// do socket, incluindo quando close()/terminate() são chamados
+// mais tarde (em disconnect(), reconnect(), ou no timeout de
+// conexão). Por isso, mesmo que o socket ainda esteja CONNECTING
+// no momento do close(), há sempre um listener de 'error' pronto
+// para captar o evento interno emitido pela lib `ws` — não há
+// risco de uncaught exception por falta de listener.
+//
+// Ainda assim, por segurança e consistência com a correção em
+// server.ts, envolvemos as chamadas de close()/terminate() em
+// try/catch como rede de segurança adicional (defesa em
+// profundidade), caso o estado interno do socket mude de forma
+// inesperada entre versões da lib `ws`.
 export class WebSocketManager extends EventEmitter {
   private ws: WebSocket | null = null;
   private url?: string;
@@ -121,10 +142,30 @@ export class WebSocketManager extends EventEmitter {
 
         this.ws = new WebSocket(connectUrl);
 
+        // IMPORTANTE: onerror é atribuído já a seguir (síncrono),
+        // antes de qualquer await/setTimeout poder disparar um
+        // close()/terminate() sobre este socket. Isto garante que
+        // nunca existe uma janela sem listener de 'error' — é o
+        // que torna este ficheiro imune ao bug corrigido em
+        // server.ts. Não mover esta atribuição para depois de
+        // outros passos assíncronos.
+        this.ws.onerror = (event) => {
+          logger.error('WebSocket error', {
+            message: (event as any).message,
+            error: (event as any).error?.message,
+            code: (event as any).error?.code,
+          });
+          this.emit('error', event);
+        };
+
         this.connectionTimeout = setTimeout(() => {
           if (!this.isConnected) {
             logger.error('WebSocket connection timeout — fechando socket pendente');
-            this.ws?.close();
+            try {
+              this.ws?.close();
+            } catch (err: any) {
+              logger.warn('Erro ao fechar socket pendente (ignorado)', { message: err?.message });
+            }
             reject(new Error('WebSocket connection timeout'));
           }
         }, 10_000);
@@ -149,15 +190,6 @@ export class WebSocketManager extends EventEmitter {
               ? event.data.toString()
               : Buffer.from(event.data as ArrayBuffer).toString();
           this.handleMessage(raw);
-        };
-
-        this.ws.onerror = (event) => {
-          logger.error('WebSocket error', {
-            message: (event as any).message,
-            error: (event as any).error?.message,
-            code: (event as any).error?.code,
-          });
-          this.emit('error', event);
         };
 
         // ── DIAGNÓSTICO CRÍTICO ──────────────────────────────
@@ -481,7 +513,11 @@ export class WebSocketManager extends EventEmitter {
   reconnect() {
     if (this.ws) {
       this.isManualReconnect = true;
-      this.ws.close();
+      try {
+        this.ws.close();
+      } catch (err: any) {
+        logger.warn('Erro ao fechar socket durante reconnect (ignorado)', { message: err?.message });
+      }
     }
     this.reconnectAttempts = 0;
     this.connect().then(() => {
@@ -508,7 +544,11 @@ export class WebSocketManager extends EventEmitter {
 
   disconnect() {
     if (this.ws) {
-      this.ws.close();
+      try {
+        this.ws.close();
+      } catch (err: any) {
+        logger.warn('Erro ao fechar socket durante disconnect (ignorado)', { message: err?.message });
+      }
       this.ws = null;
     }
     this.stopHeartbeat();

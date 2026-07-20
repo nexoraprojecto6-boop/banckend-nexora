@@ -25,15 +25,44 @@ export const helmetMiddleware = helmet({
   xssFilter: true,
 });
 
+// ── CORS ─────────────────────────────────────────────────────
+
+// Expande cada origin configurada para incluir a variante com e sem
+// "www." — evita bloquear pedidos por engano quando o DNS aponta as
+// duas formas (nexoraforex.pro e www.nexoraforex.pro) mas só uma
+// delas foi definida nas env vars.
+function withWwwVariants(url: string): string[] {
+  try {
+    const u = new URL(url);
+    const bareHost = u.host.replace(/^www\./, '');
+    const wwwHost = `www.${bareHost}`;
+    return [
+      `${u.protocol}//${bareHost}`,
+      `${u.protocol}//${wwwHost}`,
+    ];
+  } catch {
+    return [url];
+  }
+}
+
+// IMPORTANTE: config.security.corsOrigin (env var CORS_ORIGIN) NÃO é
+// usado aqui — as origens permitidas vêm de config.frontend.url e
+// config.frontend.prodUrl. Para mudar o domínio aceite pelo CORS,
+// atualiza FRONTEND_URL / FRONTEND_PROD_URL no .env, não CORS_ORIGIN.
+const configuredOrigins = [
+  config.frontend.url,
+  config.frontend.prodUrl,
+  'http://localhost:3000',
+  'http://localhost:3001',
+];
+
+const allowedOrigins = Array.from(
+  new Set(configuredOrigins.flatMap(withWwwVariants)),
+);
+
 // CORS middleware
 export const corsMiddleware = cors({
   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-    const allowedOrigins = [
-      config.frontend.url,
-      config.frontend.prodUrl,
-      'http://localhost:3000',
-      'http://localhost:3001',
-    ];
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -86,12 +115,10 @@ export const apiLimiter = createRateLimiter(
   config.rateLimit.windowMs,
   config.rateLimit.maxRequests
 );
-
 export const authLimiter = createRateLimiter(
   15 * 60 * 1000,
   30
 );
-
 export const wsLimiter = createRateLimiter(
   1000,
   10
@@ -120,7 +147,6 @@ export const requestLoggerMiddleware = (
 export const sanitizationMiddleware: RequestHandler = express.json({
   limit: '10mb',
 });
-
 export const urlEncodedMiddleware: RequestHandler = express.urlencoded({
   extended: true,
   limit: '10mb',

@@ -19,6 +19,21 @@
 //   ✅ NOVO: rotas de administração de utilizadores locais
 //      (/api/admin/users) — login local com email/senha,
 //      independente do fluxo OAuth Deriv
+//   ✅ CORREÇÃO CRÍTICA (uncaught exception):
+//      terminate() num WebSocket que ainda está em handshake
+//      (readyState === CONNECTING) faz a lib `ws` emitir
+//      internamente um evento 'error' com a mensagem
+//      "WebSocket was closed before the connection was
+//      established". Como removeAllListeners() era chamado
+//      IMEDIATAMENTE ANTES de terminate(), esse 'error' ficava
+//      sem nenhum listener — e o Node trata EventEmitter 'error'
+//      sem listener como excepção não tratada, derrubando o
+//      processo inteiro (ver process.on('uncaughtException')
+//      no fim deste ficheiro, que faz process.exit(1)).
+//      Correção: antes de terminate(), se o socket ainda está
+//      CONNECTING, anexa-se um listener 'error' no-op para
+//      absorver esse evento esperado. Aplicado em dois pontos:
+//      authenticateClient() e cleanupSession().
 // ============================================================
 
 import 'express-async-errors';
@@ -111,6 +126,53 @@ function sendError(ws: WebSocket, message: string, code = 'ERROR'): void {
 
 function getNextReqId(session: ClientSession): number {
   return ++session.nextReqId;
+}
+
+// ─── Encerrar derivWs com segurança ───────────────────────────
+// CORREÇÃO CRÍTICA: nunca chamar terminate() logo após
+// removeAllListeners() sem antes verificar se o socket ainda
+// está a meio do handshake (CONNECTING). Nesse estado, o
+// terminate() da lib `ws` invoca internamente abortHandshake(),
+// que emite um evento 'error' síncrono com a mensagem
+// "WebSocket was closed before the connection was established".
+// Se não houver NENHUM listener de 'error' registado nesse
+// momento (porque acabámos de os remover todos), o Node trata
+// isso como uma excepção não tratada (EventEmitter sem listener
+// de 'error' == throw), o que derruba o processo inteiro através
+// do handler process.on('uncaughtException') → process.exit(1).
+//
+// Esta função centraliza o encerramento seguro do derivWs e é
+// usada tanto em authenticateClient() como em cleanupSession(),
+// eliminando a duplicação do bug nos dois pontos.
+function safeTerminateDerivWs(session: ClientSession): void {
+  const ws = session.derivWs;
+  if (!ws) return;
+
+  if (session.derivMessageHandler) {
+    ws.removeListener('message', session.derivMessageHandler);
+    session.derivMessageHandler = null;
+  }
+
+  const isConnecting = ws.readyState === WebSocket.CONNECTING;
+
+  ws.removeAllListeners();
+
+  if (isConnecting) {
+    // Absorve o 'error' esperado do abortHandshake interno da lib
+    // ws — isto é comportamento normal quando se aborta um
+    // handshake ainda em curso, não um erro real da aplicação.
+    ws.on('error', () => { /* esperado ao abortar handshake em curso — ignorar */ });
+  }
+
+  try {
+    ws.terminate();
+  } catch (err: any) {
+    // Rede de segurança adicional: mesmo com a checagem de
+    // readyState acima, socket internals do `ws` podem ter uma
+    // corrida (ex: cleanup chamado duas vezes para a mesma
+    // sessão). Nunca deixar isto escapar como uncaught exception.
+    logger.warn('[WS] Erro ao terminar derivWs (ignorado)', { message: err?.message });
+  }
 }
 
 // ─── Aguardar WS disponível ───────────────────────────────────
@@ -456,15 +518,13 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     session.botManager.removeAllListeners();
     session.botManager = null;
   }
-  if (session.derivWs) {
-    if (session.derivMessageHandler) {
-      session.derivWs.removeListener('message', session.derivMessageHandler);
-      session.derivMessageHandler = null;
-    }
-    session.derivWs.removeAllListeners();
-    session.derivWs.terminate();
-    session.derivWs = null;
-  }
+
+  // CORREÇÃO: usa safeTerminateDerivWs() em vez de
+  // removeAllListeners() + terminate() diretos, para evitar
+  // uncaught exception quando o socket ainda está CONNECTING.
+  safeTerminateDerivWs(session);
+  session.derivWs = null;
+
   if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
 
   try {
@@ -548,14 +608,11 @@ async function cleanupSession(ws: WebSocket): Promise<void> {
     session.botManager.removeAllListeners();
   }
 
-  if (session.derivWs) {
-    if (session.derivMessageHandler) {
-      session.derivWs.removeListener('message', session.derivMessageHandler);
-      session.derivMessageHandler = null;
-    }
-    session.derivWs.removeAllListeners();
-    session.derivWs.terminate();
-  }
+  // CORREÇÃO CRÍTICA (era a causa do crash original):
+  // usa safeTerminateDerivWs() em vez de removeAllListeners() +
+  // terminate() diretos. Ver comentário completo na definição
+  // da função, no topo do ficheiro.
+  safeTerminateDerivWs(session);
 }
 
 // ─── Tipos de mensagem de bots ────────────────────────────────

@@ -2,8 +2,9 @@
 // NEXORA FOREX — Auth Routes
 //
 // 1) Deriv OAuth2 + PKCE — INTOCADO.
-// 2) Login local (nome, WhatsApp, email + senha) com verificação
-//    de email obrigatória antes do login funcionar.
+// 2) Login local (nome, WhatsApp, email + senha) — SEM
+//    verificação de email obrigatória. O registo já cria a
+//    conta ativa e o login funciona logo de seguida.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express'
@@ -14,9 +15,7 @@ import { authLimiter } from '@middleware/security.js'
 import { signLocalToken, requireLocalAuth } from '@middleware/auth-local.middleware.js'
 import { config } from '@config/index.js'
 import logger from '@utils/logger.js'
-import {
-  RegisterSchema, LocalLoginSchema, VerifyEmailSchema, ResendVerificationSchema,
-} from '../types/schemas.js'
+import { RegisterSchema, LocalLoginSchema } from '../types/schemas.js'
 
 const router: Router = Router()
 const FRONTEND_URL   = config.frontend.url
@@ -143,59 +142,12 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
     const { fullName, whatsapp, email, password } = RegisterSchema.parse(req.body)
     const user = await UserService.register({ fullName, whatsapp, email, password })
 
-    logger.info('[Auth] Registo local concluído, aguarda verificação de email', { id: user.id })
+    logger.info('[Auth] Registo local concluído', { id: user.id })
     res.status(201).json({
       success: true,
-      message: 'Conta criada. Verifica o teu email para poderes entrar.',
+      message: 'Conta criada com sucesso!',
       user,
     })
-  } catch (error) {
-    next(error)
-  }
-})
-
-// ── GET /api/auth/verify-email?token=... ───────────────────────
-// Aberto via link no email. Redireciona para o frontend com resultado.
-router.get('/verify-email', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const token = req.query.token as string | undefined
-    if (!token) {
-      return res.redirect(`${FRONTEND_URL}/verify-email?status=missing_token`)
-    }
-
-    const user  = await UserService.verifyEmailToken(token)
-    const authToken = signLocalToken({ sub: user.id, email: user.email, role: user.role })
-
-    return res.redirect(
-      `${FRONTEND_URL}/verify-email?status=success&token=${encodeURIComponent(authToken)}`,
-    )
-  } catch (error: any) {
-    logger.warn('[Auth] Falha na verificação de email', { message: error.message })
-    return res.redirect(`${FRONTEND_URL}/verify-email?status=error&message=${encodeURIComponent(error.message)}`)
-  }
-})
-
-// ── POST /api/auth/verify-email ─────────────────────────────────
-// Alternativa em JSON, caso o frontend prefira chamar via fetch
-// em vez de seguir o redirect do link do email.
-router.post('/verify-email', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { token } = VerifyEmailSchema.parse(req.body)
-    const user = await UserService.verifyEmailToken(token)
-    const authToken = signLocalToken({ sub: user.id, email: user.email, role: user.role })
-    res.json({ success: true, token: authToken, user })
-  } catch (error) {
-    next(error)
-  }
-})
-
-// ── POST /api/auth/resend-verification ──────────────────────────
-router.post('/resend-verification', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { email } = ResendVerificationSchema.parse(req.body)
-    await UserService.resendVerification(email)
-    // Resposta genérica, não confirma se o email existe (evita enumeração de contas)
-    res.json({ success: true, message: 'Se o email existir e não estiver verificado, foi enviado um novo link.' })
   } catch (error) {
     next(error)
   }

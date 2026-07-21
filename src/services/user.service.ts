@@ -9,27 +9,29 @@
 //   user:{id}                 -> JSON do utilizador
 //   user:email:{email}        -> id  (lookup rápido por email)
 //   users:index                -> SET com todos os ids (listagens/stats)
-//   email-verify:{token}       -> id  (token de verificação, TTL 24h)
 //
 // Admin: o role 'admin' é atribuído com base em config.admin.emails
 // (env var ADMIN_EMAILS, lista separada por vírgulas). É recalculado
 // a cada login para se manter em sincronia caso a lista mude depois
 // do utilizador já ter sido criado.
+//
+// NOTA: a verificação de email foi removida. O registo já cria o
+// utilizador com emailVerified: true e o login não faz mais essa
+// checagem. O campo emailVerified foi mantido no tipo apenas para
+// não quebrar as estatísticas do admin (getStats / AdminUserRow).
 // ============================================================
 
 import bcrypt from 'bcryptjs'
-import crypto from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import { getRedisClient, isRedisConnected } from '@utils/redis.js'
 import logger from '@utils/logger.js'
 import { config } from '@config/index.js'
-import { AuthenticationError, ConflictError } from '../types/errors.js'
-import { EmailService } from './email.service.js'
+import { AuthenticationError } from '../types/errors.js'
+import { ConflictError } from '../types/errors.js'
 
 const SALT_ROUNDS = 12
 const INACTIVE_AFTER_DAYS = 30
 const ONLINE_THRESHOLD_MS = 5 * 60 * 1000 // 5 min sem atividade = offline
-const VERIFY_TOKEN_TTL_SECONDS = 24 * 60 * 60 // 24h
 
 export interface LocalUser {
   id: string
@@ -58,9 +60,6 @@ function userKey(id: string): string {
 function emailKey(email: string): string {
   return `user:email:${email.toLowerCase().trim()}`
 }
-function verifyKey(token: string): string {
-  return `email-verify:${token}`
-}
 const INDEX_KEY = 'users:index'
 
 function isAdminEmail(email: string): boolean {
@@ -71,7 +70,6 @@ function isAdminEmail(email: string): boolean {
 const memUsers = new Map<string, LocalUser>()
 const memEmailIndex = new Map<string, string>()
 const memIndex = new Set<string>()
-const memVerifyTokens = new Map<string, { userId: string; expiresAt: number }>()
 
 export class UserService {
 
@@ -97,7 +95,7 @@ export class UserService {
       passwordHash: await bcrypt.hash(input.password, SALT_ROUNDS),
       role: isAdminEmail(normalizedEmail) ? 'admin' : 'user',
       status: 'active',
-      emailVerified: false,
+      emailVerified: true, // verificação de email desativada — conta já entra ativa
       createdAt: Date.now(),
       lastLoginAt: null,
       lastActiveAt: null,
@@ -105,16 +103,6 @@ export class UserService {
 
     await this.persist(user)
     logger.info('[UserService] Novo utilizador registado', { id: user.id, email: user.email, role: user.role })
-
-    // Dispara o email de verificação — NUNCA deve derrubar o registo.
-    try {
-      const token = await this.generateEmailVerificationToken(user.id)
-      await EmailService.sendVerificationEmail(user.email, user.fullName, token)
-    } catch (err) {
-      logger.error('[UserService] Falha ao enviar email de verificação (registo continua)', {
-        id: user.id, email: user.email, err,
-      })
-    }
 
     return toPublic(user)
   }
@@ -131,10 +119,6 @@ export class UserService {
     const valid = await bcrypt.compare(password, user.passwordHash)
     if (!valid) {
       throw new AuthenticationError('Email ou senha inválidos')
-    }
-
-    if (!user.emailVerified) {
-      throw new AuthenticationError('Confirma o teu email antes de entrares. Verifica a tua caixa de entrada.')
     }
 
     // Recalcula o role a cada login, para refletir alterações na
@@ -163,72 +147,6 @@ export class UserService {
     } catch (err) {
       logger.warn('[UserService] Falha ao atualizar lastActiveAt', { id, err })
     }
-  }
-
-  // ─── Verificação de email ──────────────────────────────────
-
-  static async generateEmailVerificationToken(userId: string): Promise<string> {
-    const token = crypto.randomBytes(32).toString('hex')
-
-    if (isRedisConnected()) {
-      try {
-        await getRedisClient().set(verifyKey(token), userId, { EX: VERIFY_TOKEN_TTL_SECONDS })
-        return token
-      } catch (err) {
-        logger.warn('[UserService] Falha ao guardar token de verificação no Redis, a usar memória', { err })
-      }
-    }
-
-    memVerifyTokens.set(token, { userId, expiresAt: Date.now() + VERIFY_TOKEN_TTL_SECONDS * 1000 })
-    return token
-  }
-
-  static async verifyEmailToken(token: string): Promise<PublicUser> {
-    let userId: string | null = null
-
-    if (isRedisConnected()) {
-      try {
-        const client = getRedisClient()
-        userId = await client.getDel(verifyKey(token))
-      } catch (err) {
-        logger.warn('[UserService] Falha ao ler token de verificação no Redis, a usar memória', { err })
-      }
-    }
-
-    if (!userId) {
-      const entry = memVerifyTokens.get(token)
-      if (entry) {
-        memVerifyTokens.delete(token)
-        if (Date.now() <= entry.expiresAt) userId = entry.userId
-      }
-    }
-
-    if (!userId) {
-      throw new AuthenticationError('Link de verificação inválido ou expirado')
-    }
-
-    const user = await this.findById(userId)
-    if (!user) {
-      throw new AuthenticationError('Utilizador não encontrado')
-    }
-
-    user.emailVerified = true
-    await this.persist(user)
-    logger.info('[UserService] Email verificado', { id: user.id, email: user.email })
-    return toPublic(user)
-  }
-
-  static async resendVerification(email: string): Promise<void> {
-    const user = await this.findByEmail(email)
-    if (!user) {
-      // Não revela se o email existe ou não (evita enumeração de contas)
-      return
-    }
-    if (user.emailVerified) {
-      throw new ConflictError('Este email já está verificado')
-    }
-    const token = await this.generateEmailVerificationToken(user.id)
-    await EmailService.sendVerificationEmail(user.email, user.fullName, token)
   }
 
   // ─── Consultas ──────────────────────────────────────────────

@@ -34,6 +34,13 @@
 //      CONNECTING, anexa-se um listener 'error' no-op para
 //      absorver esse evento esperado. Aplicado em dois pontos:
 //      authenticateClient() e cleanupSession().
+//   ✅ CORREÇÃO: /health movido para ANTES do apiLimiter — o
+//      healthcheck do Render faz polling frequente nesse
+//      endpoint e estava sendo bloqueado com 429 pelo rate
+//      limiter, o que fazia o Render considerar a instância
+//      "não saudável" e reiniciá-la (visto no log de 21/07,
+//      00:12–00:14: "Rate limit exceeded" em loop → SIGTERM →
+//      restart da instância).
 // ============================================================
 
 import 'express-async-errors';
@@ -737,6 +744,30 @@ app.use(cookieParser());
 app.use(sanitizationMiddleware);
 app.use(urlEncodedMiddleware);
 app.use(requestLoggerMiddleware);
+
+// ── Health check ANTES do rate limiter ──────────────────────
+// CORREÇÃO: plataformas como o Render fazem polling frequente
+// deste endpoint (a cada poucos segundos) para decidir se a
+// instância está saudável. Enquanto /health ficava DEPOIS do
+// apiLimiter, esse polling normal estourava o rate limit e
+// passava a receber 429 — o Render interpretou isso como
+// instância não saudável e forçou um restart (ver log de
+// 21/07 00:12–00:14: "Rate limit exceeded" em loop seguido de
+// "SIGTERM recebido, a encerrar..." e restart da instância).
+// Colocando /health antes do apiLimiter, ele nunca passa pelo
+// rate limiter e o healthcheck da plataforma nunca mais falha
+// por esse motivo.
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok', timestamp: new Date().toISOString(),
+    environment: config.server.nodeEnv,
+    redis: isRedisConnected() ? 'connected' : 'unavailable (memory fallback)',
+    uptime: process.uptime(), wsClients: wss.clients.size,
+    wsSessions: sessions.size,
+    wsAuthenticated: [...sessions.values()].filter(s => s.authenticated).length,
+  });
+});
+
 app.use(apiLimiter);
 
 app.use('/api/bots', (req: Request, _res: Response, next: NextFunction) => {
@@ -754,17 +785,6 @@ app.get('/api/online-count', (_req, res) => {
   let authenticated = 0;
   for (const [, s] of sessions) { if (s.authenticated) authenticated++; }
   res.json({ count: authenticated, totalConnections: wss.clients.size });
-});
-
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok', timestamp: new Date().toISOString(),
-    environment: config.server.nodeEnv,
-    redis: isRedisConnected() ? 'connected' : 'unavailable (memory fallback)',
-    uptime: process.uptime(), wsClients: wss.clients.size,
-    wsSessions: sessions.size,
-    wsAuthenticated: [...sessions.values()].filter(s => s.authenticated).length,
-  });
 });
 
 app.use('/api/auth',         authRoutes);

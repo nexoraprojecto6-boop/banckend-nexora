@@ -1,5 +1,4 @@
 import { z } from 'zod';
-
 // Auth Schemas
 export const LoginRequestSchema = z.object({
   code: z.string().min(1, 'Authorization code is required'),
@@ -14,10 +13,8 @@ export const AuthCallbackSchema = z.object({
 export const OTPRequestSchema = z.object({
   accountId: z.string().min(1, 'Account ID is required'),
 });
-
 // ─── Login local (nome, WhatsApp, email + senha) ───────────
 const whatsappRegex = /^\+?[0-9]{8,15}$/;
-
 export const RegisterSchema = z.object({
   fullName: z.string().trim().min(3, 'Nome completo é obrigatório'),
   whatsapp: z.string().trim().regex(whatsappRegex, 'Número de WhatsApp inválido (usa formato internacional, ex: +244923456789)'),
@@ -28,13 +25,6 @@ export const LocalLoginSchema = z.object({
   email: z.string().email('Email inválido'),
   password: z.string().min(1, 'Senha é obrigatória'),
 });
-export const VerifyEmailSchema = z.object({
-  token: z.string().min(1, 'Token é obrigatório'),
-});
-export const ResendVerificationSchema = z.object({
-  email: z.string().email('Email inválido'),
-});
-
 // Trading Schemas
 export const ProposalRequestSchema = z.object({
   contractType: z.enum(['CALL', 'PUT', 'HIGHER', 'LOWER', 'DIGITEVEN', 'DIGITODD', 'ONETOUCH', 'NOTOUCH', 'MULTUP', 'MULTDOWN', 'ACCU']),
@@ -61,28 +51,23 @@ export const ContractUpdateSchema = z.object({
     takeProfit: z.number().optional(),
   }).optional(),
 });
-
 // Account Schemas
 export const AccountCreationSchema = z.object({
   currency: z.enum(['USD']),
   group: z.enum(['row']),
   accountType: z.enum(['demo', 'real']),
 });
-
 // WebSocket Schemas
 export const WebSocketMessageSchema = z.object({
   type: z.string(),
   payload: z.any().optional(),
   reqId: z.string().optional(),
 });
-
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
 export type AuthCallback = z.infer<typeof AuthCallbackSchema>;
 export type OTPRequest = z.infer<typeof OTPRequestSchema>;
 export type RegisterInput = z.infer<typeof RegisterSchema>;
 export type LocalLoginInput = z.infer<typeof LocalLoginSchema>;
-export type VerifyEmailInput = z.infer<typeof VerifyEmailSchema>;
-export type ResendVerificationInput = z.infer<typeof ResendVerificationSchema>;
 export type ProposalRequest = z.infer<typeof ProposalRequestSchema>;
 export type BuyRequest = z.infer<typeof BuyRequestSchema>;
 export type SellRequest = z.infer<typeof SellRequestSchema>;

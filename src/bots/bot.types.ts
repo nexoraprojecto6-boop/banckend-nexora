@@ -70,7 +70,9 @@ export interface AlfhaParams {
 export interface OverOneRecoveryParams {
   digitBarrier: number;           // barreira do DIGITOVER (fixo em 1 para "Over 1")
   recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
-  maxMartingaleSteps: number;     // teto de níveis de gale antes de cortar e resetar
+  protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
+                                    //   (protege a banca em vez de continuar escalando)
+  maxMartingaleSteps: number;     // teto de perdas seguidas (mesmo em modo protetor) antes de cortar e resetar
   maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
                                     //   mesmo que a recuperação fique incompleta
   minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)

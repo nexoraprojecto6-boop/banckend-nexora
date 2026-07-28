@@ -7,7 +7,7 @@
 //
 // ─── Arquitectura: MessageRouter central ─────────────────────
 // Em vez de cada chamada (buyContract/waitForContract/
-// subscribeToTicks) registar o seu próprio ws.on('message', ...),
+// subscribeToTicks/getProposal) registar o seu próprio ws.on('message', ...),
 // todas partilham UM único MessageRouter por ligação WS (ver
 // message-router.ts). O router faz o parse uma única vez e despacha
 // por req_id (pedidos únicos) ou por subscrição (streams contínuos),
@@ -20,6 +20,9 @@
 //   ✅ waitForContract: forget usa subscription.id do servidor
 //   ✅ subscribeToTicks: filtra por symbol E pela subscrição
 //   ✅ buyContract aceita barrier opcional (contratos de dígitos)
+//   ✅ getProposal: pedido único de payout, sem comprar, reaproveitando
+//      o mesmo padrão do passo 1 do buyContract (confirmado contra a
+//      doc oficial da Deriv — proposal.md)
 // ============================================================
 
 import { WebSocket } from 'ws';
@@ -367,5 +370,65 @@ export function createDerivWsAdapter(
     };
   }
 
-  return { buyContract, waitForContract, subscribeToTicks };
+  // ──────────────────────────────────────────────────────────
+  // getProposal
+  // Pedido único de proposta (payout) sem comprar — mesmo passo 1
+  // do buyContract, mas devolve o payout em vez de comprar com o
+  // ask_price. Usado pelas estratégias para calcular o stake certo
+  // ANTES de decidir quanto apostar (ex: gale de recuperação do
+  // Over1 Recovery / ETHEREUM). Não envia subscribe:1 — é um único
+  // pedido/resposta, sem stream contínuo.
+  // ──────────────────────────────────────────────────────────
+
+  async function getProposal(params: {
+    symbol: string;
+    contractType: string;
+    duration: number;
+    durationUnit: string;
+    currency: string;
+    barrier?: string;
+    stake: number;
+  }): Promise<{ payout: number }> {
+
+    const ws = getDerivWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      throw new Error('[DerivAdapter] WebSocket não está disponível');
+    }
+
+    const durationUnit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
+    const router = getMessageRouter(ws);
+    const reqId = nextReqId();
+
+    let proposalMsg: Record<string, unknown>;
+    try {
+      proposalMsg = await router.request({
+        proposal:          1,
+        amount:            params.stake,
+        basis:             'stake',
+        contract_type:     params.contractType,
+        currency:          params.currency,
+        duration:          params.duration,
+        duration_unit:     durationUnit,
+        underlying_symbol: params.symbol,
+        ...(params.barrier !== undefined ? { barrier: params.barrier } : {}),
+      }, reqId, 15_000);
+    } catch (err) {
+      throw toDerivApiError(err, 'Erro ao consultar proposta/payout');
+    }
+
+    const proposal = proposalMsg.proposal as Record<string, unknown> | undefined;
+    if (proposalMsg.msg_type !== 'proposal' || proposal?.payout === undefined) {
+      throw new Error('Resposta de proposal inválida ou sem payout');
+    }
+
+    logger.debug('[DerivAdapter] proposal (payout only) recebida', {
+      reqId, symbol: params.symbol, stake: params.stake,
+      contractType: params.contractType, barrier: params.barrier,
+      payout: proposal.payout,
+    });
+
+    return { payout: Number(proposal.payout) };
+  }
+
+  return { buyContract, waitForContract, subscribeToTicks, getProposal };
 }

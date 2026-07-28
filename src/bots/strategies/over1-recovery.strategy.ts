@@ -8,10 +8,19 @@
 // no mesmo formato do ScalperStrategy.
 //
 // DIFERENÇA-CHAVE em relação ao Scalper: em vez de multiplicar o
-// stake por um fator fixo (gale clássico), este bot CONSULTA o
-// payout real da Deriv antes de cada compra (via getProposal) e
-// calcula o stake exato necessário para, se ganhar, recuperar toda
-// a perda acumulada no ciclo + uma margem extra (recoveryMarginPercent).
+// stake por um fator fixo (gale clássico) a cada perda, este bot:
+//
+//   • Na 1ª perda do ciclo — CONSULTA o payout real da Deriv (via
+//     getProposal) e calcula o stake exato necessário para, se
+//     ganhar, recuperar 100% do valor perdido + uma margem extra
+//     (recoveryMarginPercent).
+//   • Na 2ª perda SEGUIDA em diante — em vez de continuar escalando
+//     o stake de recuperação (o que ficaria cada vez mais agressivo,
+//     já que o payout do Over 1 é baixo), o bot DERRUBA o nível e
+//     entra com um stake pequeno e protegido (protectiveStakePercent,
+//     % do stake inicial). Fica nesse modo protetor até ganhar (o
+//     ciclo reseta) ou até a pausa automática (pauseLossLimit) entrar.
+//     Isto evita que uma sequência ruim faça o stake explodir.
 //
 // AVISO IMPORTANTE (leia antes de usar em conta real):
 // - Dígitos em índices sintéticos são próximos de uniformes e
@@ -54,6 +63,7 @@ export class Over1RecoveryStrategy extends BaseStrategy {
     const params = (config.strategyParams ?? {
       digitBarrier: 1,
       recoveryMarginPercent: 10,
+      protectiveStakePercent: 25,
       maxMartingaleSteps: 6,
       maxStakeCap: 50,
       minStake: 0.35,
@@ -74,9 +84,9 @@ export class Over1RecoveryStrategy extends BaseStrategy {
 
     this.log(
       'info',
-      `Over1 Recovery — symbol: ${this.state.config.symbol}, barreira: over ${this.params.digitBarrier}, ` +
+      `Over1 Recovery (ETHEREUM) — symbol: ${this.state.config.symbol}, barreira: over ${this.params.digitBarrier}, ` +
       `stake inicial: $${this.state.config.initialStake}, margem de recuperação: +${this.params.recoveryMarginPercent}%, ` +
-      `teto de stake: $${this.params.maxStakeCap}`,
+      `stake protetor: ${this.params.protectiveStakePercent}% após perdas seguidas, teto de stake: $${this.params.maxStakeCap}`,
     );
 
     this.tickSub = this.derivWs.subscribeToTicks(this.state.config.symbol, (price) => {
@@ -189,7 +199,7 @@ export class Over1RecoveryStrategy extends BaseStrategy {
   // ─── Gestão de stake (gale de recuperação baseado em payout real) ─
 
   private async adjustStake(won: boolean, lossValue: number): Promise<void> {
-    const { maxMartingaleSteps, maxStakeCap } = this.params;
+    const { maxMartingaleSteps, maxStakeCap, protectiveStakePercent, minStake } = this.params;
     const initial = this.state.config.initialStake;
 
     if (won) {
@@ -200,39 +210,60 @@ export class Over1RecoveryStrategy extends BaseStrategy {
     }
 
     this.lossAccum += lossValue;
+    this.martingaleSteps += 1;
 
-    if (this.martingaleSteps >= maxMartingaleSteps) {
-      // Teto de níveis atingido -> corta as perdas, não tenta mais recuperar.
-      this.log('info', `Teto de ${maxMartingaleSteps} níveis de gale atingido — cortando o ciclo e resetando o stake.`);
+    // Camada extra de segurança: mesmo em modo protetor (stake pequeno),
+    // uma sequência longa demais de perdas seguidas corta o ciclo e
+    // reseta — independente do pauseLossLimit, que olha para o valor
+    // acumulado, não para a contagem de perdas seguidas.
+    if (this.martingaleSteps > maxMartingaleSteps) {
+      this.log('info', `${this.martingaleSteps} perdas seguidas — teto atingido, cortando o ciclo e resetando o stake por segurança.`);
       this.lossAccum = 0;
       this.martingaleSteps = 0;
       this.state.stats.currentStake = initial;
       return;
     }
 
-    this.martingaleSteps += 1;
+    if (this.martingaleSteps === 1) {
+      // 1ª perda do ciclo: tenta recuperar 100% do valor perdido + margem.
+      try {
+        const stake = await this.computeRecoveryStake();
+        this.state.stats.currentStake = stake;
 
-    try {
-      const stake = await this.computeRecoveryStake();
-      this.state.stats.currentStake = stake;
-
-      if (stake >= maxStakeCap) {
-        this.log(
-          'warn',
-          `Stake de recuperação calculado ($${stake.toFixed(2)}) atingiu o teto ($${maxStakeCap}). ` +
-          `A recuperação total pode ficar incompleta neste nível — isto é intencional para proteger a conta.`,
-        );
+        if (stake >= maxStakeCap) {
+          this.log(
+            'warn',
+            `Stake de recuperação calculado ($${stake.toFixed(2)}) atingiu o teto ($${maxStakeCap}). ` +
+            `A recuperação total pode ficar incompleta — isto é intencional para proteger a conta.`,
+          );
+        }
+      } catch (err) {
+        // Se não conseguimos consultar o payout com segurança, NÃO
+        // adivinhamos um stake maior. Resetamos ao stake inicial —
+        // mais seguro do que arriscar um valor errado.
+        const message = err instanceof Error ? err.message : String(err);
+        this.log('error', `Falha ao calcular stake de recuperação (${message}) — resetando ao stake inicial por segurança.`);
+        this.lossAccum = 0;
+        this.martingaleSteps = 0;
+        this.state.stats.currentStake = initial;
       }
-    } catch (err) {
-      // Se não conseguimos consultar o payout com segurança, NÃO adivinhamos
-      // um stake maior. Resetamos ao stake inicial e desistimos deste ciclo
-      // de recuperação — mais seguro do que arriscar um valor errado.
-      const message = err instanceof Error ? err.message : String(err);
-      this.log('error', `Falha ao calcular stake de recuperação (${message}) — resetando ao stake inicial por segurança.`);
-      this.lossAccum = 0;
-      this.martingaleSteps = 0;
-      this.state.stats.currentStake = initial;
+      return;
     }
+
+    // 2ª perda SEGUIDA em diante: em vez de continuar escalando (o que
+    // ficaria cada vez mais agressivo), derruba o nível — entra com um
+    // stake pequeno e protegido até ganhar (reseta o ciclo) ou até a
+    // pausa automática entrar.
+    const protectiveStake = Math.max(
+      initial * (protectiveStakePercent / 100),
+      minStake ?? 0,
+    );
+    this.state.stats.currentStake = parseFloat(protectiveStake.toFixed(2));
+    this.log(
+      'info',
+      `Perda seguida (nível ${this.martingaleSteps}) — protegendo a banca, entrando com stake reduzido: ` +
+      `$${this.state.stats.currentStake.toFixed(2)} (${protectiveStakePercent}% do stake inicial).`,
+    );
   }
 
   // Calcula o stake necessário para, se a próxima operação ganhar,

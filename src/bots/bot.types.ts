@@ -3,7 +3,7 @@
 // ============================================================
 
 export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
-export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha';
+export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery';
 export type TradeDirection = 'CALL' | 'PUT';
 
 // ─── Configuração base (comum a todas as estratégias) ────────
@@ -61,6 +61,22 @@ export interface AlfhaParams {
   maxMartingaleSteps: number;   // nº de níveis de Gale antes de resetar o stake
   pauseLossLimit: number;       // perda acumulada que pausa o bot temporariamente (0 = desactivado)
   pauseSeconds: number;         // duração da pausa automática, em segundos
+}
+
+// Parâmetros do bot OVER1_RECOVERY (nome de exibição: "ETHEREUM") —
+// Over 1 fixo, com gale de recuperação (recupera a perda acumulada
+// do ciclo + uma margem extra, calculado sobre o payout real da Deriv).
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface OverOneRecoveryParams {
+  digitBarrier: number;           // barreira do DIGITOVER (fixo em 1 para "Over 1")
+  recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
+  maxMartingaleSteps: number;     // teto de níveis de gale antes de cortar e resetar
+  maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
+                                    //   mesmo que a recuperação fique incompleta
+  minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)
+  pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
+  pauseSeconds: number;           // duração da pausa automática, em segundos
+  decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
 }
 
 // ─── Estatísticas do bot ─────────────────────────────────────
@@ -197,4 +213,17 @@ export interface DerivWsAdapter {
     symbol: string,
     onTick: (price: number) => void,
   ): { unsubscribe: () => void };
+
+  // Pedido único de proposta (payout) sem comprar — usado pelas
+  // estratégias para calcular o stake certo ANTES de decidir quanto
+  // apostar (ex: gale de recuperação do Over1 Recovery / ETHEREUM).
+  getProposal(params: {
+    symbol: string;
+    contractType: string;
+    duration: number;
+    durationUnit: string;
+    currency: string;
+    barrier?: string;
+    stake: number;
+  }): Promise<{ payout: number }>;
 }

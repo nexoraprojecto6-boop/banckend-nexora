@@ -177,17 +177,23 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
   // é só o nome comercial escolhido para este bot).
   //
   // Compra DIGITOVER 1 (1 tick) sempre que o último dígito observado
-  // for baixo (<= 1). Ao perder, consulta o payout real da Deriv e
-  // calcula o stake exato para recuperar a perda acumulada do ciclo
-  // + uma margem extra (recoveryMarginPercent), respeitando um teto
-  // absoluto de stake (maxStakeCap) e um teto de níveis de gale.
+  // for baixo (<= 1).
+  //   • 1ª perda do ciclo: consulta o payout real da Deriv e calcula
+  //     o stake exato para recuperar 100% do valor perdido + uma
+  //     margem extra (recoveryMarginPercent).
+  //   • 2ª perda SEGUIDA em diante: em vez de continuar escalando,
+  //     derruba o nível — entra com um stake pequeno e protegido
+  //     (protectiveStakePercent, % do stake inicial) até ganhar
+  //     (reseta o ciclo) ou até a pausa automática entrar.
+  // Sempre respeitando um teto absoluto de stake (maxStakeCap) e um
+  // teto de perdas seguidas (maxMartingaleSteps).
   // ATENÇÃO: alto risco — usar apenas em conta demo. Dígitos em
   // índices sintéticos são praticamente aleatórios e independentes
   // entre ticks; recuperar a perda + margem não muda o valor
   // esperado do jogo, só muda o formato do risco.
   {
     name:        'ETHEREUM',
-    description: 'Compra DIGITOVER 1 (1 tick) no Volatility 100 (1s) Index sempre que o último dígito é baixo. Ao perder, consulta o payout real e calcula o stake exato para recuperar a perda acumulada + 10%, com teto absoluto de stake. Recomendado apenas em conta demo.',
+    description: 'Compra DIGITOVER 1 (1 tick) no Volatility 100 (1s) Index sempre que o último dígito é baixo. Na 1ª perda, tenta recuperar 100% do valor + 10% consultando o payout real. Em perdas seguidas, protege a banca entrando com stake reduzido em vez de continuar escalando. Recomendado apenas em conta demo.',
     strategy:    'over1_recovery',
     tags:        ['digitos', 'gale', 'recuperação', 'risco-alto', 'demo'],
     isActive:    true,
@@ -203,14 +209,15 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       maxLoss:      40,
       maxProfit:    5,
       strategyParams: {
-        digitBarrier:          1,    // Over 1 — perde se o dígito for 0 ou 1
-        recoveryMarginPercent: 10,   // margem extra de +10% sobre o stake inicial
-        maxMartingaleSteps:    6,    // teto de níveis antes de cortar e resetar
-        maxStakeCap:           50,   // teto absoluto de stake — nunca ultrapassado
-        minStake:              0.35, // piso de stake (mínimo aceito pela Deriv)
-        pauseLossLimit:        20,   // pausa temporária ao acumular $20 de perda
-        pauseSeconds:          10,   // duração da pausa automática
-        decimalPlaces:         2,    // casas decimais do símbolo
+        digitBarrier:           1,    // Over 1 — perde se o dígito for 0 ou 1
+        recoveryMarginPercent:  10,   // margem extra de +10% sobre o stake inicial (só na 1ª perda)
+        protectiveStakePercent: 25,   // % do stake inicial usado a partir da 2ª perda seguida
+        maxMartingaleSteps:     6,    // teto de perdas seguidas antes de cortar e resetar
+        maxStakeCap:            50,   // teto absoluto de stake — nunca ultrapassado
+        minStake:               0.35, // piso de stake (mínimo aceito pela Deriv)
+        pauseLossLimit:         20,   // pausa temporária ao acumular $20 de perda
+        pauseSeconds:           10,   // duração da pausa automática
+        decimalPlaces:          2,    // casas decimais do símbolo
       },
     },
   },

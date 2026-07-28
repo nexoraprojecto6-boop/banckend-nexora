@@ -15,6 +15,7 @@
 //   'trend_following'        → TrendFollowingStrategy
 //   'scalper'                → ScalperStrategy (DIGITOVER + Gale)
 //   'alfha'                  → AlfhaStrategy (DIGITOVER/DIGITUNDER conforme o dígito + Gale)
+//   'over1_recovery'         → Over1RecoveryStrategy (DIGITOVER 1 + Gale de recuperação por payout real) — nome de exibição: "ETHEREUM"
 //
 // ACESSO:
 //   Apenas o administrador gere este ficheiro.
@@ -164,6 +165,52 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
         maxMartingaleSteps:  10,     // teto de níveis antes de resetar
         pauseLossLimit:      20,     // pausa temporária ao acumular $20 de perda
         pauseSeconds:        10,     // duração da pausa automática
+      },
+    },
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // BOT 5 — ETHEREUM (Digit Over 1 + Gale de Recuperação)
+  // ──────────────────────────────────────────────────────────
+  // Nome de exibição "ETHEREUM"; estratégia interna continua
+  // 'over1_recovery' (não confundir com o ativo cripto Ethereum —
+  // é só o nome comercial escolhido para este bot).
+  //
+  // Compra DIGITOVER 1 (1 tick) sempre que o último dígito observado
+  // for baixo (<= 1). Ao perder, consulta o payout real da Deriv e
+  // calcula o stake exato para recuperar a perda acumulada do ciclo
+  // + uma margem extra (recoveryMarginPercent), respeitando um teto
+  // absoluto de stake (maxStakeCap) e um teto de níveis de gale.
+  // ATENÇÃO: alto risco — usar apenas em conta demo. Dígitos em
+  // índices sintéticos são praticamente aleatórios e independentes
+  // entre ticks; recuperar a perda + margem não muda o valor
+  // esperado do jogo, só muda o formato do risco.
+  {
+    name:        'ETHEREUM',
+    description: 'Compra DIGITOVER 1 (1 tick) no Volatility 100 (1s) Index sempre que o último dígito é baixo. Ao perder, consulta o payout real e calcula o stake exato para recuperar a perda acumulada + 10%, com teto absoluto de stake. Recomendado apenas em conta demo.',
+    strategy:    'over1_recovery',
+    tags:        ['digitos', 'gale', 'recuperação', 'risco-alto', 'demo'],
+    isActive:    true,
+    createdBy:   'admin',
+    defaultConfig: {
+      symbol:       '1HZ100V',       // Volatility 100 (1s) Index
+      contractType: 'DIGITOVER',
+      duration:     1,
+      durationUnit: 'ticks',
+      initialStake: 0.5,
+      currency:     'USD',
+      maxTrades:    0,
+      maxLoss:      40,
+      maxProfit:    5,
+      strategyParams: {
+        digitBarrier:          1,    // Over 1 — perde se o dígito for 0 ou 1
+        recoveryMarginPercent: 10,   // margem extra de +10% sobre o stake inicial
+        maxMartingaleSteps:    6,    // teto de níveis antes de cortar e resetar
+        maxStakeCap:           50,   // teto absoluto de stake — nunca ultrapassado
+        minStake:              0.35, // piso de stake (mínimo aceito pela Deriv)
+        pauseLossLimit:        20,   // pausa temporária ao acumular $20 de perda
+        pauseSeconds:          10,   // duração da pausa automática
+        decimalPlaces:         2,    // casas decimais do símbolo
       },
     },
   },

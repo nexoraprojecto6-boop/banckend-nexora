@@ -19,6 +19,9 @@
 //   ✅ NOVO: rotas de administração de utilizadores locais
 //      (/api/admin/users) — login local com email/senha,
 //      independente do fluxo OAuth Deriv
+//   ✅ NOVO: rotas de notificações broadcast
+//      (/api/notifications leitura, /api/admin/notifications
+//      gestão) — sino no dashboard + criação/remoção no painel admin
 //   ✅ CORREÇÃO CRÍTICA (uncaught exception):
 //      terminate() num WebSocket que ainda está em handshake
 //      (readyState === CONNECTING) faz a lib `ws` emitir
@@ -57,13 +60,15 @@ import {
   urlEncodedMiddleware, requestLoggerMiddleware, apiLimiter,
 } from '@middleware/security.js';
 import { errorHandler, notFoundHandler } from '@middleware/errorHandler.js';
-import authRoutes       from '@routes/auth.routes.js';
-import accountRoutes    from '@routes/accounts.routes.js';
-import tradingRoutes    from '@routes/trading.routes.js';
-import botsRoutes       from '@routes/bots.routes.js';
-import adminRoutes      from '@routes/admin.routes.js';
-import labelsRoutes     from '@routes/labels.routes.js';
-import adminUsersRoutes from '@routes/admin-users.routes.js'; // ← NOVO
+import authRoutes              from '@routes/auth.routes.js';
+import accountRoutes           from '@routes/accounts.routes.js';
+import tradingRoutes           from '@routes/trading.routes.js';
+import botsRoutes              from '@routes/bots.routes.js';
+import adminRoutes             from '@routes/admin.routes.js';
+import labelsRoutes            from '@routes/labels.routes.js';
+import adminUsersRoutes        from '@routes/admin-users.routes.js';
+import notificationsRoutes     from '@routes/notifications.routes.js';        // ← NOVO
+import adminNotificationsRoutes from '@routes/admin-notifications.routes.js'; // ← NOVO
 import { DerivAPIService } from '@services/deriv-api.service.js';
 import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
@@ -787,13 +792,15 @@ app.get('/api/online-count', (_req, res) => {
   res.json({ count: authenticated, totalConnections: wss.clients.size });
 });
 
-app.use('/api/auth',         authRoutes);
-app.use('/api/accounts',     accountRoutes);
-app.use('/api/trading',      tradingRoutes);
-app.use('/api/bots',         botsRoutes);
-app.use('/api/admin',        adminRoutes);
-app.use('/api/admin/labels', labelsRoutes);
-app.use('/api/admin/users',  adminUsersRoutes);   // ← NOVO: stats/listagem/bloqueio de utilizadores locais
+app.use('/api/auth',                 authRoutes);
+app.use('/api/accounts',             accountRoutes);
+app.use('/api/trading',              tradingRoutes);
+app.use('/api/bots',                 botsRoutes);
+app.use('/api/admin',                adminRoutes);
+app.use('/api/admin/labels',         labelsRoutes);
+app.use('/api/admin/users',          adminUsersRoutes);         // stats/listagem/bloqueio de utilizadores locais
+app.use('/api/notifications',        notificationsRoutes);      // ← NOVO: leitura de notificações (dashboard)
+app.use('/api/admin/notifications',  adminNotificationsRoutes); // ← NOVO: gestão de notificações (painel admin)
 app.use(notFoundHandler);
 app.use(errorHandler);
 

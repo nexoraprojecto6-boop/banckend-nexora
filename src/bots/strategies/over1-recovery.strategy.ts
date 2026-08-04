@@ -5,7 +5,8 @@
 // 0 ou 1; ganha se for 2–9). Duração fixa de 1 tick.
 //
 // ORIENTADA A EVENTOS DE TICK (não ao timer fixo da BaseStrategy),
-// no mesmo formato do ScalperStrategy.
+// no mesmo formato do ScalperStrategy. Marca `skipTickLoop = true`
+// — ver base.strategy.ts.
 //
 // DIFERENÇA-CHAVE em relação ao Scalper: em vez de multiplicar o
 // stake por um fator fixo (gale clássico) a cada perda, este bot:
@@ -74,6 +75,7 @@ export class Over1RecoveryStrategy extends BaseStrategy {
 
     super(id, name, 'over1_recovery', config, derivWs);
     this.params = params;
+    this.skipTickLoop = true;
   }
 
   protected async onStart(): Promise<void> {
@@ -84,7 +86,7 @@ export class Over1RecoveryStrategy extends BaseStrategy {
 
     this.log(
       'info',
-      `Over1 Recovery (ETHEREUM) — symbol: ${this.state.config.symbol}, barreira: over ${this.params.digitBarrier}, ` +
+      `Over1 Recovery (TURBO STRIKE) — symbol: ${this.state.config.symbol}, barreira: over ${this.params.digitBarrier}, ` +
       `stake inicial: $${this.state.config.initialStake}, margem de recuperação: +${this.params.recoveryMarginPercent}%, ` +
       `stake protetor: ${this.params.protectiveStakePercent}% após perdas seguidas, teto de stake: $${this.params.maxStakeCap}`,
     );
@@ -187,10 +189,21 @@ export class Over1RecoveryStrategy extends BaseStrategy {
         this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake (recuperação): $${nextStake}`);
       }
 
+      // BUG CORRIGIDO: ver explicação em base.strategy.ts / alfha —
+      // sem isto, o stop loss / take profit só era verificado até 2s
+      // depois, através do loop "vazio" da BaseStrategy.
+      this.checkStopConditions();
+      if (!this.active) return;
+
       this.checkPauseCondition();
     } catch (err) {
+      // BUG CORRIGIDO: antes, este catch só registava a falha no log
+      // e não delegava para handleUnexpectedError — ou seja, se a
+      // Deriv devolvesse "saldo insuficiente", o bot continuava a
+      // tentar operar indefinidamente em vez de parar sozinho.
       const message = err instanceof Error ? err.message : String(err);
       this.log('error', `[Over1 Recovery] Falha ao operar: ${message}`, { stake });
+      await this.handleUnexpectedError(err);
     } finally {
       this.pending = false;
     }

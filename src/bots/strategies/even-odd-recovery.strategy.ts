@@ -39,6 +39,14 @@
 // STOP LOSS e TAKE PROFIT do bot inteiro (não do ciclo de gale)
 // continuam em config.maxLoss / config.maxProfit, tratados pela
 // BaseStrategy.
+//
+// NOTA (reset do oppositeStreak): o contador de ticks seguidos com a
+// paridade oposta é resetado sempre que o bot sai de uma pausa
+// automática ou termina um trade (placeTrade). Sem isto, um streak
+// parcial acumulado antes de uma pausa/trade "sobrevivia" à
+// interrupção e podia disparar uma entrada no 1º tick seguinte, sem
+// esperar a sequência completa de reversão — inconsistente com a
+// lógica documentada acima.
 // ============================================================
 
 import {
@@ -222,6 +230,10 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
       await this.handleUnexpectedError(err);
     } finally {
       this.pending = false;
+      // Reset do streak ao terminar um trade — evita aproveitar um
+      // streak parcial acumulado antes/depois deste ciclo (ver nota
+      // no cabeçalho do ficheiro).
+      this.oppositeStreak = 0;
     }
   }
 
@@ -356,6 +368,10 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
     this.pauseTimer = setTimeout(() => {
       this.paused = false;
       this.pauseTimer = null;
+      // Reset do streak ao sair da pausa — ver nota no cabeçalho do
+      // ficheiro. Garante que a sequência de reversão é sempre
+      // contada do zero após qualquer interrupção.
+      this.oppositeStreak = 0;
       this.log('info', 'Pausa automática terminada — retomando operações.');
     }, pauseSeconds * 1000);
   }

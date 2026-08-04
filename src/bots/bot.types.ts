@@ -1,257 +1,253 @@
 // ============================================================
-// NEXORA FOREX — Base Strategy
+// NEXORA FOREX — Bot Types
 // ============================================================
 
-import { EventEmitter } from 'events';
-import {
-  BotConfig,
-  BotEvent,
-  BotEventType,
-  BotLogEntry,
-  BotState,
-  BotStats,
-  BotStatus,
-  BotStrategyType,
-  LogLevel,
-  TradeResult,
-  DerivWsAdapter,
-} from '../bot.types.js';
-import { DerivApiError } from '../deriv-ws.adapter.js';
+export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
+export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery' | 'even_odd_recovery';
+export type TradeDirection = 'CALL' | 'PUT';
 
-export function createInitialStats(initialStake: number): BotStats {
-  return {
-    totalTrades: 0,
-    wins: 0,
-    losses: 0,
-    totalProfit: 0,
-    totalLoss: 0,
-    netPnL: 0,
-    winRate: 0,
-    currentStreak: 0,
-    currentStake: initialStake,
-    peakProfit: 0,
-    maxDrawdown: 0,
-  };
+// ─── Configuração base (comum a todas as estratégias) ────────
+
+export interface BotConfig {
+  symbol: string;              // ex: "R_100", "1HZ100V"
+  contractType: string;        // ex: "CALL", "PUT", "DIGITOVER"
+  duration: number;
+  durationUnit: 'ticks' | 's' | 'm' | 'h' | 'd';
+  initialStake: number;
+  currency: string;            // "USD"
+  maxTrades?: number;          // 0 = ilimitado
+  maxLoss?: number;            // para se perda total > valor
+  maxProfit?: number;          // para se lucro total > valor
+  strategyParams?: Record<string, unknown>;
 }
 
-export abstract class BaseStrategy extends EventEmitter {
-  protected state: BotState;
-  protected active = false;
-  protected derivWs: DerivWsAdapter;
-  private loopTimer: ReturnType<typeof setTimeout> | null = null;
+// ─── Parâmetros específicos por estratégia ───────────────────
 
-  // Estratégias orientadas a EVENTOS DE TICK (Scalper, Alfha,
-  // Over1Recovery) já abrem os seus trades a partir da subscrição de
-  // ticks (onTick), fora deste loop. Para essas, o loop periódico
-  // abaixo não faz nada útil (o tick() delas é um no-op) — só
-  // desperdiça um timer e atrasava até getTickDelay() a verificação
-  // de stop loss / take profit. As subclasses marcam
-  // `this.skipTickLoop = true` no construtor e chamam
-  // `this.checkStopConditions()` elas próprias, logo a seguir a cada
-  // resultado de trade.
-  protected skipTickLoop = false;
+export interface ScalpingParams {
+  maxConsecutiveLosses: number; // pausa o bot após N perdas seguidas
+}
 
-  constructor(
-    id: string,
-    name: string,
-    strategy: BotStrategyType,
-    config: BotConfig,
-    derivWs: DerivWsAdapter,
-  ) {
-    super();
-    this.derivWs = derivWs;
-    this.state = {
-      id,
-      name,
-      strategy,
-      status: 'idle',
-      config,
-      stats: createInitialStats(config.initialStake),
-      logs: [],
-    };
-  }
+export interface MartingaleParams {
+  multiplier: number;          // multiplicador do stake (ex: 2.0)
+  maxStake: number;            // teto do stake para evitar explosão
+  resetOnWin: boolean;         // true = anti-martingale
+}
 
-  // ─── API pública ──────────────────────────────────────────
+export interface TrendFollowingParams {
+  ticksWindow: number;         // quantos ticks analisar
+  trendThreshold: number;      // variação % mínima para confirmar tendência (ex: 0.002)
+}
 
-  async start(): Promise<void> {
-    if (this.active) return;
-    this.active = true;
-    this.setStatus('running');
-    this.state.startedAt = new Date();
-    this.log('info', `Bot "${this.state.name}" iniciado — estratégia: ${this.state.strategy}`);
-    this.emit('bot:started', this.buildEvent('bot:started', {}));
-    await this.onStart();
-    if (!this.skipTickLoop) this.scheduleNextTick();
-  }
+// Parâmetros do bot SCALPER — apenas o necessário para configurar.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface ScalperParams {
+  predictDigit: number;        // barreira do DIGITOVER (ex: 2 = "over 2", gatilho cobre dígitos 0,1,2)
+  gale: number;                // multiplicador do stake por perda
+  lossesToStartGale: number;   // nº de perdas seguidas antes do Gale começar
+  maxMartingaleSteps: number;  // nº de níveis de Gale antes de resetar o stake
+  pauseLossLimit: number;      // perda acumulada que pausa o bot temporariamente (0 = desactivado)
+  pauseSeconds: number;        // duração da pausa automática, em segundos
+  decimalPlaces?: number;      // nº de casas decimais do símbolo, usado para extrair
+                                //   o último dígito corretamente (padrão: 2 se omitido)
+}
 
-  async stop(reason = 'manual'): Promise<void> {
-    if (!this.active && this.state.status === 'stopped') return;
-    this.active = false;
-    if (this.loopTimer) clearTimeout(this.loopTimer);
-    this.setStatus('stopped');
-    this.state.stoppedAt = new Date();
-    this.log('info', `Bot parado — motivo: ${reason}`);
-    this.emit('bot:stopped', this.buildEvent('bot:stopped', { reason }));
-    await this.onStop();
-  }
+// Parâmetros do bot ALFHA — opera Over e Under conforme o último dígito.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface AlfhaParams {
+  digitOver: number;            // barreira para entrar em DIGITOVER
+  digitUnder: number;           // barreira para entrar em DIGITUNDER
+  gale: number;                 // multiplicador do stake por perda
+  lossesToStartGale: number;    // nº de perdas seguidas antes do Gale começar
+  maxMartingaleSteps: number;   // nº de níveis de Gale antes de resetar o stake
+  pauseLossLimit: number;       // perda acumulada que pausa o bot temporariamente (0 = desactivado)
+  pauseSeconds: number;         // duração da pausa automática, em segundos
+}
 
-  pause(): void {
-    if (this.state.status !== 'running') return;
-    this.active = false;
-    if (this.loopTimer) clearTimeout(this.loopTimer);
-    this.setStatus('paused');
-    this.log('info', 'Bot pausado');
-    this.emit('bot:paused', this.buildEvent('bot:paused', {}));
-  }
+// Parâmetros do bot OVER1_RECOVERY (nome de exibição: "ETHEREUM") —
+// Over 1 fixo, com gale de recuperação (recupera a perda acumulada
+// do ciclo + uma margem extra, calculado sobre o payout real da Deriv).
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface OverOneRecoveryParams {
+  digitBarrier: number;           // barreira do DIGITOVER (fixo em 1 para "Over 1")
+  recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
+  protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
+                                    //   (protege a banca em vez de continuar escalando)
+  maxMartingaleSteps: number;     // teto de perdas seguidas (mesmo em modo protetor) antes de cortar e resetar
+  maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
+                                    //   mesmo que a recuperação fique incompleta
+  minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)
+  pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
+  pauseSeconds: number;           // duração da pausa automática, em segundos
+  decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
+}
 
-  async resume(): Promise<void> {
-    if (this.state.status !== 'paused') return;
-    this.active = true;
-    this.setStatus('running');
-    this.log('info', 'Bot retomado');
-    this.emit('bot:resumed', this.buildEvent('bot:resumed', {}));
-    if (!this.skipTickLoop) this.scheduleNextTick();
-  }
+// Parâmetros do bot EVEN_ODD_RECOVERY (nome de exibição: "LITECOIN") —
+// Even ou Odd fixo (conforme targetParity), com gale de recuperação
+// (recupera a perda acumulada do ciclo + uma margem extra, calculado
+// sobre o payout real da Deriv). Entrada filtrada por uma sequência de
+// ticks seguidos com a paridade oposta (streakTrigger) — NÃO muda a
+// probabilidade real do próximo dígito, apenas decide quando entrar.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface EvenOddRecoveryParams {
+  targetParity: 'even' | 'odd';   // 'even' -> DIGITEVEN | 'odd' -> DIGITODD
+  streakTrigger: number;          // nº de ticks seguidos com a paridade oposta antes de entrar
+  recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
+  protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
+                                    //   (protege a banca em vez de continuar escalando)
+  maxMartingaleSteps: number;     // teto de perdas seguidas (mesmo em modo protetor) antes de cortar e resetar
+  maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
+                                    //   mesmo que a recuperação fique incompleta
+  minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)
+  pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
+  pauseSeconds: number;           // duração da pausa automática, em segundos
+  decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
+}
 
-  getState(): BotState {
-    return { ...this.state, logs: [...this.state.logs] };
-  }
+// ─── Estatísticas do bot ─────────────────────────────────────
 
-  // ─── Hooks abstratos ──────────────────────────────────────
+export interface BotStats {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  totalProfit: number;
+  totalLoss: number;
+  netPnL: number;
+  winRate: number;             // 0–100
+  currentStreak: number;       // positivo = wins, negativo = losses
+  currentStake: number;
+  peakProfit: number;
+  maxDrawdown: number;
+}
 
-  protected abstract onStart(): Promise<void>;
-  protected abstract onStop(): Promise<void>;
-  protected abstract tick(): Promise<void>;
-  protected getTickDelay(): number { return 1000; }
+// ─── Estado completo do bot ──────────────────────────────────
 
-  // ─── Loop interno ─────────────────────────────────────────
+export interface BotState {
+  id: string;
+  name: string;
+  strategy: BotStrategyType;
+  status: BotStatus;
+  config: BotConfig;
+  stats: BotStats;
+  lastError?: string;
+  startedAt?: Date;
+  stoppedAt?: Date;
+  logs: BotLogEntry[];
+}
 
-  private scheduleNextTick(): void {
-    if (!this.active) return;
-    this.loopTimer = setTimeout(async () => {
-      try {
-        await this.tick();
-        this.checkStopConditions();
-      } catch (err) {
-        await this.handleUnexpectedError(err);
-      }
-      if (this.active) this.scheduleNextTick();
-    }, this.getTickDelay());
-  }
+// ─── Logs ────────────────────────────────────────────────────
 
-  // ─── Tratamento de erros partilhado ───────────────────────
-  // Usado tanto pelo loop acima como pelas estratégias orientadas a
-  // tick (que chamam isto diretamente no catch do seu placeTrade,
-  // já que o erro delas nunca passaria por aqui — acontece fora do
-  // loop, na subscrição de ticks). Antes desta extração, as
-  // estratégias orientadas a tick tinham cada uma o seu próprio
-  // tratamento de erro (ou nenhum), e nenhuma delas parava o bot ao
-  // detetar saldo insuficiente — só esta função central o fazia.
+export type LogLevel = 'info' | 'warn' | 'error' | 'trade';
 
-  protected async handleUnexpectedError(err: unknown): Promise<void> {
-    if (err instanceof DerivApiError && err.code === 'InsufficientBalance') {
-      this.log('error', 'Saldo insuficiente para abrir o contrato — bot parado.');
-      this.emit('bot:insufficient_balance', this.buildEvent('bot:insufficient_balance', {
-        message: err.message,
-      }));
-      await this.stop('insufficient_balance');
-      return;
-    }
-    const msg = err instanceof Error ? err.message : String(err);
-    this.log('error', `Erro na operação: ${msg}`);
-    this.setError(msg);
-  }
+export interface BotLogEntry {
+  timestamp: Date;
+  level: LogLevel;
+  message: string;
+  data?: Record<string, unknown>;
+}
 
-  // ─── Verificação de condições de parada ───────────────────
-  // Emite bot:goal_reached com o motivo exacto ANTES de parar,
-  // para o frontend poder mostrar uma mensagem clara: meta atingida
-  // (take profit), stop de perda (max loss), ou limite de trades.
+// ─── Resultado de trade ──────────────────────────────────────
 
-  protected checkStopConditions(): void {
-    const { maxTrades, maxLoss, maxProfit } = this.state.config;
-    const { totalTrades, totalLoss, netPnL } = this.state.stats;
+export interface TradeResult {
+  contractId: string;
+  profit: number;
+  stake: number;
+  won: boolean;
+  entryTick?: number;
+  exitTick?: number;
+  exitDigit?: number;   // último algarismo do exitTick, já calculado pela
+                          // estratégia (evita recalcular no frontend com
+                          // casas decimais desconhecidas do símbolo)
+  entryTime: Date;
+  exitTime?: Date;
+}
 
-    if (maxTrades && maxTrades > 0 && totalTrades >= maxTrades) {
-      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
-        reason: 'max_trades_reached', totalTrades, maxTrades,
-      }));
-      this.stop('max_trades_reached');
-      return;
-    }
-    if (maxLoss && totalLoss >= maxLoss) {
-      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
-        reason: 'max_loss_reached', totalLoss, maxLoss,
-      }));
-      this.stop('max_loss_reached');
-      return;
-    }
-    if (maxProfit && netPnL >= maxProfit) {
-      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
-        reason: 'max_profit_reached', netPnL, maxProfit,
-      }));
-      this.stop('max_profit_reached');
-      return;
-    }
-  }
+// ─── Eventos emitidos pelo bot ───────────────────────────────
+// Estes eventos são repassados via WebSocket ao frontend
+//
+// bot:goal_reached — emitido ANTES de bot:stopped quando o bot pára
+//   automaticamente por ter atingido uma condição de paragem (take
+//   profit, stop de perda, ou limite de trades). payload.reason
+//   identifica qual: 'max_profit_reached' | 'max_loss_reached' |
+//   'max_trades_reached'. O frontend usa isto para mostrar a
+//   mensagem certa ("Meta atingida!", "Stop de perda atingido", etc).
+//
+// bot:insufficient_balance — emitido quando uma compra falha por
+//   saldo insuficiente na conta Deriv (erro InsufficientBalance da
+//   API). O bot é parado automaticamente a seguir.
 
-  // ─── Registo de resultado de trade ───────────────────────
+export type BotEventType =
+  | 'bot:started'
+  | 'bot:stopped'
+  | 'bot:paused'
+  | 'bot:resumed'
+  | 'bot:error'
+  | 'bot:trade_opened'
+  | 'bot:trade_closed'
+  | 'bot:stats_updated'
+  | 'bot:log'
+  | 'bot:goal_reached'
+  | 'bot:insufficient_balance';
 
-  protected recordTradeResult(result: TradeResult): void {
-    const s = this.state.stats;
-    s.totalTrades += 1;
+export interface BotEvent {
+  type: BotEventType;
+  botId: string;
+  payload: Record<string, unknown>;
+}
 
-    if (result.won) {
-      s.wins += 1;
-      s.totalProfit += result.profit;
-      s.currentStreak = s.currentStreak > 0 ? s.currentStreak + 1 : 1;
-    } else {
-      s.losses += 1;
-      s.totalLoss += Math.abs(result.profit);
-      s.currentStreak = s.currentStreak < 0 ? s.currentStreak - 1 : -1;
-    }
+// ─── Shapes de request/response da API REST ──────────────────
 
-    s.netPnL = s.totalProfit - s.totalLoss;
-    s.winRate = s.totalTrades > 0 ? (s.wins / s.totalTrades) * 100 : 0;
-    s.peakProfit = Math.max(s.peakProfit, s.netPnL);
-    s.maxDrawdown = Math.max(s.maxDrawdown, s.peakProfit - s.netPnL);
+export interface CreateBotRequest {
+  name: string;
+  strategy: BotStrategyType;
+  config: BotConfig;
+}
 
-    // contractType incluído para a UI mostrar a coluna "Tipo" (ex: CALL,
-    // PUT, DIGITOVER); exitTick/entryTick e exitDigit (já calculado pela
-    // estratégia, quando disponível) para a coluna "Tick Final".
-    this.emit('bot:trade_closed', this.buildEvent('bot:trade_closed', {
-      contractId:   result.contractId,
-      profit:       result.profit,
-      won:          result.won,
-      stake:        result.stake,
-      entryTick:    result.entryTick,
-      exitTick:     result.exitTick,
-      exitDigit:    result.exitDigit,
-      contractType: this.state.config.contractType,
-    }));
-    this.emit('bot:stats_updated', this.buildEvent('bot:stats_updated', { stats: { ...s } }));
-  }
+export interface BotSummary {
+  id: string;
+  name: string;
+  strategy: BotStrategyType;
+  status: BotStatus;
+  stats: BotStats;
+  startedAt?: Date;
+  stoppedAt?: Date;
+}
 
-  // ─── Helpers ──────────────────────────────────────────────
+// ─── Interface do adaptador Deriv injectado nos bots ─────────
+// Recebe o derivWs da sessão do cliente (já autenticado)
 
-  protected setStatus(status: BotStatus): void {
-    this.state.status = status;
-  }
+export interface DerivWsAdapter {
+  buyContract(params: {
+    symbol: string;
+    contractType: string;
+    stake: number;
+    duration: number;
+    durationUnit: string;
+    currency: string;
+    barrier?: string;       // necessário para contratos de dígitos (DIGITOVER/DIGITUNDER)
+  }): Promise<{ contractId: string }>;
 
-  protected setError(message: string): void {
-    this.state.status = 'error';
-    this.state.lastError = message;
-    this.active = false;
-    this.emit('bot:error', this.buildEvent('bot:error', { error: message }));
-  }
+  waitForContract(contractId: string): Promise<{
+    profit: number;
+    won: boolean;
+    entryTick: number;
+    exitTick: number;
+  }>;
 
-  protected log(level: LogLevel, message: string, data?: Record<string, unknown>): void {
-    const entry: BotLogEntry = { timestamp: new Date(), level, message, data };
-    if (this.state.logs.length >= 500) this.state.logs.shift();
-    this.state.logs.push(entry);
-    this.emit('bot:log', this.buildEvent('bot:log', { entry }));
-  }
+  subscribeToTicks(
+    symbol: string,
+    onTick: (price: number) => void,
+  ): { unsubscribe: () => void };
 
-  private buildEvent(type: BotEventType, payload: Record<string, unknown>): BotEvent {
-    return { type, botId: this.state.id, payload };
-  }
+  // Pedido único de proposta (payout) sem comprar — usado pelas
+  // estratégias para calcular o stake certo ANTES de decidir quanto
+  // apostar (ex: gale de recuperação do Over1 Recovery / ETHEREUM).
+  getProposal(params: {
+    symbol: string;
+    contractType: string;
+    duration: number;
+    durationUnit: string;
+    currency: string;
+    barrier?: string;
+    stake: number;
+  }): Promise<{ payout: number }>;
 }

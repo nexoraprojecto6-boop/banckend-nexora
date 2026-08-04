@@ -7,9 +7,9 @@
 // Orientada a EVENTOS DE TICK (não ao timer fixo da BaseStrategy):
 // cada tick que chega via subscribeToTicks é avaliado; se o último
 // dígito observado for "baixo" (< predictDigit + 1), compra.
+// Por isso marca `skipTickLoop = true` — ver base.strategy.ts.
 //
-// Parâmetros expostos ao utilizador (cartão de configuração) —
-// apenas o que é realmente necessário ajustar:
+// Parâmetros expostos ao utilizador (cartão de configuração):
 //   predictDigit        barreira do DIGITOVER (padrão: 2 -> gatilho cobre 0,1,2)
 //   gale                multiplicador do stake por perda
 //   lossesToStartGale   nº de perdas seguidas antes do Gale começar a multiplicar
@@ -59,6 +59,7 @@ export class ScalperStrategy extends BaseStrategy {
 
     super(id, name, 'scalper', config, derivWs);
     this.params = params;
+    this.skipTickLoop = true;
   }
 
   protected async onStart(): Promise<void> {
@@ -177,12 +178,21 @@ export class ScalperStrategy extends BaseStrategy {
         this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
       }
 
+      // BUG CORRIGIDO: ver explicação em base.strategy.ts / alfha —
+      // sem isto, o stop loss / take profit só era verificado até 2s
+      // depois, através do loop "vazio" da BaseStrategy.
+      this.checkStopConditions();
+      if (!this.active) return;
+
       this.checkPauseCondition();
     } catch (err) {
-      // Antes: erro de compra/contrato virava unhandled rejection e
-      // o bot podia seguir operando sem registrar a falha.
+      // BUG CORRIGIDO: antes, este catch só registava a falha no log
+      // e não delegava para handleUnexpectedError — ou seja, se a
+      // Deriv devolvesse "saldo insuficiente", o bot continuava a
+      // tentar operar indefinidamente em vez de parar sozinho.
       const message = err instanceof Error ? err.message : String(err);
       this.log('error', `[Scalper] Falha ao operar: ${message}`, { stake });
+      await this.handleUnexpectedError(err);
     } finally {
       this.pending = false;
     }

@@ -40,6 +40,17 @@ export abstract class BaseStrategy extends EventEmitter {
   protected derivWs: DerivWsAdapter;
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Estratégias orientadas a EVENTOS DE TICK (Scalper, Alfha,
+  // Over1Recovery) já abrem os seus trades a partir da subscrição de
+  // ticks (onTick), fora deste loop. Para essas, o loop periódico
+  // abaixo não faz nada útil (o tick() delas é um no-op) — só
+  // desperdiça um timer e atrasava até getTickDelay() a verificação
+  // de stop loss / take profit. As subclasses marcam
+  // `this.skipTickLoop = true` no construtor e chamam
+  // `this.checkStopConditions()` elas próprias, logo a seguir a cada
+  // resultado de trade.
+  protected skipTickLoop = false;
+
   constructor(
     id: string,
     name: string,
@@ -70,7 +81,7 @@ export abstract class BaseStrategy extends EventEmitter {
     this.log('info', `Bot "${this.state.name}" iniciado — estratégia: ${this.state.strategy}`);
     this.emit('bot:started', this.buildEvent('bot:started', {}));
     await this.onStart();
-    this.scheduleNextTick();
+    if (!this.skipTickLoop) this.scheduleNextTick();
   }
 
   async stop(reason = 'manual'): Promise<void> {
@@ -99,7 +110,7 @@ export abstract class BaseStrategy extends EventEmitter {
     this.setStatus('running');
     this.log('info', 'Bot retomado');
     this.emit('bot:resumed', this.buildEvent('bot:resumed', {}));
-    this.scheduleNextTick();
+    if (!this.skipTickLoop) this.scheduleNextTick();
   }
 
   getState(): BotState {
@@ -122,20 +133,33 @@ export abstract class BaseStrategy extends EventEmitter {
         await this.tick();
         this.checkStopConditions();
       } catch (err) {
-        if (err instanceof DerivApiError && err.code === 'InsufficientBalance') {
-          this.log('error', 'Saldo insuficiente para abrir o contrato — bot parado.');
-          this.emit('bot:insufficient_balance', this.buildEvent('bot:insufficient_balance', {
-            message: err.message,
-          }));
-          await this.stop('insufficient_balance');
-          return;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        this.log('error', `Erro no tick: ${msg}`);
-        this.setError(msg);
+        await this.handleUnexpectedError(err);
       }
       if (this.active) this.scheduleNextTick();
     }, this.getTickDelay());
+  }
+
+  // ─── Tratamento de erros partilhado ───────────────────────
+  // Usado tanto pelo loop acima como pelas estratégias orientadas a
+  // tick (que chamam isto diretamente no catch do seu placeTrade,
+  // já que o erro delas nunca passaria por aqui — acontece fora do
+  // loop, na subscrição de ticks). Antes desta extração, as
+  // estratégias orientadas a tick tinham cada uma o seu próprio
+  // tratamento de erro (ou nenhum), e nenhuma delas parava o bot ao
+  // detetar saldo insuficiente — só esta função central o fazia.
+
+  protected async handleUnexpectedError(err: unknown): Promise<void> {
+    if (err instanceof DerivApiError && err.code === 'InsufficientBalance') {
+      this.log('error', 'Saldo insuficiente para abrir o contrato — bot parado.');
+      this.emit('bot:insufficient_balance', this.buildEvent('bot:insufficient_balance', {
+        message: err.message,
+      }));
+      await this.stop('insufficient_balance');
+      return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    this.log('error', `Erro na operação: ${msg}`);
+    this.setError(msg);
   }
 
   // ─── Verificação de condições de parada ───────────────────

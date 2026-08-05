@@ -3,7 +3,7 @@
 // ============================================================
 
 export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
-export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery';
+export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery' | 'even_odd_recovery';
 export type TradeDirection = 'CALL' | 'PUT';
 
 // ─── Configuração base (comum a todas as estratégias) ────────
@@ -69,6 +69,28 @@ export interface AlfhaParams {
 // STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
 export interface OverOneRecoveryParams {
   digitBarrier: number;           // barreira do DIGITOVER (fixo em 1 para "Over 1")
+  recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
+  protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
+                                    //   (protege a banca em vez de continuar escalando)
+  maxMartingaleSteps: number;     // teto de perdas seguidas (mesmo em modo protetor) antes de cortar e resetar
+  maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
+                                    //   mesmo que a recuperação fique incompleta
+  minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)
+  pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
+  pauseSeconds: number;           // duração da pausa automática, em segundos
+  decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
+}
+
+// Parâmetros do bot EVEN_ODD_RECOVERY (nome de exibição: "LITECOIN") —
+// Even ou Odd fixo (conforme targetParity), com gale de recuperação
+// (recupera a perda acumulada do ciclo + uma margem extra, calculado
+// sobre o payout real da Deriv). Entrada filtrada por uma sequência de
+// ticks seguidos com a paridade oposta (streakTrigger) — NÃO muda a
+// probabilidade real do próximo dígito, apenas decide quando entrar.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface EvenOddRecoveryParams {
+  targetParity: 'even' | 'odd';   // 'even' -> DIGITEVEN | 'odd' -> DIGITODD
+  streakTrigger: number;          // nº de ticks seguidos com a paridade oposta antes de entrar
   recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
   protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
                                     //   (protege a banca em vez de continuar escalando)

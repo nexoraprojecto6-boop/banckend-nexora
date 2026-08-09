@@ -44,6 +44,20 @@
 //      "não saudável" e reiniciá-la (visto no log de 21/07,
 //      00:12–00:14: "Rate limit exceeded" em loop → SIGTERM →
 //      restart da instância).
+//   ✅ NOVO (Operar Manual): handler `manual_buy` — faz
+//      proposal→buy→acompanhamento do fecho do contrato na
+//      Deriv, reaproveitando o MessageRouter (message-router.ts)
+//      sobre a MESMA ligação Deriv da sessão (não abre segunda
+//      ligação, não interfere com o BotManager). Campos e tipos
+//      seguem a documentação oficial da Deriv:
+//        - o campo do símbolo é `underlying_symbol` (não `symbol`)
+//        - `duration_unit` aceita "d","m","s","h","t" (não "ticks")
+//        - `proposal_open_contract.profit`/`buy_price`/`payout`
+//          vêm como STRING — sempre convertidos com Number()
+//        - `is_sold` é 0/1 (integer), não boolean
+//        - não existe `exit_tick`; o campo certo é `exit_spot`
+//          (string, preço) — o último dígito é calculado a partir
+//          dele, tal como no ChartSection/OperarManualPage
 // ============================================================
 
 import 'express-async-errors';
@@ -75,6 +89,7 @@ import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
 import { BotEvent, BotConfig, BotStrategyType } from './bots/bot.types.js';
 import { seedBotCatalog } from './bots/catalog-seed.js';
+import { getMessageRouter } from './bots/message-router.js'; // ← NOVO (Operar Manual)
 
 // ─── Limites ──────────────────────────────────────────────────
 const MAX_SESSIONS        = 100;
@@ -111,6 +126,7 @@ interface ClientSession {
   derivMessageHandler:  ((raw: Buffer) => void) | null;
   token:                string;
   accountId:            string | null;
+  currency:             string; // ← NOVO (Operar Manual): moeda da conta activa
   pingInterval:         NodeJS.Timeout | null;
   authTimeout:          NodeJS.Timeout | null;
   reconnectTimer:       NodeJS.Timeout | null;
@@ -517,6 +533,155 @@ async function handleBotMessage(
   }
 }
 
+// ─── Compra manual (Over/Under, Matches/Differs, Rise/Fall...) ─
+// ============================================================
+// Segue à risca a documentação oficial da Deriv:
+//   - proposal / buy usam `underlying_symbol` (não `symbol`)
+//   - duration_unit: "d","m","s","h","t" (não "ticks")
+//   - proposal_open_contract.profit / buy_price / payout são
+//     STRING na resposta da Deriv — sempre convertidos com Number()
+//   - is_sold é 0/1 (integer), não boolean
+//   - não existe `exit_tick`; o campo certo é `exit_spot`
+//     (preço, string) — o dígito de saída é calculado a partir dele
+//   - erros chegam como { error: { code, message }, msg_type }
+//     (o MessageRouter.request() já rejeita a Promise nesse caso)
+// ============================================================
+
+const DIGIT_CONTRACT_TYPES = new Set([
+  'DIGITOVER', 'DIGITUNDER', 'DIGITMATCH', 'DIGITDIFF', 'DIGITODD', 'DIGITEVEN',
+]);
+
+// Deriv usa 't' para ticks — o frontend envia 'ticks' (mais legível
+// na UI), por isso convertemos aqui antes de enviar à Deriv.
+function mapDurationUnit(u: string): string {
+  switch (u) {
+    case 'ticks': return 't';
+    case 't':     return 't';
+    case 's':     return 's';
+    case 'm':     return 'm';
+    case 'h':     return 'h';
+    case 'd':     return 'd';
+    default:      return u;
+  }
+}
+
+// O último dígito é calculado a partir do preço (exit_spot), tal
+// como o resto da app já faz (ChartSection.tsx / OperarManualPage.tsx).
+function lastDigitFromPrice(price: number): number {
+  const s = Number(price).toFixed(2);
+  return parseInt(s[s.length - 1], 10);
+}
+
+async function handleManualBuy(
+  ws: WebSocket, session: ClientSession, payload: Record<string, unknown>,
+): Promise<void> {
+  const symbol       = payload.symbol as string;
+  const contractType = payload.contractType as string;
+  const duration     = Number(payload.duration);
+  const durationUnit = payload.durationUnit as string;
+  const stake        = Number(payload.stake);
+  const barrier      = payload.barrier;
+
+  if (!symbol || !contractType || !duration || !durationUnit || !stake) {
+    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: 'Parâmetros em falta.' } });
+    return;
+  }
+  if (!session.derivWs || session.derivWs.readyState !== WebSocket.OPEN) {
+    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: 'Conexão Deriv indisponível.' } });
+    return;
+  }
+
+  const derivWs = session.derivWs;
+  const router  = getMessageRouter(derivWs);
+
+  try {
+    // ── 1) Proposta de preço ──────────────────────────────────
+    const proposalPayload: Record<string, unknown> = {
+      proposal: 1,
+      amount: stake,
+      basis: 'stake',
+      contract_type: contractType,
+      currency: session.currency || 'USD',
+      duration,
+      duration_unit: mapDurationUnit(durationUnit),
+      underlying_symbol: symbol, // ← campo correcto segundo a doc Deriv
+    };
+    if (DIGIT_CONTRACT_TYPES.has(contractType) && barrier !== undefined && barrier !== null && barrier !== '') {
+      proposalPayload.barrier = String(barrier);
+    }
+
+    const proposalRes = await router.request(proposalPayload, getNextReqId(session), 15_000);
+    const proposal = proposalRes.proposal as any;
+    if (!proposal?.id) throw new Error('Não foi possível obter proposta da Deriv.');
+
+    // ── 2) Compra do contrato pelo id da proposta ─────────────
+    const buyRes = await router.request(
+      { buy: proposal.id, price: Number(proposal.ask_price) },
+      getNextReqId(session),
+      15_000,
+    );
+    const buy = buyRes.buy as any;
+    if (!buy?.contract_id) throw new Error('Compra não confirmada pela Deriv.');
+
+    sendToClient(ws, 'manual_buy_result', {
+      payload: {
+        success: true,
+        contractId: String(buy.contract_id),
+        payout: Number(buy.payout),
+      },
+    });
+
+    // ── 3) Acompanhar o contrato até fechar (proposal_open_contract) ──
+    const contractId = buy.contract_id as number;
+    const subKey = `manual_poc_${contractId}`;
+    let derivSubId: string | null = null;
+
+    const { unsubscribe } = router.subscribe(
+      subKey,
+      (msg) => (msg as any).msg_type === 'proposal_open_contract'
+        && Number((msg as any).proposal_open_contract?.contract_id) === contractId,
+      (msg) => {
+        const poc = (msg as any).proposal_open_contract;
+        if ((msg as any).subscription?.id) derivSubId = (msg as any).subscription.id;
+
+        // is_sold vem como 0/1 (integer) — nunca truthy directo
+        if (Number(poc?.is_sold) !== 1) return;
+
+        const profit = Number(poc.profit ?? 0);
+        const exitSpot = poc.exit_spot != null ? Number(poc.exit_spot) : undefined;
+
+        sendToClient(ws, 'manual_trade_closed', {
+          payload: {
+            contractId: String(contractId),
+            profit,
+            won: profit >= 0,
+            stake,
+            exitTick: exitSpot,
+            exitDigit: typeof exitSpot === 'number' && !Number.isNaN(exitSpot)
+              ? lastDigitFromPrice(exitSpot)
+              : undefined,
+          },
+        });
+
+        unsubscribe();
+        if (derivSubId && derivWs.readyState === WebSocket.OPEN) {
+          derivWs.send(JSON.stringify({ forget: derivSubId, req_id: getNextReqId(session) }));
+        }
+      },
+    );
+
+    derivWs.send(JSON.stringify({
+      proposal_open_contract: 1,
+      contract_id: contractId,
+      subscribe: 1,
+      req_id: getNextReqId(session),
+    }));
+  } catch (err: any) {
+    logger.error('[WS] Erro na compra manual', { error: err.message });
+    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: err.message ?? 'Erro ao comprar.' } });
+  }
+}
+
 // ─── Autenticação ─────────────────────────────────────────────
 
 async function authenticateClient(ws: WebSocket, token: string, accountId?: string): Promise<void> {
@@ -561,6 +726,7 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
 
     session.token         = token;
     session.accountId     = targetAccountId;
+    session.currency      = target.currency ?? 'USD'; // ← NOVO (Operar Manual)
     session.isAdmin       = ADMIN_IDS.has(targetAccountId);
     session.authenticated = true;
     session.reconnectAttempts = 0;
@@ -648,7 +814,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
 
   const session: ClientSession = {
     derivWs: null, derivMessageHandler: null,
-    token: '', accountId: null,
+    token: '', accountId: null, currency: 'USD', // ← NOVO (Operar Manual)
     pingInterval: null, authTimeout: null, reconnectTimer: null,
     reconnectAttempts: 0, authenticated: false, isAdmin: false,
     botManager: null, nextReqId: 1000,
@@ -695,6 +861,13 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       const newId = (payload.accountId ?? data.accountId) as string;
       if (!newId) { sendError(ws, 'accountId em falta', 'MISSING_ACCOUNT'); return; }
       await authenticateClient(ws, session.token, newId);
+      return;
+    }
+
+    // ── NOVO: Operar Manual ────────────────────────────────────
+    if (type === 'manual_buy') {
+      if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
+      await handleManualBuy(ws, session, payload);
       return;
     }
 

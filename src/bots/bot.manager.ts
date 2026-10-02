@@ -1,14 +1,14 @@
 // ============================================================
-// NEXORA FOREX — Bot Manager
+// NEXORA FOREX — Bot Manager v2
 // ============================================================
-// Cada cliente WS tem o seu próprio BotManager (instanciado
-// no server.ts quando a sessão é autenticada).
-//
-// Isso garante isolamento total: os bots de um cliente não
-// interferem com os bots de outro.
-//
-// O BotManager emite eventos que o server.ts reencaminha
-// ao cliente via sendToClient().
+// Correcções vs v1:
+//   ✅ deleteBot() para bots running E paused (e agora é async,
+//      aguarda o stop e remove os listeners → sem leak de memória)
+//   ✅ stopAll() também pára bots em pausa
+//   ✅ stopAll()/destroy() usam allSettled: um bot que falha ao parar
+//      não impede os restantes
+//   ⚠️ even-odd-recovery.strategy.ts existe na pasta mas NÃO estava
+//      registado no buildStrategy (ver bloco comentado abaixo)
 // ============================================================
 
 import { EventEmitter } from 'events';
@@ -29,13 +29,9 @@ import { TrendFollowingStrategy } from './strategies/trend-following.strategy.js
 import { ScalperStrategy } from './strategies/scalper.strategy.js';
 import { AlfhaStrategy } from './strategies/alfha.strategy.js';
 import { Over1RecoveryStrategy } from './strategies/over1-recovery.strategy.js';
+// import { EvenOddRecoveryStrategy } from './strategies/even-odd-recovery.strategy.js';
 import logger from '@utils/logger.js';
 
-// Todos os eventos emitidos pelas estratégias.
-// bot:goal_reached e bot:insufficient_balance são emitidos pela
-// BaseStrategy antes de bot:stopped, para o frontend distinguir o
-// motivo exacto da paragem (meta atingida, stop de perda, saldo
-// insuficiente) em vez de um stop genérico.
 const BOT_EVENTS = [
   'bot:started',
   'bot:stopped',
@@ -65,7 +61,6 @@ export class BotManager extends EventEmitter {
     const id = uuidv4();
     const bot = this.buildStrategy(id, req.name, req.strategy, req.config);
 
-    // Borbulhar todos os eventos do bot para o manager
     BOT_EVENTS.forEach((event) => {
       bot.on(event, (botEvent: BotEvent) => this.emit('bot_event', botEvent));
     });
@@ -91,19 +86,30 @@ export class BotManager extends EventEmitter {
     await this.getOrThrow(botId).resume();
   }
 
-  deleteBot(botId: string): void {
+  async deleteBot(botId: string): Promise<void> {
     const bot = this.getOrThrow(botId);
-    if (bot.getState().status === 'running') bot.stop('deleted');
+    const status = bot.getState().status;
+    if (status === 'running' || status === 'paused') {
+      try {
+        await bot.stop('deleted');
+      } catch (err) {
+        logger.error('[BotManager] Falha ao parar bot antes de remover', { botId, error: err });
+      }
+    }
+    bot.removeAllListeners();
     this.bots.delete(botId);
     logger.info(`[BotManager] Bot removido — id: ${botId}`);
   }
 
   async stopAll(): Promise<void> {
-    await Promise.all(
-      Array.from(this.bots.values())
-        .filter((b) => b.getState().status === 'running')
-        .map((b) => b.stop('bulk_stop')),
-    );
+    const targets = Array.from(this.bots.values()).filter((b) => {
+      const s = b.getState().status;
+      return s === 'running' || s === 'paused';
+    });
+    const results = await Promise.allSettled(targets.map((b) => b.stop('bulk_stop')));
+    results.forEach((r) => {
+      if (r.status === 'rejected') logger.error('[BotManager] Falha em stopAll', { error: r.reason });
+    });
   }
 
   // ─── Queries ──────────────────────────────────────────────
@@ -123,22 +129,23 @@ export class BotManager extends EventEmitter {
     return this.getOrThrow(botId).getState().logs.slice(-limit);
   }
 
-  // ─── Atualizar o derivWs quando o cliente trocar de conta ──
+  // ─── Troca de conta (só afecta bots criados a seguir) ─────
 
   updateDerivWs(derivWs: DerivWsAdapter): void {
     this.derivWs = derivWs;
     logger.info('[BotManager] derivWs atualizado (troca de conta)');
   }
 
-  // ─── Cleanup ao desligar sessão ───────────────────────────
+  // ─── Cleanup ──────────────────────────────────────────────
 
   async destroy(): Promise<void> {
     await this.stopAll();
+    this.bots.forEach((b) => b.removeAllListeners());
     this.bots.clear();
     this.removeAllListeners();
   }
 
-  // ─── Factory de estratégias ───────────────────────────────
+  // ─── Factory ──────────────────────────────────────────────
 
   private buildStrategy(
     id: string,
@@ -160,6 +167,9 @@ export class BotManager extends EventEmitter {
         return new AlfhaStrategy(id, name, config, this.derivWs);
       case 'over1_recovery':
         return new Over1RecoveryStrategy(id, name, config, this.derivWs);
+      // Descomente quando confirmar o nome da classe e o valor em BotStrategyType:
+      // case 'even_odd_recovery':
+      //   return new EvenOddRecoveryStrategy(id, name, config, this.derivWs);
       default:
         throw new Error(`Estratégia desconhecida: ${strategy}`);
     }

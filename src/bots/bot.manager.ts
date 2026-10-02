@@ -7,8 +7,9 @@
 //   ✅ stopAll() também pára bots em pausa
 //   ✅ stopAll()/destroy() usam allSettled: um bot que falha ao parar
 //      não impede os restantes
-//   ⚠️ even-odd-recovery.strategy.ts existe na pasta mas NÃO estava
-//      registado no buildStrategy (ver bloco comentado abaixo)
+//   ✅ even_odd_recovery (bot LITECOIN) NÃO estava registado no
+//      buildStrategy → "Estratégia desconhecida". Se a classe tiver outro
+//      nome, ajuste o import.
 // ============================================================
 
 import { EventEmitter } from 'events';
@@ -29,7 +30,7 @@ import { TrendFollowingStrategy } from './strategies/trend-following.strategy.js
 import { ScalperStrategy } from './strategies/scalper.strategy.js';
 import { AlfhaStrategy } from './strategies/alfha.strategy.js';
 import { Over1RecoveryStrategy } from './strategies/over1-recovery.strategy.js';
-// import { EvenOddRecoveryStrategy } from './strategies/even-odd-recovery.strategy.js';
+import { EvenOddRecoveryStrategy } from './strategies/even-odd-recovery.strategy.js';
 import logger from '@utils/logger.js';
 
 const BOT_EVENTS = [
@@ -167,9 +168,8 @@ export class BotManager extends EventEmitter {
         return new AlfhaStrategy(id, name, config, this.derivWs);
       case 'over1_recovery':
         return new Over1RecoveryStrategy(id, name, config, this.derivWs);
-      // Descomente quando confirmar o nome da classe e o valor em BotStrategyType:
-      // case 'even_odd_recovery':
-      //   return new EvenOddRecoveryStrategy(id, name, config, this.derivWs);
+      case 'even_odd_recovery': // 'LITECOIN' — antes não registado → "Estratégia desconhecida"
+        return new EvenOddRecoveryStrategy(id, name, config, this.derivWs);
       default:
         throw new Error(`Estratégia desconhecida: ${strategy}`);
     }

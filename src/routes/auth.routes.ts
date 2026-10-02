@@ -2,15 +2,15 @@
 // NEXORA FOREX — Auth Routes
 //
 // 1) Deriv OAuth2 + PKCE — INTOCADO.
-// 2) Login local (nome, WhatsApp, email + senha) — SEM
-//    verificação de email obrigatória. O registo já cria a
-//    conta ativa e o login funciona logo de seguida.
+// 2) Login local (email + senha) — se o email ainda não existe, a
+//    conta é criada na hora e gravada no Redis. Não há registo
+//    separado e não há verificação de email.
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express'
 import { AuthService } from '@services/auth.service.js'
 import { DerivAPIService } from '@services/deriv-api.service.js'
-import { UserService } from '@services/user.service.js'
+import { UserService, WeakPasswordError } from '@services/user.service.js'
 import { authLimiter } from '@middleware/security.js'
 import { signLocalToken, requireLocalAuth } from '@middleware/auth-local.middleware.js'
 import { config } from '@config/index.js'
@@ -133,7 +133,7 @@ router.post('/refresh-token', authLimiter, (_req: Request, res: Response) => {
 })
 
 // ============================================================
-// 2) LOGIN LOCAL (nome, WhatsApp, email + senha)
+// 2) LOGIN LOCAL (email + senha)
 // ============================================================
 
 // ── POST /api/auth/register ───────────────────────────────────
@@ -154,18 +154,22 @@ router.post('/register', authLimiter, async (req: Request, res: Response, next: 
 })
 
 // ── POST /api/auth/login-local ────────────────────────────────
+// Entra se o email existe; cria a conta e entra se ainda não existe.
 router.post('/login-local', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = LocalLoginSchema.parse(req.body)
-    const user  = await UserService.login(email, password)
+    const { user, created } = await UserService.enter(email, password)
     const token = signLocalToken({ sub: user.id, email: user.email, role: user.role })
-    res.json({ success: true, token, user })
+    res.status(created ? 201 : 200).json({ success: true, created, token, user })
   } catch (error) {
+    if (error instanceof WeakPasswordError) {
+      return res.status(400).json({ success: false, error: { message: error.message } })
+    }
     next(error)
   }
 })
 
-// ── GET /api/auth/me ────────────────────────────────────────────
+// ── GET /api/auth/me ──────────────────────────────────────────
 router.get('/me', requireLocalAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = await UserService.findById(req.localUser!.sub)

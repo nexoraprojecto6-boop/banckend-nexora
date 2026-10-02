@@ -1,51 +1,33 @@
 // ============================================================
-// NEXORA FOREX — Alfha Strategy (Digit Over/Under + Gale)
+// NEXORA FOREX — Alfha Strategy v2 (Digit Over/Under + Gale)
 // ============================================================
 // Opera nos dois lados, conforme o último dígito observado:
 //   - dígito <= digitOver   -> compra DIGITOVER (digitOver)
 //   - dígito >= digitUnder  -> compra DIGITUNDER (digitUnder)
-//   - qualquer outro dígito -> não entra, espera o próximo tick
+//   - qualquer outro dígito -> não entra
 //
-// Orientada a EVENTOS DE TICK (não ao timer fixo da BaseStrategy) —
-// por isso marca `skipTickLoop = true`: o loop periódico da
-// BaseStrategy não tem nada para fazer aqui e só desperdiçava um
-// timer. Em compensação, esta estratégia chama
-// `this.checkStopConditions()` ela própria, logo após cada trade.
+// Orientada a EVENTOS DE TICK (skipTickLoop = true).
 //
-// Parâmetros expostos ao utilizador (cartão de configuração):
-//   digitOver           barreira para entrar em DIGITOVER
-//   digitUnder          barreira para entrar em DIGITUNDER
-//   gale                multiplicador do stake por perda
-//   lossesToStartGale   nº de perdas seguidas antes do Gale começar a multiplicar
-//   maxMartingaleSteps  nº de níveis de Gale antes de resetar o stake
-//   pauseLossLimit      perda acumulada (no ciclo) que pausa o bot temporariamente
-//   pauseSeconds        duração da pausa automática, em segundos
-//   decimalPlaces       nº de casas decimais do símbolo, usado para extrair
-//                        o último dígito corretamente (padrão: 2)
+// Correcções vs v1:
+//   ✅ Último dígito com o pip_size REAL do tick (decimalPlaces=2 fixo
+//      lia o dígito errado em R_10 (3 casas), R_50 (4 casas), etc.)
+//   ✅ exitDigit agora é enviado ao frontend (faltava), vindo de
+//      exit_spot (string original da Deriv)
+//   ✅ Params parciais já não perdem os defaults de forma silenciosa
+//   ✅ Stake sem dízimas (0.35 × 2.2 …)
 //
-// STOP LOSS e TAKE PROFIT NÃO ficam aqui — já são cobertos por
-// config.maxLoss / config.maxProfit, tratados pela BaseStrategy.
+// STOP LOSS / TAKE PROFIT: config.maxLoss / config.maxProfit (BaseStrategy).
 //
-// AVISO: dígitos em índices sintéticos são próximos de uniformes e
-// independentes entre ticks — esta estratégia não tem vantagem
-// estatística comprovada, e o uso de Gale (martingale) aumenta o
-// risco a cada perda. Recomendado apenas em conta demo.
+// AVISO: dígitos em índices sintéticos são independentes entre ticks;
+// esta estratégia não tem vantagem estatística e o Gale aumenta o risco.
+// Recomendado apenas em conta demo.
 // ============================================================
 
-import {
-  AlfhaParams,
-  BotConfig,
-  TradeResult,
-  DerivWsAdapter,
-} from '../bot.types.js';
+import { AlfhaParams, BotConfig, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
+import { decimalsFromPip, exitDigitOf, lastDigit, roundMoney, withDefaults } from './digit-utils.js';
 
 type Side = 'DIGITOVER' | 'DIGITUNDER';
-
-// `decimalPlaces` acrescentado localmente — ver correção de
-// getLastDigit() mais abaixo. Se/quando `AlfhaParams` (bot.types.ts)
-// passar a declarar este campo nativamente, este alias deixa de ser
-// necessário.
 type AlfhaParamsResolved = AlfhaParams & { decimalPlaces?: number };
 
 export class AlfhaStrategy extends BaseStrategy {
@@ -55,16 +37,12 @@ export class AlfhaStrategy extends BaseStrategy {
   private lossAccum = 0;
   private martingaleSteps = 0;
   private paused = false;
+  private pipDecimals?: number;
   private tickSub: { unsubscribe: () => void } | null = null;
   private pauseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
-    // Nota: o `decimalPlaces: 2` no fallback abaixo cobre tanto o
-    // caso de strategyParams ausente como o caso (mais comum) de
-    // strategyParams existir mas não incluir decimalPlaces — o
-    // spread do config.strategyParams por cima garante que qualquer
-    // valor explícito do utilizador continua a prevalecer.
-    const params = ({
+    const params = withDefaults<AlfhaParamsResolved>({
       digitOver: 2,
       digitUnder: 7,
       gale: 2,
@@ -73,8 +51,7 @@ export class AlfhaStrategy extends BaseStrategy {
       pauseLossLimit: 20,
       pauseSeconds: 10,
       decimalPlaces: 2,
-      ...(config.strategyParams ?? {}),
-    }) as unknown as AlfhaParamsResolved;
+    }, config.strategyParams);
 
     super(id, name, 'alfha', config, derivWs);
     this.params = params;
@@ -87,6 +64,7 @@ export class AlfhaStrategy extends BaseStrategy {
     this.lossAccum = 0;
     this.martingaleSteps = 0;
     this.paused = false;
+    this.pending = false;
 
     this.log(
       'info',
@@ -94,43 +72,37 @@ export class AlfhaStrategy extends BaseStrategy {
       `stake inicial: $${this.state.config.initialStake}, gale: ${this.params.gale}x`,
     );
 
-    this.tickSub = this.derivWs.subscribeToTicks(this.state.config.symbol, (price) => {
-      this.onTick(price);
-    });
+    this.tickSub = this.derivWs.subscribeToTicks(
+      this.state.config.symbol,
+      (price: number, pipSize?: number) => this.onTick(price, pipSize),
+    );
   }
 
   protected async onStop(): Promise<void> {
     this.pending = false;
     this.tickSub?.unsubscribe();
     this.tickSub = null;
-
-    // BUG CORRIGIDO: esta estratégia agendava a pausa automática com
-    // um `setTimeout` solto, sem guardar a referência. Se o bot fosse
-    // parado a meio de uma pausa, o timer continuava vivo e, minutos
-    // depois, reaparecia a "desmarcar" this.paused — o que podia
-    // fazer um bot reiniciado assumir um estado de pausa errado.
-    // ScalperStrategy e Over1RecoveryStrategy já guardavam este
-    // timer; faltava aqui.
     if (this.pauseTimer) {
       clearTimeout(this.pauseTimer);
       this.pauseTimer = null;
     }
   }
 
-  protected async tick(): Promise<void> {
-    // no-op de propósito — a acção acontece em onTick()
-  }
-
-  protected getTickDelay(): number {
-    return 2000;
-  }
+  protected async tick(): Promise<void> { /* no-op: ação em onTick() */ }
 
   // ─── Lógica orientada a tick ──────────────────────────────
 
-  private onTick(price: number): void {
+  private get decimals(): number {
+    return this.pipDecimals ?? this.params.decimalPlaces ?? 2;
+  }
+
+  private onTick(price: number, pipSize?: number): void {
+    if (pipSize !== undefined && this.pipDecimals === undefined) {
+      this.pipDecimals = decimalsFromPip(pipSize, this.params.decimalPlaces ?? 2);
+    }
     if (!this.active || this.pending || this.paused) return;
 
-    const digit = this.getLastDigit(price);
+    const digit = lastDigit(price, this.decimals);
     const { digitOver, digitUnder } = this.params;
 
     if (digit <= digitOver) {
@@ -138,20 +110,6 @@ export class AlfhaStrategy extends BaseStrategy {
     } else if (digit >= digitUnder) {
       void this.placeTrade('DIGITUNDER', digitUnder);
     }
-  }
-
-  // BUG CRÍTICO CORRIGIDO: a versão anterior usava
-  // `price.toString().replace('.', '')`, que corta zeros à direita
-  // (ex.: 1233.20 -> "1233.2" -> lê-se "2" como último dígito em vez
-  // do "0" correto). Isto fazia a estratégia comprar DIGITOVER/UNDER
-  // com base no dígito ERRADO em qualquer preço terminado em zero —
-  // exactamente o tipo de "entrada ruim" reportado. ScalperStrategy e
-  // Over1RecoveryStrategy já usavam a forma correta com
-  // `toFixed(decimalPlaces)`; esta estratégia estava desalinhada.
-  private getLastDigit(price: number): number {
-    const decimalPlaces = this.params.decimalPlaces ?? 2;
-    const str = price.toFixed(decimalPlaces).replace('.', '');
-    return parseInt(str[str.length - 1], 10);
   }
 
   private async placeTrade(side: Side, barrier: number): Promise<void> {
@@ -166,12 +124,7 @@ export class AlfhaStrategy extends BaseStrategy {
     try {
       const entryTime = new Date();
       const { contractId } = await this.derivWs.buyContract({
-        symbol,
-        contractType: side,
-        stake,
-        duration,
-        durationUnit,
-        currency,
+        symbol, contractType: side, stake, duration, durationUnit, currency,
         barrier: String(barrier),
       });
 
@@ -189,6 +142,7 @@ export class AlfhaStrategy extends BaseStrategy {
         won: result.won,
         entryTick: result.entryTick,
         exitTick: result.exitTick,
+        exitDigit: exitDigitOf(result, this.decimals),
         entryTime,
         exitTime: new Date(),
       };
@@ -197,30 +151,14 @@ export class AlfhaStrategy extends BaseStrategy {
       this.adjustStake(result.won, Math.abs(result.profit));
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
-      if (result.won) {
-        this.log('trade', `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`);
-      } else {
-        this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
-      }
+      this.log('trade', result.won
+        ? `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`
+        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
 
-      // BUG CORRIGIDO: como esta estratégia é orientada a tick (não
-      // ao loop fixo da BaseStrategy), o stop loss / take profit só
-      // era verificado até 2s depois (getTickDelay), através do loop
-      // "vazio" da BaseStrategy — o bot podia abrir mais um ou dois
-      // contratos depois de já ter atingido o limite configurado.
-      // Verificamos agora imediatamente, aqui.
       this.checkStopConditions();
       if (!this.active) return;
-
       this.checkPauseCondition();
     } catch (err) {
-      // BUG CRÍTICO CORRIGIDO: esta estratégia não tinha NENHUM catch
-      // — qualquer erro (rede, saldo insuficiente, etc.) tornava-se
-      // uma unhandled promise rejection, já que placeTrade() é
-      // chamado como "fire and forget" (`void this.placeTrade(...)`)
-      // a partir de onTick(). Sem o catch, o erro nunca chegava a
-      // handleUnexpectedError — em particular, saldo insuficiente
-      // NUNCA parava este bot automaticamente.
       const message = err instanceof Error ? err.message : String(err);
       this.log('error', `[Alfha] Falha ao operar: ${message}`, { stake });
       await this.handleUnexpectedError(err);
@@ -229,7 +167,7 @@ export class AlfhaStrategy extends BaseStrategy {
     }
   }
 
-  // ─── Gestão de stake (Gale a partir de N perdas, teto de níveis) ─
+  // ─── Gale ─────────────────────────────────────────────────
 
   private adjustStake(won: boolean, lossValue: number): void {
     const { gale, lossesToStartGale, maxMartingaleSteps } = this.params;
@@ -246,11 +184,9 @@ export class AlfhaStrategy extends BaseStrategy {
     this.lossCount += 1;
     this.lossAccum += lossValue;
 
-    const shouldGale = this.lossCount > lossesToStartGale && this.martingaleSteps < maxMartingaleSteps;
-
-    if (shouldGale) {
+    if (this.lossCount > lossesToStartGale && this.martingaleSteps < maxMartingaleSteps) {
       this.martingaleSteps += 1;
-      this.state.stats.currentStake = parseFloat((this.state.stats.currentStake * gale).toFixed(2));
+      this.state.stats.currentStake = roundMoney(this.state.stats.currentStake * gale);
     } else {
       this.lossCount = 0;
       this.lossAccum = 0;
@@ -263,13 +199,13 @@ export class AlfhaStrategy extends BaseStrategy {
 
   private checkPauseCondition(): void {
     const { pauseLossLimit, pauseSeconds } = this.params;
-    if (pauseLossLimit <= 0) return;
-    if (this.lossAccum < pauseLossLimit) return;
+    if (pauseLossLimit <= 0 || this.lossAccum < pauseLossLimit) return;
 
     this.paused = true;
     this.lossAccum = 0;
     this.log('info', `Pausa automática — perda acumulada atingiu $${pauseLossLimit}. Retomando em ${pauseSeconds}s.`);
 
+    if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = setTimeout(() => {
       this.paused = false;
       this.pauseTimer = null;

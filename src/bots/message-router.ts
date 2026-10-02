@@ -1,35 +1,34 @@
 // ============================================================
-// NEXORA FOREX — Message Router (Deriv WebSocket)
+// NEXORA FOREX — Message Router (Deriv WebSocket) v2
 // ============================================================
-// Problema que resolve:
-//   Antes, cada chamada a buyContract/waitForContract/subscribeToTicks
-//   registava o SEU PRÓPRIO ws.on('message', handler). Com muitos
-//   bots activos no mesmo WS (uma sessão pode ter vários bots), cada
-//   mensagem recebida da Deriv era testada contra TODOS os listeners
-//   acumulados — custo O(n) por mensagem, e cada handler repetia o
-//   próprio JSON.parse.
+// Um único router por ligação WS. Despacho O(1):
+//   • pedidos únicos  → Map<req_id, pending>
+//   • streams         → Map<req_id, stream> (1ª resposta) e
+//                       Map<subscription.id, stream> (restantes)
 //
-// Como resolve:
-//   UM único listener 'message' por ligação WS. Faz o parse UMA vez,
-//   e despacha para quem estiver interessado:
-//     - by req_id  → respostas de pedido único (proposal, buy, etc.)
-//       Resolve e REMOVE automaticamente após a primeira correspondência
-//       (request/response clássico, sem ambiguidade entre pedidos
-//       concorrentes — cada um tem o seu próprio req_id).
-//     - by subscription key → streams contínuos (ticks, contratos
-//       abertos em acompanhamento). Mantidos até serem cancelados
-//       explicitamente (unsubscribe).
-//
-// Isto resolve directamente os pontos #1 (request tracking sem
-// variáveis globais — cada pedido já tem o seu req_id isolado) e #2
-// (router central em vez de ifs duplicados) do documento de reforço
-// de arquitectura, e elimina o custo O(n) por mensagem do ponto #17.
+// Correcções vs v1:
+//   ✅ Sem varrer todas as subscrições a cada mensagem (era O(n))
+//   ✅ Erro na 1ª resposta de um stream (ex: símbolo inválido) chega ao
+//      consumidor (antes ficava mudo e o bot esperava para sempre)
+//   ✅ forget com o subscription.id guardado NO STREAM (antes ficava
+//      por consumidor → subscrições órfãs → limite de 100)
+//   ✅ Stream fechado antes da 1ª resposta é "forgotten" quando chega
+//   ✅ Consumidores são avisados quando a ligação cai (onDisconnect)
+//      para voltarem a subscrever na nova ligação
+//   ✅ ws.send que lança excepção já não deixa timer/pending pendurados
+//   ✅ Limite de envio (80/s) abaixo dos 100/s da Deriv
+//   ✅ dispatch() público: permite parse ÚNICO por mensagem
+//      (deriv-api.service faz o parse e entrega ao router)
 // ============================================================
 
 import { WebSocket } from 'ws';
 import logger from '@utils/logger.js';
+import { nextReqId } from '@utils/req-id.js';
 
-type RawMessage = Record<string, unknown>;
+export type RawMessage = Record<string, unknown>;
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_SENDS_PER_SECOND = 80; // Deriv: 100 pedidos/s por ligação
 
 interface PendingRequest {
   resolve: (msg: RawMessage) => void;
@@ -37,44 +36,67 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
-// ─── Subscrições com contagem de referências ──────────────────
-// Inspirado no SubscriptionManager oficial da @deriv/deriv-api:
-// múltiplos consumidores da MESMA subscrição (mesma key) partilham
-// uma só entrada — equivalente manual ao share()+finalize() do RxJS
-// que a biblioteca oficial usa. Sem isto, dois bots a pedir ticks do
-// mesmo símbolo criariam duas entradas independentes no router
-// (cada uma reagindo à mesma mensagem), o que é redundante mas não
-// incorreto; com isto, partilham a entrada e cada consumidor pode
-// cancelar a sua parte sem afectar o outro.
-interface Subscription {
-  // Devolve true se a mensagem foi consumida por esta subscrição.
-  match: (msg: RawMessage) => boolean;
-  // Um callback por consumidor activo desta key.
-  consumers: Set<(msg: RawMessage) => void>;
+export interface StreamConsumer {
+  onMessage: (msg: RawMessage) => void;
+  /** Erro da Deriv na 1ª resposta (stream não arrancou) ou a meio. */
+  onError?: (err: Error) => void;
+  /** A ligação fechou — o consumidor deve voltar a subscrever. */
+  onDisconnect?: () => void;
 }
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+interface StreamEntry {
+  key: string;
+  reqId: number;
+  subId: string | null;
+  sent: boolean;
+  consumers: Set<StreamConsumer>;
+}
+
+function derivError(raw: unknown, fallback: string): Error {
+  const e = (raw ?? {}) as RawMessage;
+  return Object.assign(new Error(String(e.message ?? fallback)), {
+    code: String(e.code ?? 'UNKNOWN'),
+  });
+}
 
 export class MessageRouter {
-  private ws: WebSocket;
   private pending = new Map<number, PendingRequest>();
-  private subscriptions = new Map<string, Subscription>();
+  private streamsByKey = new Map<string, StreamEntry>();
+  private streamsByReqId = new Map<number, StreamEntry>();
+  private streamsBySubId = new Map<string, StreamEntry>();
+  private orphanReqIds = new Set<number>();
   private destroyed = false;
+  private windowStart = 0;
+  private sentInWindow = 0;
 
-  constructor(ws: WebSocket) {
-    this.ws = ws;
-    this.ws.on('message', this.handleRaw);
+  constructor(private readonly ws: WebSocket, private readonly ownsListener = true) {
+    if (ownsListener) this.ws.on('message', this.handleRaw);
   }
 
-  // ─── Request/response de pedido único ────────────────────────
-  // Resolve com a primeira mensagem cujo req_id corresponda. Depois
-  // de resolver (ou rejeitar, ou expirar), o pedido é removido —
-  // não fica nenhum listener pendurado.
+  // ─── Envio com limite de taxa ─────────────────────────────
 
-  request(payload: Record<string, unknown>, reqId: number, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<RawMessage> {
-    if (this.destroyed) {
-      return Promise.reject(new Error('MessageRouter destruído — ligação fechada'));
+  private throttled(fn: () => void): void {
+    const now = Date.now();
+    if (now - this.windowStart >= 1000) {
+      this.windowStart = now;
+      this.sentInWindow = 0;
     }
+    if (this.sentInWindow < MAX_SENDS_PER_SECOND) {
+      this.sentInWindow++;
+      fn();
+      return;
+    }
+    setTimeout(() => this.throttled(fn), Math.max(1, this.windowStart + 1000 - now));
+  }
+
+  // ─── Pedido único ─────────────────────────────────────────
+
+  request(
+    payload: Record<string, unknown>,
+    reqId: number = nextReqId(),
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  ): Promise<RawMessage> {
+    if (this.destroyed) return Promise.reject(new Error('MessageRouter destruído — ligação fechada'));
     if (this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('Deriv WebSocket não está disponível'));
     }
@@ -86,116 +108,197 @@ export class MessageRouter {
       }, timeoutMs);
 
       this.pending.set(reqId, { resolve, reject, timer });
-      this.ws.send(JSON.stringify({ ...payload, req_id: reqId }));
+
+      this.throttled(() => {
+        if (!this.pending.has(reqId)) return; // já expirou/foi rejeitado
+        try {
+          this.ws.send(JSON.stringify({ ...payload, req_id: reqId }));
+        } catch (err) {
+          clearTimeout(timer);
+          this.pending.delete(reqId);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
     });
   }
 
-  // ─── Subscrições contínuas (com reuso por key) ────────────────
-  // key deve identificar univocamente o stream Deriv (ex:
-  // `ticks:${symbol}`, `poc:${contractId}`) — duas chamadas com a
-  // MESMA key partilham a mesma entrada, tal como o
-  // SubscriptionManager oficial faz para o mesmo request.
-  //
-  // Devolve uma função de unsubscribe ESPECÍFICA deste consumidor —
-  // chamá-la remove só este callback. A entrada subjacente (e o
-  // envio de "forget" à Deriv) só desaparece quando o ÚLTIMO
-  // consumidor dessa key se desinscreve, evitando cancelar uma
-  // subscrição que outra parte do código ainda está a usar.
+  // ─── Streams (ticks, proposal_open_contract, ...) ─────────
+  // key identifica o stream (ex: `ticks:R_50`). Vários consumidores
+  // da mesma key partilham UMA subscrição na Deriv.
 
-  subscribe(
+  openStream(
     key: string,
-    match: (msg: RawMessage) => boolean,
-    onMessage: (msg: RawMessage) => void,
-  ): { reused: boolean; unsubscribe: () => void } {
-    let sub = this.subscriptions.get(key);
-    const reused = !!sub;
+    payload: Record<string, unknown>,
+    consumer: StreamConsumer,
+  ): { reused: boolean; close: () => void } {
+    let entry = this.streamsByKey.get(key);
+    const reused = !!entry;
 
-    if (!sub) {
-      sub = { match, consumers: new Set() };
-      this.subscriptions.set(key, sub);
+    if (!entry) {
+      const created: StreamEntry = {
+        key,
+        reqId: nextReqId(),
+        subId: null,
+        sent: false,
+        consumers: new Set(),
+      };
+      entry = created;
+      this.streamsByKey.set(key, created);
+      this.streamsByReqId.set(created.reqId, created);
+
+      this.throttled(() => {
+        if (this.destroyed || this.streamsByKey.get(key) !== created) return;
+        try {
+          this.ws.send(JSON.stringify({ ...payload, subscribe: 1, req_id: created.reqId }));
+          created.sent = true;
+        } catch (err) {
+          this.failStream(created, derivError(
+            { message: err instanceof Error ? err.message : String(err), code: 'SEND_FAILED' },
+            'Falha ao enviar subscrição',
+          ));
+        }
+      });
     }
-    sub.consumers.add(onMessage);
+
+    entry.consumers.add(consumer);
+    const target = entry;
+    let closed = false;
 
     return {
       reused,
-      unsubscribe: () => {
-        const current = this.subscriptions.get(key);
-        if (!current) return;
-        current.consumers.delete(onMessage);
-        // Só remove a entrada (e quem a chama deve só então enviar
-        // "forget" à Deriv) quando não restar nenhum consumidor —
-        // equivalente ao finalize() do RxJS na biblioteca oficial.
-        if (current.consumers.size === 0) {
-          this.subscriptions.delete(key);
-        }
+      close: () => {
+        if (closed) return;
+        closed = true;
+        target.consumers.delete(consumer);
+        if (target.consumers.size === 0) this.dropStream(target, true);
       },
     };
   }
 
-  // Força a remoção total de uma key, independentemente de quantos
-  // consumidores ainda existam — usar só em cleanup de emergência
-  // (ex: destroy() da ligação). Em uso normal, prefira o
-  // unsubscribe() específico devolvido por subscribe().
-  unsubscribe(key: string): void {
-    this.subscriptions.delete(key);
+  /** Força nova subscrição: todos os consumidores recebem onDisconnect. */
+  resetStream(key: string): void {
+    const entry = this.streamsByKey.get(key);
+    if (!entry) return;
+    const consumers = [...entry.consumers];
+    this.dropStream(entry, true);
+    for (const c of consumers) {
+      try { c.onDisconnect?.(); } catch (err) { logger.error('[MessageRouter] onDisconnect falhou', { error: err }); }
+    }
+  }
+
+  consumerCount(key: string): number {
+    return this.streamsByKey.get(key)?.consumers.size ?? 0;
   }
 
   isSubscribed(key: string): boolean {
-    return this.subscriptions.has(key);
+    return this.streamsByKey.has(key);
   }
 
-  // Quantos consumidores activos existem para esta key — útil para
-  // decidir se vale a pena enviar "forget" (só quando chega a 0).
-  consumerCount(key: string): number {
-    return this.subscriptions.get(key)?.consumers.size ?? 0;
+  private dropStream(entry: StreamEntry, sendForget: boolean): void {
+    if (this.streamsByKey.get(entry.key) === entry) this.streamsByKey.delete(entry.key);
+    this.streamsByReqId.delete(entry.reqId);
+    if (entry.subId) {
+      this.streamsBySubId.delete(entry.subId);
+      if (sendForget) this.forget(entry.subId);
+    } else if (sendForget && entry.sent && !this.destroyed) {
+      // 1ª resposta ainda não chegou: fazer forget quando chegar
+      this.orphanReqIds.add(entry.reqId);
+    }
   }
 
-  // ─── Dispatcher central — único ws.on('message') desta ligação ──
+  private failStream(entry: StreamEntry, err: Error): void {
+    const consumers = [...entry.consumers];
+    this.dropStream(entry, false);
+    for (const c of consumers) {
+      try { c.onError?.(err); } catch (e) { logger.error('[MessageRouter] onError falhou', { error: e }); }
+    }
+  }
+
+  private forget(subId: string): void {
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ forget: subId, req_id: nextReqId() }));
+    } catch { /* ligação a fechar */ }
+  }
+
+  private fanout(entry: StreamEntry, msg: RawMessage): void {
+    if (msg.error) {
+      const err = derivError(msg.error, 'Erro Deriv no stream');
+      for (const c of [...entry.consumers]) {
+        try { c.onError?.(err); } catch (e) { logger.error('[MessageRouter] onError falhou', { error: e }); }
+      }
+      return;
+    }
+    for (const c of entry.consumers) {
+      try {
+        c.onMessage(msg);
+      } catch (err) {
+        logger.error('[MessageRouter] Erro a processar stream', { key: entry.key, error: err });
+      }
+    }
+  }
+
+  // ─── Dispatcher ───────────────────────────────────────────
 
   private handleRaw = (raw: Buffer | string): void => {
     let msg: RawMessage;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      return; // mensagem não-JSON, ignorar
+      return;
     }
-
-    // 1) Request/response de pedido único, por req_id
-    const reqId = msg.req_id as number | undefined;
-    if (typeof reqId === 'number' && this.pending.has(reqId)) {
-      const p = this.pending.get(reqId)!;
-      this.pending.delete(reqId);
-      clearTimeout(p.timer);
-      if (msg.error) {
-        p.reject(Object.assign(new Error((msg.error as RawMessage).message as string ?? 'Erro Deriv'), {
-          code: (msg.error as RawMessage).code,
-        }));
-      } else {
-        p.resolve(msg);
-      }
-      return; // mensagens com req_id correspondido não passam às subscrições
-    }
-
-    // 2) Subscrições contínuas — testar todas (uma mensagem pode,
-    // em teoria, interessar a mais do que uma, embora seja raro).
-    // Cada subscrição com match() verdadeiro notifica TODOS os seus
-    // consumidores actuais.
-    for (const sub of this.subscriptions.values()) {
-      if (!sub.match(msg)) continue;
-      for (const consumer of sub.consumers) {
-        try {
-          consumer(msg);
-        } catch (err) {
-          logger.error('[MessageRouter] Erro a processar subscrição', { error: err });
-        }
-      }
-    }
+    this.dispatch(msg);
   };
 
-  // ─── Cleanup ───────────────────────────────────────────────────
-  // Chamado quando a ligação WS fecha/é substituída. Rejeita todos
-  // os pedidos pendentes (em vez de deixá-los pendurados para sempre
-  // à espera de uma resposta que nunca vai chegar) e limpa o listener.
+  /** Entrega uma mensagem JÁ parseada (parse único por mensagem). */
+  dispatch(msg: RawMessage): void {
+    const reqId = typeof msg.req_id === 'number' ? msg.req_id : undefined;
+
+    if (reqId !== undefined) {
+      // 1) pedido único
+      const p = this.pending.get(reqId);
+      if (p) {
+        this.pending.delete(reqId);
+        clearTimeout(p.timer);
+        if (msg.error) p.reject(derivError(msg.error, 'Erro Deriv'));
+        else p.resolve(msg);
+        return;
+      }
+
+      // 2) stream fechado antes da 1ª resposta → cancelar
+      if (this.orphanReqIds.delete(reqId)) {
+        const sid = (msg.subscription as { id?: string } | undefined)?.id;
+        if (sid) this.forget(sid);
+        return;
+      }
+
+      // 3) 1ª resposta de um stream
+      const s = this.streamsByReqId.get(reqId);
+      if (s) {
+        this.streamsByReqId.delete(reqId);
+        if (msg.error) {
+          this.failStream(s, derivError(msg.error, 'Erro ao iniciar subscrição'));
+          return;
+        }
+        const sid = (msg.subscription as { id?: string } | undefined)?.id;
+        if (sid) {
+          s.subId = sid;
+          this.streamsBySubId.set(sid, s);
+        }
+        this.fanout(s, msg);
+        return;
+      }
+    }
+
+    // 4) mensagens seguintes do stream (ecoam req_id, mas já não está em streamsByReqId)
+    const subId = (msg.subscription as { id?: string } | undefined)?.id;
+    if (subId) {
+      const s = this.streamsBySubId.get(subId);
+      if (s) this.fanout(s, msg);
+    }
+  }
+
+  // ─── Cleanup ──────────────────────────────────────────────
 
   destroy(reason = 'connection closed'): void {
     if (this.destroyed) return;
@@ -206,36 +309,49 @@ export class MessageRouter {
       p.reject(new Error(`Ligação fechada antes da resposta (req_id=${reqId}): ${reason}`));
     }
     this.pending.clear();
-    this.subscriptions.clear();
 
-    this.ws.removeListener('message', this.handleRaw);
+    const entries = [...this.streamsByKey.values()];
+    this.streamsByKey.clear();
+    this.streamsByReqId.clear();
+    this.streamsBySubId.clear();
+    this.orphanReqIds.clear();
+
+    for (const e of entries) {
+      for (const c of e.consumers) {
+        try { c.onDisconnect?.(); } catch (err) { logger.error('[MessageRouter] onDisconnect falhou', { error: err }); }
+      }
+    }
+
+    if (this.ownsListener) this.ws.removeListener('message', this.handleRaw);
   }
 
-  get pendingCount(): number {
-    return this.pending.size;
-  }
-
-  get subscriptionCount(): number {
-    return this.subscriptions.size;
-  }
+  get pendingCount(): number { return this.pending.size; }
+  get subscriptionCount(): number { return this.streamsByKey.size; }
 }
 
-// ─── Registo por ligação WS ──────────────────────────────────────
-// Garante UM único MessageRouter por instância de WebSocket, mesmo
-// que múltiplas partes do código (vários bots da mesma sessão)
-// peçam um router para o mesmo ws.
+// ─── Registo por ligação ─────────────────────────────────────
 
 const routerRegistry = new WeakMap<WebSocket, MessageRouter>();
 
-export function getMessageRouter(ws: WebSocket): MessageRouter {
-  let router = routerRegistry.get(ws);
-  if (!router) {
-    router = new MessageRouter(ws);
-    routerRegistry.set(ws, router);
-    ws.once('close', () => {
-      router?.destroy('ws closed');
-      routerRegistry.delete(ws);
-    });
-  }
+function register(ws: WebSocket, ownsListener: boolean): MessageRouter {
+  const router = new MessageRouter(ws, ownsListener);
+  routerRegistry.set(ws, router);
+  ws.once('close', () => {
+    router.destroy('ws closed');
+    routerRegistry.delete(ws);
+  });
   return router;
+}
+
+/** Router com listener próprio (faz o seu próprio parse). */
+export function getMessageRouter(ws: WebSocket): MessageRouter {
+  return routerRegistry.get(ws) ?? register(ws, true);
+}
+
+/**
+ * Router SEM listener próprio: quem criou o WS faz o JSON.parse uma vez
+ * e chama router.dispatch(msg). Usado por createAuthenticatedWebSocket.
+ */
+export function attachExternalRouter(ws: WebSocket): MessageRouter {
+  return routerRegistry.get(ws) ?? register(ws, false);
 }

@@ -250,8 +250,13 @@ export class MessageRouter {
     this.dispatch(msg);
   };
 
-  /** Entrega uma mensagem JÁ parseada (parse único por mensagem). */
-  dispatch(msg: RawMessage): void {
+  /**
+   * Entrega uma mensagem JÁ parseada (parse único por mensagem).
+   * Devolve true se a mensagem foi consumida por um pedido/stream do
+   * router (tráfego dos bots) — o server.ts usa isto para NÃO a
+   * reencaminhar ao frontend.
+   */
+  dispatch(msg: RawMessage): boolean {
     const reqId = typeof msg.req_id === 'number' ? msg.req_id : undefined;
 
     if (reqId !== undefined) {
@@ -262,14 +267,14 @@ export class MessageRouter {
         clearTimeout(p.timer);
         if (msg.error) p.reject(derivError(msg.error, 'Erro Deriv'));
         else p.resolve(msg);
-        return;
+        return true;
       }
 
       // 2) stream fechado antes da 1ª resposta → cancelar
       if (this.orphanReqIds.delete(reqId)) {
         const sid = (msg.subscription as { id?: string } | undefined)?.id;
         if (sid) this.forget(sid);
-        return;
+        return true;
       }
 
       // 3) 1ª resposta de um stream
@@ -278,7 +283,7 @@ export class MessageRouter {
         this.streamsByReqId.delete(reqId);
         if (msg.error) {
           this.failStream(s, derivError(msg.error, 'Erro ao iniciar subscrição'));
-          return;
+          return true;
         }
         const sid = (msg.subscription as { id?: string } | undefined)?.id;
         if (sid) {
@@ -286,7 +291,7 @@ export class MessageRouter {
           this.streamsBySubId.set(sid, s);
         }
         this.fanout(s, msg);
-        return;
+        return true;
       }
     }
 
@@ -294,8 +299,12 @@ export class MessageRouter {
     const subId = (msg.subscription as { id?: string } | undefined)?.id;
     if (subId) {
       const s = this.streamsBySubId.get(subId);
-      if (s) this.fanout(s, msg);
+      if (s) {
+        this.fanout(s, msg);
+        return true;
+      }
     }
+    return false;
   }
 
   // ─── Cleanup ──────────────────────────────────────────────
@@ -354,4 +363,13 @@ export function getMessageRouter(ws: WebSocket): MessageRouter {
  */
 export function attachExternalRouter(ws: WebSocket): MessageRouter {
   return routerRegistry.get(ws) ?? register(ws, false);
+}
+
+/** Destrói explicitamente o router de um WS (ex: quando o server o termina sem emitir 'close'). */
+export function destroyMessageRouter(ws: WebSocket): void {
+  const r = routerRegistry.get(ws);
+  if (r) {
+    r.destroy('ws terminated');
+    routerRegistry.delete(ws);
+  }
 }

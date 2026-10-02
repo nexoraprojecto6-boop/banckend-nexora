@@ -114,12 +114,16 @@ export function createDerivWsAdapter(
   const directBuy = options.directBuy ?? true;
   const watchers = new Map<string, Promise<ContractResult>>();
 
-  function requireOpenWs(): WebSocket {
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível');
+  // Espera até 5 s por um WS aberto: durante uma reconexão da sessão
+  // (OTP novo) o bot não deve falhar logo no primeiro pedido.
+  async function requireOpenWs(waitMs = 5_000): Promise<WebSocket> {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const ws = getDerivWs();
+      if (ws && ws.readyState === WebSocket.OPEN) return ws;
+      if (Date.now() >= deadline) throw new Error('[DerivAdapter] WebSocket não está disponível');
+      await new Promise((r) => setTimeout(r, 100));
     }
-    return ws;
   }
 
   function contractParameters(p: TickParams, unit: string, amount: number): Record<string, unknown> {
@@ -139,10 +143,15 @@ export function createDerivWsAdapter(
   // buyContract
   // ──────────────────────────────────────────────────────────
 
-  async function buyContract(params: TickParams): Promise<{ contractId: string }> {
+  async function buyContract(params: TickParams): Promise<{
+    contractId: string;
+    payout?: number;
+    buyPrice?: number;
+    balanceAfter?: number;
+  }> {
     const unit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
     const amount = roundStake(params.stake, params.currency);
-    const router = getMessageRouter(requireOpenWs());
+    const router = getMessageRouter(await requireOpenWs());
 
     let buyMsg: Record<string, unknown>;
 
@@ -163,7 +172,7 @@ export function createDerivWsAdapter(
         const proposal = proposalMsg.proposal as Record<string, unknown> | undefined;
         if (!proposal?.id) throw new Error('Resposta de proposal inválida ou sem id');
 
-        const router2 = getMessageRouter(requireOpenWs());
+        const router2 = getMessageRouter(await requireOpenWs());
         buyMsg = await router2.request(
           { buy: String(proposal.id), price: Number(proposal.ask_price ?? amount) },
           nextReqId(),
@@ -191,7 +200,12 @@ export function createDerivWsAdapter(
       contractId, symbol: params.symbol, contractType: params.contractType, stake: amount,
     });
 
-    return { contractId };
+    return {
+      contractId,
+      payout: buy.payout === undefined ? undefined : Number(buy.payout),
+      buyPrice: buy.buy_price === undefined ? undefined : Number(buy.buy_price),
+      balanceAfter: buy.balance_after === undefined ? undefined : Number(buy.balance_after),
+    };
   }
 
   // ──────────────────────────────────────────────────────────
@@ -400,7 +414,7 @@ export function createDerivWsAdapter(
   }): Promise<{ payout: number }> {
     const unit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
     const amount = roundStake(params.stake, params.currency);
-    const router = getMessageRouter(requireOpenWs());
+    const router = getMessageRouter(await requireOpenWs());
 
     let msg: Record<string, unknown>;
     try {

@@ -1,33 +1,20 @@
 // ============================================================
-// NEXORA FOREX — Auth Service (OAuth2 + PKCE via Redis)
-//
-// CORRECÇÃO: substituição de cookies por Redis para armazenar
-// o par (codeVerifier, state) durante o fluxo OAuth.
-//
-// POR QUÊ:
-//   Cookies SameSite=None são bloqueados por browsers modernos
-//   (Safari ITP, Chrome 3rd-party cookie phase-out, Firefox ETP)
-//   em redirects cross-origin — exactamente o que acontece no
-//   callback OAuth: Deriv → Render (domínios diferentes).
-//   O browser descartava o cookie antes de o Render o conseguir
-//   ler, causando "Cookie PKCE não encontrado".
-//
-// SOLUÇÃO:
-//   O state OAuth (já gerado por segurança CSRF) serve como
-//   chave única no Redis. O codeVerifier é guardado em Redis
-//   com TTL de 10 minutos. Nenhum cookie necessário.
-//
-// FLUXO:
-//   1. /login  → gera PKCE + state → guarda codeVerifier em
-//               Redis com chave "pkce:{state}" → TTL 600s
-//   2. /callback → lê e apaga codeVerifier do Redis usando
-//                  o state recebido da Deriv como chave
+// NEXORA FOREX — Auth Service v2 (OAuth2 + PKCE via Redis)
+// ============================================================
+// Correcções vs v1:
+//   ✅ code_verifier gerado com randomBytes + base64url (o anterior usava
+//      "v % 66" → enviesado, e getRandomValues do módulo crypto)
+//   ✅ state com 32 bytes
+//   ✅ Erros OAuth lidos no formato padrão (error / error_description)
+//      — a v1 só lia error.message e perdia o motivo real
+//   ✅ Timeout nos pedidos HTTP (token e OTP); retry no OTP
+//   ✅ Fallback em memória com limpeza periódica (crescia sem limite)
+//   ✅ refresh_token guardado se a Deriv o devolver
 // ============================================================
 
 import crypto   from 'crypto'
 import { v4 as uuidv4 } from 'uuid'
 import axios    from 'axios'
-import { Request } from 'express'
 import { config } from '@config/index.js'
 import logger   from '@utils/logger.js'
 import { getRedisClient, isRedisConnected } from '@utils/redis.js'
@@ -41,9 +28,10 @@ interface PKCEPair {
 }
 
 export interface TokenResponse {
-  accessToken: string
-  expiresIn:   number
-  tokenType:   string
+  accessToken:   string
+  expiresIn:     number
+  tokenType:     string
+  refreshToken?: string
 }
 
 export interface UserSession {
@@ -54,36 +42,39 @@ export interface UserSession {
 }
 
 // ─── Constantes ───────────────────────────────────────────────
-const PKCE_TTL_SECONDS = 600  // 10 minutos
+const PKCE_TTL_SECONDS = 600
+const HTTP_TIMEOUT_MS  = 15_000
 
 function pkceKey(state: string): string {
   return `pkce:${state}`
 }
 
-// ─── Fallback em memória (quando Redis não está disponível) ───
-// Garante que o fluxo funciona mesmo em dev sem Redis.
+// ─── Fallback em memória ──────────────────────────────────────
 const memoryStore = new Map<string, { verifier: string; expiresAt: number }>()
+
+const cleanupTimer = setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of memoryStore) {
+    if (v.expiresAt < now) memoryStore.delete(k)
+  }
+}, 60_000)
+cleanupTimer.unref?.()
 
 async function storePkce(state: string, codeVerifier: string): Promise<void> {
   const key = pkceKey(state)
 
   if (isRedisConnected()) {
     try {
-      const client = getRedisClient()
-      await client.set(key, codeVerifier, { EX: PKCE_TTL_SECONDS })
-      logger.debug('[Auth] PKCE guardado no Redis', { state })
+      await getRedisClient().set(key, codeVerifier, { EX: PKCE_TTL_SECONDS })
+      logger.debug('[Auth] PKCE guardado no Redis')
       return
     } catch (err) {
       logger.warn('[Auth] Falha ao guardar PKCE no Redis, usando memória', { err })
     }
   }
 
-  // Fallback: memória
-  memoryStore.set(key, {
-    verifier: codeVerifier,
-    expiresAt: Date.now() + PKCE_TTL_SECONDS * 1000,
-  })
-  logger.debug('[Auth] PKCE guardado em memória (fallback)', { state })
+  memoryStore.set(key, { verifier: codeVerifier, expiresAt: Date.now() + PKCE_TTL_SECONDS * 1000 })
+  logger.debug('[Auth] PKCE guardado em memória (fallback)')
 }
 
 async function retrieveAndDeletePkce(state: string): Promise<string> {
@@ -91,31 +82,40 @@ async function retrieveAndDeletePkce(state: string): Promise<string> {
 
   if (isRedisConnected()) {
     try {
-      const client = getRedisClient()
-      const verifier = await client.getDel(key)
-      if (verifier) {
-        logger.debug('[Auth] PKCE lido e apagado do Redis', { state })
-        return verifier
-      }
+      const verifier = await getRedisClient().getDel(key)
+      if (verifier) return verifier
     } catch (err) {
       logger.warn('[Auth] Falha ao ler PKCE do Redis, tentando memória', { err })
     }
   }
 
-  // Fallback: memória
   const entry = memoryStore.get(key)
   if (!entry) {
     throw new AuthenticationError(
-      'Estado PKCE não encontrado. O fluxo de login pode ter expirado (>10 min) ou foi iniciado noutra sessão de servidor.',
+      'Estado PKCE não encontrado. O fluxo de login pode ter expirado (>10 min) ou foi iniciado noutra instância do servidor.',
     )
   }
+  memoryStore.delete(key)
   if (Date.now() > entry.expiresAt) {
-    memoryStore.delete(key)
     throw new AuthenticationError('Estado PKCE expirado. Inicia o login novamente.')
   }
-  memoryStore.delete(key)
-  logger.debug('[Auth] PKCE lido e apagado da memória (fallback)', { state })
   return entry.verifier
+}
+
+// ─── Erros OAuth (formato padrão RFC 6749 + envelope Deriv) ───
+function oauthErrorInfo(error: unknown): { code?: string; message?: string; status?: number } {
+  if (!axios.isAxiosError(error)) return {}
+  const data = error.response?.data as any
+  const status = error.response?.status
+  if (typeof data?.error === 'string') {
+    return { status, code: data.error, message: data.error_description ?? data.error }
+  }
+  const first = data?.errors?.[0]
+  return {
+    status,
+    code:    data?.error?.code ?? first?.code,
+    message: data?.error?.message ?? first?.message ?? data?.message,
+  }
 }
 
 // ─── AuthService ─────────────────────────────────────────────
@@ -123,22 +123,14 @@ async function retrieveAndDeletePkce(state: string): Promise<string> {
 export class AuthService {
 
   static generatePKCE(): PKCEPair {
-    const codeVerifier = Array.from(crypto.getRandomValues(new Uint8Array(64)))
-      .map(v => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[v % 66])
-      .join('')
-
-    const hash = crypto.createHash('sha256').update(codeVerifier).digest()
-    const codeChallenge = Buffer.from(hash)
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '')
-
+    // 64 bytes → 86 caracteres base64url (RFC 7636: 43–128)
+    const codeVerifier = crypto.randomBytes(64).toString('base64url')
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url')
     return { codeVerifier, codeChallenge }
   }
 
   static generateState(): string {
-    return crypto.randomBytes(16).toString('hex')
+    return crypto.randomBytes(32).toString('hex')
   }
 
   static async buildAuthorizationUrl(options: {
@@ -151,7 +143,6 @@ export class AuthService {
     const pkce  = this.generatePKCE()
     const state = this.generateState()
 
-    // Guardar codeVerifier no Redis (ou memória) — sem cookie
     await storePkce(state, pkce.codeVerifier)
 
     const params = new URLSearchParams({
@@ -169,23 +160,16 @@ export class AuthService {
       ...(options.utmSource   && { utm_source:   options.utmSource }),
     })
 
-    return {
-      url:   `${config.deriv.authBaseUrl}/auth?${params.toString()}`,
-      state,
-    }
+    return { url: `${config.deriv.authBaseUrl}/auth?${params.toString()}`, state }
   }
 
-  // Recupera e apaga o codeVerifier do Redis (uso único)
   static async retrievePkce(state: string): Promise<string> {
     return retrieveAndDeletePkce(state)
   }
 
-  static async exchangeCodeForToken(
-    code:         string,
-    codeVerifier: string,
-  ): Promise<TokenResponse> {
+  static async exchangeCodeForToken(code: string, codeVerifier: string): Promise<TokenResponse> {
     try {
-      const tokenResponse = await axios.post(
+      const response = await axios.post(
         `${config.deriv.authBaseUrl}/token`,
         new URLSearchParams({
           grant_type:    'authorization_code',
@@ -194,74 +178,70 @@ export class AuthService {
           code_verifier: codeVerifier,
           redirect_uri:  config.deriv.redirectUri,
         }),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
+        {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          timeout: HTTP_TIMEOUT_MS,
+        },
       )
 
-      const { access_token, expires_in, token_type } = tokenResponse.data
+      const { access_token, expires_in, token_type, refresh_token } = response.data
+      if (!access_token) throw new AuthenticationError('Resposta da Deriv sem access_token')
+
       logger.info('[AuthService] Token obtido com sucesso', { expiresIn: expires_in })
-
       return {
-        accessToken: access_token,
-        expiresIn:   expires_in,
-        tokenType:   token_type,
+        accessToken:  access_token,
+        expiresIn:    Number(expires_in) || 3600,
+        tokenType:    token_type ?? 'Bearer',
+        refreshToken: refresh_token,
       }
     } catch (error) {
+      if (error instanceof AuthenticationError) throw error
       if (axios.isAxiosError(error)) {
-        const derivError = error.response?.data?.error
-        logger.error('[AuthService] Falha na troca de token', {
-          status:  error.response?.status,
-          message: derivError?.message,
-          code:    derivError?.code,
-        })
-        throw new AuthenticationError(
-          derivError?.message ?? 'Falha ao trocar código por token',
-        )
+        const info = oauthErrorInfo(error)
+        logger.error('[AuthService] Falha na troca de token', info)
+        throw new AuthenticationError(info.message ?? 'Falha ao trocar código por token')
       }
       throw error
     }
   }
 
-  static async getOtpUrl(params: {
-    accessToken: string
-    accountId:   string
-  }): Promise<string> {
+  static async getOtpUrl(params: { accessToken: string; accountId: string }): Promise<string> {
     const endpoint = `${config.deriv.apiBaseUrl}/trading/v1/options/accounts/${params.accountId}/otp`
-    try {
-      const response = await axios.post(endpoint, {}, {
-        headers: {
-          Authorization:  `Bearer ${params.accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10_000,
-      })
-
-      const url = response.data?.data?.url as string | undefined
-      if (!url || !url.startsWith('wss://')) {
-        throw new Error('URL OTP inválida recebida da Deriv')
-      }
-
-      logger.debug('[AuthService] OTP URL obtida', { accountId: params.accountId })
-      return url
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        logger.error('[AuthService] Falha ao obter OTP URL', {
-          status:    error.response?.status,
-          accountId: params.accountId,
-          data:      error.response?.data,
-        })
-        throw new AuthenticationError(
-          `Falha ao obter OTP: ${error.response?.data?.message ?? (error as Error).message}`,
-        )
-      }
-      throw error
+    const headers = {
+      Authorization:  `Bearer ${params.accessToken}`,
+      'Content-Type': 'application/json',
     }
+
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await axios.post(endpoint, {}, { headers, timeout: 10_000 })
+        const url = response.data?.data?.url as string | undefined
+        if (!url || !url.startsWith('wss://')) throw new Error('URL OTP inválida recebida da Deriv')
+        logger.debug('[AuthService] OTP URL obtida', { accountId: params.accountId })
+        return url
+      } catch (error) {
+        lastError = error
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined
+        const retryable = axios.isAxiosError(error) && (!status || [429, 502, 503, 504].includes(status))
+        if (!retryable || attempt === 2) break
+        await new Promise((r) => setTimeout(r, 300 * 2 ** attempt))
+      }
+    }
+
+    if (axios.isAxiosError(lastError)) {
+      const info = oauthErrorInfo(lastError)
+      logger.error('[AuthService] Falha ao obter OTP URL', { accountId: params.accountId, ...info })
+      throw new AuthenticationError(`Falha ao obter OTP: ${info.message ?? lastError.message}`)
+    }
+    throw lastError
   }
 
-  static createSession(accessToken: string, expiresIn: number): UserSession {
+  static createSession(accessToken: string, expiresIn: number, refreshToken?: string): UserSession {
     const userId    = uuidv4()
     const expiresAt = Date.now() + expiresIn * 1_000
     logger.info('[AuthService] Sessão criada', { userId })
-    return { accessToken, expiresAt, userId }
+    return { accessToken, expiresAt, userId, refreshToken }
   }
 
   static isTokenExpired(session: UserSession): boolean {

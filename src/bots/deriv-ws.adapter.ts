@@ -1,33 +1,37 @@
 // ============================================================
-// NEXORA FOREX — Deriv WS Adapter (Privado)
+// NEXORA FOREX — Deriv WS Adapter v2 (conta autenticada)
 // ============================================================
-// Adaptador que usa a conexão privada (autenticada) gerida pela
-// sessão em server.ts. Não cria WebSockets próprios — recebe o WS
-// da sessão via getDerivWs().
+// Conforme a documentação oficial da Deriv (buy.md, proposal.md,
+// proposal-open-contract.md, ticks.md).
 //
-// ─── Arquitectura: MessageRouter central ─────────────────────
-// Em vez de cada chamada (buyContract/waitForContract/
-// subscribeToTicks/getProposal) registar o seu próprio ws.on('message', ...),
-// todas partilham UM único MessageRouter por ligação WS (ver
-// message-router.ts). O router faz o parse uma única vez e despacha
-// por req_id (pedidos únicos) ou por subscrição (streams contínuos),
-// eliminando o custo O(n) por mensagem que existe quando múltiplos
-// bots da mesma sessão têm cada um o seu próprio listener.
-//
-// Correcções mantidas desta versão:
-//   ✅ buy usa ask_price da resposta proposal (não params.stake)
-//   ✅ req_id numérico incremental (não aleatório — pode colidir)
-//   ✅ waitForContract: forget usa subscription.id do servidor
-//   ✅ subscribeToTicks: filtra por symbol E pela subscrição
-//   ✅ buyContract aceita barrier opcional (contratos de dígitos)
-//   ✅ getProposal: pedido único de payout, sem comprar, reaproveitando
-//      o mesmo padrão do passo 1 do buyContract (confirmado contra a
-//      doc oficial da Deriv — proposal.md)
+// Correcções vs v1:
+//   ✅ buy directo (buy:1 + parameters): 1 viagem de rede em vez de 2
+//      (proposal → buy). Fallback de 2 passos com { directBuy:false }.
+//   ✅ Acompanhamento do contrato começa NO MESMO INSTANTE em que o buy
+//      responde (antes só começava quando a estratégia chamava
+//      waitForContract → contratos de 1 tick podiam fechar antes).
+//   ✅ Timeout de waitForContract proporcional à duração (era fixo 35 s:
+//      contratos de 1m+ davam "Timeout" falso com o contrato ainda aberto)
+//   ✅ Campos da API nova: entry_spot / exit_spot / buy_price /
+//      sell_price (a v1 lia entry_tick/exit_tick → sempre 0, o que
+//      quebrava os dígitos finais das estratégias Even/Odd e Over/Under)
+//   ✅ Contrato só é dado como fechado com is_sold=1 ou status
+//      sold|won|lost|cancelled. is_expired/is_settleable NÃO têm lucro
+//      final → resultado registado como perda por engano.
+//   ✅ Profit = sell_price − buy_price (exacto), fallback profit
+//   ✅ Stake arredondado às casas decimais da moeda (martingale gerava
+//      0.35000000000000003 → InputValidationFailed)
+//   ✅ Streams (ticks / contrato) voltam a subscrever sozinhos após
+//      reconexão do WS; erro de símbolo inválido é registado
+//   ✅ Watchdog: ticks parados >30 s → nova subscrição
+//   ✅ onTick recebe também pip_size (2.º argumento, opcional) para
+//      calcular o último dígito correctamente (1.10 ≠ 1.1)
 // ============================================================
 
 import { WebSocket } from 'ws';
 import { DerivWsAdapter } from './bot.types.js';
 import { getMessageRouter } from './message-router.js';
+import { nextReqId } from '@utils/req-id.js';
 import logger from '@utils/logger.js';
 
 // ─── Erro tipado da Deriv ────────────────────────────────────
@@ -41,343 +45,348 @@ export class DerivApiError extends Error {
   }
 }
 
-// ─── req_id incremental (global ao módulo) ───────────────────
-// Um contador por processo evita colisões quando múltiplos bots/
-// sessões partilham req_ids — cada chamada ao router pede um novo.
-
-let globalReqIdCounter = 100_000;
-function nextReqId(): number {
-  return ++globalReqIdCounter;
-}
-
-// Converte o erro genérico que o MessageRouter rejeita (Error com
-// .code anexado quando vem de msg.error da Deriv) num DerivApiError
-// tipado, preservando o código para as estratégias reagirem (ex:
-// InsufficientBalance).
 function toDerivApiError(err: unknown, fallbackMessage: string): Error {
+  if (err instanceof DerivApiError) return err;
   if (err instanceof Error && 'code' in err && typeof (err as { code?: unknown }).code === 'string') {
     return new DerivApiError(err.message || fallbackMessage, (err as { code: string }).code);
   }
   return err instanceof Error ? err : new Error(fallbackMessage);
 }
 
-// ─── Mapeamento durationUnit ─────────────────────────────────
+// ─── Utilitários ─────────────────────────────────────────────
 
 const DURATION_UNIT_MAP: Record<string, string> = {
-  ticks: 't',
-  s: 's',
-  m: 'm',
-  h: 'h',
-  d: 'd',
-  t: 't',
+  ticks: 't', t: 't', s: 's', m: 'm', h: 'h', d: 'd',
 };
+
+const CRYPTO_8_DECIMALS = new Set(['BTC', 'ETH', 'LTC']);
+
+function roundStake(stake: number, currency: string): number {
+  const decimals = CRYPTO_8_DECIMALS.has(currency.toUpperCase()) ? 8 : 2;
+  return Number(stake.toFixed(decimals));
+}
+
+/** Tempo máximo razoável até o contrato fechar (duração + margem). */
+function maxWaitMs(duration: number, unit: string): number {
+  const MARGIN = 45_000;
+  switch (unit) {
+    case 't': return duration * 2_000 + MARGIN;
+    case 's': return duration * 1_000 + MARGIN;
+    case 'm': return duration * 60_000 + MARGIN;
+    case 'h': return duration * 3_600_000 + MARGIN;
+    case 'd': return duration * 86_400_000 + MARGIN;
+    default:  return 10 * 60_000;
+  }
+}
+
+const backoffMs = (attempt: number) => Math.min(250 * 2 ** attempt, 5_000);
+const num = (v: unknown): number => (v === null || v === undefined || v === '' ? 0 : Number(v));
+
+interface ContractResult {
+  profit: number;
+  won: boolean;
+  entryTick: number;
+  exitTick: number;
+  entrySpot?: string;
+  exitSpot?: string;
+  exitDigit?: number;
+}
+
+interface TickParams {
+  symbol: string;
+  contractType: string;
+  stake: number;
+  duration: number;
+  durationUnit: string;
+  currency: string;
+  barrier?: string;
+}
+
+const TICK_STALL_MS = 30_000;
+const DEFAULT_WAIT_MS = 10 * 60_000;
 
 // ─── Factory ─────────────────────────────────────────────────
 
 export function createDerivWsAdapter(
   getDerivWs: () => WebSocket | null,
+  options: { directBuy?: boolean } = {},
 ): DerivWsAdapter {
+  const directBuy = options.directBuy ?? true;
+  const watchers = new Map<string, Promise<ContractResult>>();
 
-  // ──────────────────────────────────────────────────────────
-  // buyContract
-  // Fluxo: proposal → (captura ask_price) → buy → contractId
-  // Usa o MessageRouter central — sem listeners próprios.
-  // ──────────────────────────────────────────────────────────
-
-  async function buyContract(params: {
-    symbol: string;
-    contractType: string;
-    stake: number;
-    duration: number;
-    durationUnit: string;
-    currency: string;
-    barrier?: string;
-  }): Promise<{ contractId: string }> {
-
+  function requireOpenWs(): WebSocket {
     const ws = getDerivWs();
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       throw new Error('[DerivAdapter] WebSocket não está disponível');
     }
+    return ws;
+  }
 
-    const durationUnit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
-    const router = getMessageRouter(ws);
-
-    // ── Passo 1: proposal ───────────────────────────────────
-    // Captura proposalId E ask_price para usar no buy.
-    const proposalReqId = nextReqId();
-    let proposalMsg: Record<string, unknown>;
-    try {
-      proposalMsg = await router.request({
-        proposal:          1,
-        amount:            params.stake,
-        basis:             'stake',
-        contract_type:     params.contractType,
-        currency:          params.currency,
-        duration:          params.duration,
-        duration_unit:     durationUnit,
-        underlying_symbol: params.symbol,
-        ...(params.barrier !== undefined ? { barrier: params.barrier } : {}),
-      }, proposalReqId, 15_000);
-    } catch (err) {
-      throw toDerivApiError(err, 'Erro na proposta');
-    }
-
-    const proposal = proposalMsg.proposal as Record<string, unknown> | undefined;
-    if (proposalMsg.msg_type !== 'proposal' || !proposal?.id) {
-      throw new Error('Resposta de proposal inválida ou sem id');
-    }
-
-    const proposalId = String(proposal.id);
-    // ask_price é o preço real a pagar — NUNCA usar params.stake aqui
-    const askPrice = Number(proposal.ask_price ?? params.stake);
-
-    logger.debug('[DerivAdapter] proposal recebida', {
-      reqId: proposalReqId, symbol: params.symbol, stake: params.stake,
-      contractType: params.contractType, duration: params.duration, durationUnit, askPrice,
-      barrier: params.barrier,
-    });
-
-    // ── Passo 2: buy ────────────────────────────────────────
-    // Reler WS — pode ter mudado se a sessão trocou de conta entre
-    // o passo 1 e aqui.
-    const ws2 = getDerivWs();
-    if (!ws2 || ws2.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível (após proposal)');
-    }
-    const router2 = getMessageRouter(ws2);
-    const buyReqId = nextReqId();
-
-    let buyMsg: Record<string, unknown>;
-    try {
-      // CRÍTICO: price = ask_price da resposta proposal, NÃO params.stake
-      buyMsg = await router2.request({ buy: proposalId, price: askPrice }, buyReqId, 15_000);
-    } catch (err) {
-      throw toDerivApiError(err, 'Erro ao comprar contrato');
-    }
-
-    const buy = buyMsg.buy as Record<string, unknown> | undefined;
-    if (buyMsg.msg_type !== 'buy' || !buy?.contract_id) {
-      throw new Error('Resposta buy inválida');
-    }
-
-    logger.debug('[DerivAdapter] buy confirmado', { reqId: buyReqId, proposalId, askPrice, contractId: buy.contract_id });
-
-    return { contractId: String(buy.contract_id) };
+  function contractParameters(p: TickParams, unit: string, amount: number): Record<string, unknown> {
+    return {
+      amount,
+      basis: 'stake',
+      contract_type: p.contractType,
+      currency: p.currency,
+      duration: p.duration,
+      duration_unit: unit,
+      underlying_symbol: p.symbol,
+      ...(p.barrier !== undefined ? { barrier: p.barrier } : {}),
+    };
   }
 
   // ──────────────────────────────────────────────────────────
-  // waitForContract
-  // Subscreve proposal_open_contract e resolve quando fecha.
-  // Stream contínuo via router.subscribe() — várias mensagens com o
-  // mesmo contract_id chegam até ele fechar.
+  // buyContract
   // ──────────────────────────────────────────────────────────
 
-  async function waitForContract(contractId: string): Promise<{
-    profit: number;
-    won: boolean;
-    entryTick: number;
-    exitTick: number;
-  }> {
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível');
+  async function buyContract(params: TickParams): Promise<{ contractId: string }> {
+    const unit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
+    const amount = roundStake(params.stake, params.currency);
+    const router = getMessageRouter(requireOpenWs());
+
+    let buyMsg: Record<string, unknown>;
+
+    try {
+      if (directBuy) {
+        // buy.md: buy:1 + parameters, price = preço máximo aceite.
+        buyMsg = await router.request(
+          { buy: 1, price: amount, parameters: contractParameters(params, unit, amount) },
+          nextReqId(),
+          15_000,
+        );
+      } else {
+        const proposalMsg = await router.request(
+          { proposal: 1, ...contractParameters(params, unit, amount) },
+          nextReqId(),
+          15_000,
+        );
+        const proposal = proposalMsg.proposal as Record<string, unknown> | undefined;
+        if (!proposal?.id) throw new Error('Resposta de proposal inválida ou sem id');
+
+        const router2 = getMessageRouter(requireOpenWs());
+        buyMsg = await router2.request(
+          { buy: String(proposal.id), price: Number(proposal.ask_price ?? amount) },
+          nextReqId(),
+          15_000,
+        );
+      }
+    } catch (err) {
+      const e = toDerivApiError(err, 'Erro ao comprar contrato');
+      if (e.message.startsWith('Timeout')) {
+        // NÃO repetir: o contrato pode ter sido comprado.
+        throw new Error(`${e.message} — estado da compra desconhecido, verifique o portfólio antes de repetir`);
+      }
+      throw e;
     }
-    const router = getMessageRouter(ws);
-    const subKey = `poc:${contractId}`;
 
-    return new Promise((resolve, reject) => {
+    const buy = buyMsg.buy as Record<string, unknown> | undefined;
+    if (!buy?.contract_id) throw new Error('Resposta buy inválida');
+
+    const contractId = String(buy.contract_id);
+
+    // Começa a acompanhar JÁ (mesmo tick de event-loop).
+    startWatch(contractId, maxWaitMs(params.duration, unit));
+
+    logger.debug('[DerivAdapter] buy confirmado', {
+      contractId, symbol: params.symbol, contractType: params.contractType, stake: amount,
+    });
+
+    return { contractId };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Acompanhamento de contrato
+  // ──────────────────────────────────────────────────────────
+
+  function startWatch(contractId: string, waitMs: number): Promise<ContractResult> {
+    const existing = watchers.get(contractId);
+    if (existing) return existing;
+
+    const p = watchContract(contractId, waitMs);
+    watchers.set(contractId, p);
+    const cleanup = () => { watchers.delete(contractId); };
+    p.then(cleanup, cleanup); // trata rejeição → sem unhandledRejection
+    return p;
+  }
+
+  function watchContract(contractId: string, waitMs: number): Promise<ContractResult> {
+    return new Promise<ContractResult>((resolve, reject) => {
       let settled = false;
-      let subscriptionServerId: string | null = null;
-      let subHandle: { reused: boolean; unsubscribe: () => void } | null = null;
+      let handle: { close: () => void } | null = null;
+      let retryTimer: ReturnType<typeof setTimeout> | null = null;
+      let deadline: ReturnType<typeof setTimeout> | null = null;
 
-      const cleanup = () => {
+      const finish = (err: Error | null, result?: ContractResult) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
-
-        // Só envia "forget" à Deriv se este for o ÚLTIMO consumidor
-        // desta subscrição — se outra chamada (ex: outro bot a
-        // acompanhar o mesmo contrato) ainda estiver à escuta, não
-        // cancelamos o stream por baixo dela. Equivalente ao
-        // finalize() do SubscriptionManager oficial da Deriv.
-        const wasLastConsumer = router.consumerCount(subKey) <= 1;
-        subHandle?.unsubscribe();
-
-        if (wasLastConsumer && subscriptionServerId && ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(JSON.stringify({ forget: subscriptionServerId, req_id: nextReqId() }));
-          } catch { /* ignorar */ }
-        }
+        if (deadline) clearTimeout(deadline);
+        if (retryTimer) clearTimeout(retryTimer);
+        handle?.close();
+        handle = null;
+        if (err) reject(err); else resolve(result!);
       };
 
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Timeout aguardando resultado do contrato (35s)'));
-      }, 35_000);
-
-      subHandle = router.subscribe(
-        subKey,
-        (msg: Record<string, unknown>) => {
-          const poc = msg.proposal_open_contract as Record<string, unknown> | undefined;
-          return !!poc && String(poc.contract_id) === contractId;
-        },
-        (msg: Record<string, unknown>) => {
-          if (settled) return;
-
-          if (msg.error) {
-            const err = msg.error as Record<string, unknown>;
-            cleanup();
-            reject(new DerivApiError(
-              String(err.message ?? 'Erro ao acompanhar contrato'),
-              String(err.code ?? 'UNKNOWN'),
-            ));
-            return;
-          }
-
-          const poc = msg.proposal_open_contract as Record<string, unknown>;
-
-          // Capturar serverId na primeira mensagem
-          const sub = msg.subscription as Record<string, unknown> | undefined;
-          if (sub?.id && !subscriptionServerId) {
-            subscriptionServerId = String(sub.id);
-          }
-
-          const isClosed =
-            poc.status === 'sold' ||
-            poc.is_sold === 1 ||
-            poc.is_expired === 1 ||
-            poc.is_settleable === 1;
-
-          if (isClosed) {
-            cleanup();
-            const profit = Number(poc.profit ?? 0);
-            resolve({
-              profit,
-              won:       profit > 0,
-              entryTick: Number(poc.entry_tick ?? 0),
-              exitTick:  Number(poc.exit_tick  ?? 0),
-            });
-          }
-        },
+      deadline = setTimeout(
+        () => finish(new Error(`Timeout aguardando resultado do contrato ${contractId} (${Math.round(waitMs / 1000)}s)`)),
+        waitMs,
       );
 
-      // Se a subscrição já existia (outro bot já está a acompanhar
-      // este mesmo contrato), não enviamos novo pedido à Deriv — só
-      // ficamos à escuta das mensagens que já estão a chegar para essa
-      // key, exactamente como o SubscriptionManager oficial reutiliza
-      // a fonte em vez de duplicar o pedido.
-      if (subHandle.reused) {
-        logger.debug('[DerivAdapter] Subscrição de contrato reutilizada', { contractId });
-        return;
-      }
+      const scheduleAttach = (attempt: number) => {
+        if (settled) return;
+        retryTimer = setTimeout(() => attach(attempt), backoffMs(attempt));
+      };
 
-      // Envia a mensagem de subscrição directamente (sem passar por
-      // router.request()): a Deriv ecoa o req_id enviado na PRIMEIRA
-      // resposta de proposal_open_contract — exactamente a mensagem
-      // que a subscrição acima precisa de receber. Se usássemos
-      // request() aqui, essa primeira mensagem seria capturada como
-      // "resposta de pedido único" e nunca chegaria ao handler da
-      // subscrição.
-      const reqId = nextReqId();
-      try {
-        ws.send(JSON.stringify({
-          proposal_open_contract: 1,
-          contract_id:            Number(contractId),
-          subscribe:              1,
-          req_id:                 reqId,
-        }));
-        logger.debug('[DerivAdapter] A aguardar contrato', { reqId, contractId });
-      } catch (err) {
-        cleanup();
-        reject(err instanceof Error ? err : new Error('Falha ao enviar subscrição'));
-      }
+      const attach = (attempt: number) => {
+        if (settled) return;
+        const ws = getDerivWs();
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          scheduleAttach(attempt + 1);
+          return;
+        }
+        const router = getMessageRouter(ws);
+        handle = router.openStream(
+          `poc:${contractId}`,
+          { proposal_open_contract: 1, contract_id: Number(contractId) },
+          {
+            onMessage: (msg) => {
+              const poc = msg.proposal_open_contract as Record<string, unknown> | undefined;
+              if (!poc || String(poc.contract_id) !== contractId) return;
+
+              const status = typeof poc.status === 'string' ? poc.status : null;
+              const closed =
+                Number(poc.is_sold) === 1 ||
+                status === 'sold' || status === 'won' || status === 'lost' || status === 'cancelled';
+              if (!closed) return;
+
+              const buyPrice = num(poc.buy_price);
+              const hasSell = poc.sell_price !== null && poc.sell_price !== undefined && poc.sell_price !== '';
+              const rawProfit = hasSell ? num(poc.sell_price) - buyPrice : num(poc.profit);
+              const profit = Number(rawProfit.toFixed(8));
+              const won = status === 'won' ? true : status === 'lost' ? false : profit > 0;
+
+              const entrySpot = poc.entry_spot ?? poc.entry_tick;
+              const exitSpot = poc.exit_spot ?? poc.exit_tick;
+              const exitSpotStr = exitSpot == null ? undefined : String(exitSpot);
+              const lastChar = exitSpotStr?.slice(-1);
+              const exitDigit = lastChar !== undefined && /\d/.test(lastChar) ? Number(lastChar) : undefined;
+
+              finish(null, {
+                profit,
+                won,
+                entryTick: num(entrySpot),
+                exitTick: num(exitSpot),
+                entrySpot: entrySpot == null ? undefined : String(entrySpot),
+                exitSpot: exitSpotStr,
+                exitDigit,
+              });
+            },
+            onError: (err) => finish(toDerivApiError(err, 'Erro ao acompanhar contrato')),
+            onDisconnect: () => {
+              handle = null;
+              logger.warn('[DerivAdapter] Ligação caiu a meio do contrato — a re-subscrever', { contractId });
+              scheduleAttach(0);
+            },
+          },
+        );
+      };
+
+      attach(0);
     });
+  }
+
+  function waitForContract(contractId: string): Promise<ContractResult> {
+    return watchers.get(contractId) ?? startWatch(contractId, DEFAULT_WAIT_MS);
   }
 
   // ──────────────────────────────────────────────────────────
   // subscribeToTicks
-  // Subscrição contínua de ticks para um símbolo, via router.
   // ──────────────────────────────────────────────────────────
 
   function subscribeToTicks(
     symbol: string,
-    onTick: (price: number) => void,
+    onTick: (price: number, pipSize?: number) => void,
   ): { unsubscribe: () => void } {
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      logger.warn('[DerivAdapter] WebSocket indisponível para ticks', { symbol });
-      return { unsubscribe: () => {} };
-    }
+    const key = `ticks:${symbol}`;
+    let closed = false;
+    let handle: { close: () => void } | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastTickAt = Date.now();
+    let failures = 0;
+    let routerRef: ReturnType<typeof getMessageRouter> | null = null;
 
-    const router = getMessageRouter(ws);
-    const subKey = `ticks:${symbol}`;
-    let serverId: string | null = null;
-    let unsubscribed = false;
-
-    const handler = (msg: Record<string, unknown>) => {
-      if (unsubscribed) return;
-      const tick = msg.tick as Record<string, unknown>;
-
-      if (!serverId) {
-        const sub = msg.subscription as Record<string, unknown> | undefined;
-        if (sub?.id) serverId = String(sub.id);
-      }
-
-      onTick(Number(tick.quote));
+    const scheduleAttach = (attempt: number) => {
+      if (closed) return;
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => attach(attempt), backoffMs(attempt));
     };
 
-    const subHandle = router.subscribe(
-      subKey,
-      (msg: Record<string, unknown>) => {
-        if (msg.msg_type !== 'tick') return false;
-        const tick = msg.tick as Record<string, unknown> | undefined;
-        return !!tick && tick.symbol === symbol;
-      },
-      handler,
-    );
-
-    // Se já havia outro consumidor a seguir o mesmo símbolo (ex:
-    // outro bot), reutiliza a subscrição existente — não duplica o
-    // pedido à Deriv, tal como o SubscriptionManager oficial.
-    if (subHandle.reused) {
-      logger.debug('[DerivAdapter] Subscrição de ticks reutilizada', { symbol });
-    } else {
-      const reqId = nextReqId();
-      try {
-        ws.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: reqId }));
-        logger.debug('[DerivAdapter] Subscrito a ticks', { symbol, reqId });
-      } catch (err) {
-        logger.error('[DerivAdapter] Falha ao subscrever ticks', { symbol, error: err });
+    const attach = (attempt: number) => {
+      if (closed) return;
+      const ws = getDerivWs();
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        scheduleAttach(attempt + 1);
+        return;
       }
-    }
+      const router = getMessageRouter(ws);
+      routerRef = router;
+      lastTickAt = Date.now();
+
+      handle = router.openStream(key, { ticks: symbol }, {
+        onMessage: (msg) => {
+          const tick = msg.tick as Record<string, unknown> | undefined;
+          if (!tick) return;
+          const quote = Number(tick.quote);
+          if (!Number.isFinite(quote)) return;
+          lastTickAt = Date.now();
+          failures = 0;
+          try {
+            onTick(quote, tick.pip_size === undefined ? undefined : Number(tick.pip_size));
+          } catch (err) {
+            logger.error('[DerivAdapter] onTick lançou erro', { symbol, error: err });
+          }
+        },
+        onError: (err) => {
+          handle = null;
+          failures++;
+          logger.error('[DerivAdapter] Erro na subscrição de ticks', {
+            symbol, message: err.message, code: (err as { code?: string }).code, failures,
+          });
+          if (failures < 5) scheduleAttach(failures);
+        },
+        onDisconnect: () => {
+          handle = null;
+          scheduleAttach(0);
+        },
+      });
+    };
+
+    attach(0);
+
+    // Watchdog: stream "mudo" → forçar nova subscrição
+    const watchdog = setInterval(() => {
+      if (closed || !handle || !routerRef) return;
+      if (Date.now() - lastTickAt > TICK_STALL_MS) {
+        logger.warn('[DerivAdapter] Ticks parados — a re-subscrever', { symbol });
+        lastTickAt = Date.now();
+        routerRef.resetStream(key);
+      }
+    }, 10_000);
+    watchdog.unref?.();
 
     return {
       unsubscribe: () => {
-        if (unsubscribed) return;
-        unsubscribed = true;
-
-        // Só envia "forget" se este for o último consumidor desta
-        // key — se outro bot ainda estiver a seguir o mesmo símbolo,
-        // não cancelamos o stream por baixo dele.
-        const wasLastConsumer = router.consumerCount(subKey) <= 1;
-        subHandle.unsubscribe();
-
-        if (wasLastConsumer && serverId && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ forget: serverId, req_id: nextReqId() }));
-          logger.debug('[DerivAdapter] Tick unsubscribe enviado', { symbol, serverId });
-        }
+        if (closed) return;
+        closed = true;
+        clearInterval(watchdog);
+        if (retryTimer) clearTimeout(retryTimer);
+        handle?.close();
+        handle = null;
       },
     };
   }
 
   // ──────────────────────────────────────────────────────────
-  // getProposal
-  // Pedido único de proposta (payout) sem comprar — mesmo passo 1
-  // do buyContract, mas devolve o payout em vez de comprar com o
-  // ask_price. Usado pelas estratégias para calcular o stake certo
-  // ANTES de decidir quanto apostar (ex: gale de recuperação do
-  // Over1 Recovery / ETHEREUM). Não envia subscribe:1 — é um único
-  // pedido/resposta, sem stream contínuo.
+  // getProposal — payout sem comprar
   // ──────────────────────────────────────────────────────────
 
   async function getProposal(params: {
@@ -389,43 +398,29 @@ export function createDerivWsAdapter(
     barrier?: string;
     stake: number;
   }): Promise<{ payout: number }> {
+    const unit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
+    const amount = roundStake(params.stake, params.currency);
+    const router = getMessageRouter(requireOpenWs());
 
-    const ws = getDerivWs();
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      throw new Error('[DerivAdapter] WebSocket não está disponível');
-    }
-
-    const durationUnit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
-    const router = getMessageRouter(ws);
-    const reqId = nextReqId();
-
-    let proposalMsg: Record<string, unknown>;
+    let msg: Record<string, unknown>;
     try {
-      proposalMsg = await router.request({
-        proposal:          1,
-        amount:            params.stake,
-        basis:             'stake',
-        contract_type:     params.contractType,
-        currency:          params.currency,
-        duration:          params.duration,
-        duration_unit:     durationUnit,
+      msg = await router.request({
+        proposal: 1,
+        amount,
+        basis: 'stake',
+        contract_type: params.contractType,
+        currency: params.currency,
+        duration: params.duration,
+        duration_unit: unit,
         underlying_symbol: params.symbol,
         ...(params.barrier !== undefined ? { barrier: params.barrier } : {}),
-      }, reqId, 15_000);
+      }, nextReqId(), 15_000);
     } catch (err) {
       throw toDerivApiError(err, 'Erro ao consultar proposta/payout');
     }
 
-    const proposal = proposalMsg.proposal as Record<string, unknown> | undefined;
-    if (proposalMsg.msg_type !== 'proposal' || proposal?.payout === undefined) {
-      throw new Error('Resposta de proposal inválida ou sem payout');
-    }
-
-    logger.debug('[DerivAdapter] proposal (payout only) recebida', {
-      reqId, symbol: params.symbol, stake: params.stake,
-      contractType: params.contractType, barrier: params.barrier,
-      payout: proposal.payout,
-    });
+    const proposal = msg.proposal as Record<string, unknown> | undefined;
+    if (proposal?.payout === undefined) throw new Error('Resposta de proposal inválida ou sem payout');
 
     return { payout: Number(proposal.payout) };
   }

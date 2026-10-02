@@ -1,48 +1,29 @@
 // ============================================================
-// NEXORA FOREX — Server
+// NEXORA FOREX — Server v2
 // ============================================================
-// CORRECÇÕES DESTA VERSÃO:
-//   ✅ setupDerivMessageHandler: remove listener 'message' antigo
-//      antes de adicionar novo — evita acumulação de listeners em
-//      cada reconexão
-//   ✅ Deduplicação de sessões por accountId
-//   ✅ Reconexão Deriv com novo OTP obrigatório
-//   ✅ Bot aguarda WS disponível (waitForDerivWs)
-//   ✅ Limite de sessões simultâneas (DoS protection)
-//   ✅ Timeout de autenticação (30s)
-//   ✅ Cleanup completo em todos os caminhos
-//   ✅ trust proxy + cookie-parser — corrige "Cookie PKCE não
-//      encontrado" no fluxo OAuth entre Vercel (frontend) e Render
-//      (backend, atrás de proxy reverso)
-//   ✅ Rotas de administração de utilizadores locais
-//      (/api/admin/users) — login local com email/senha,
-//      independente do fluxo OAuth Deriv
-//   ✅ Rotas de notificações broadcast (/api/notifications leitura,
-//      /api/admin/notifications gestão)
-//   ✅ CORREÇÃO CRÍTICA (uncaught exception): terminate() num
-//      WebSocket em handshake (CONNECTING) faz a lib `ws` emitir um
-//      'error' interno. Se removeAllListeners() foi chamado antes,
-//      esse 'error' fica sem listener e derruba o processo. Por isso
-//      safeTerminateDerivWs() anexa um listener 'error' no-op antes
-//      de terminar um socket ainda a ligar.
-//   ✅ CORREÇÃO: /health antes do apiLimiter — o healthcheck do
-//      Render fazia polling e recebia 429, o que reiniciava a
-//      instância.
-//   ✅ Operar Manual: handler `manual_buy` (proposal → buy →
-//      acompanhamento do fecho), sobre a MESMA ligação Deriv da
-//      sessão. Campos segundo a doc oficial da Deriv:
-//        - `underlying_symbol` (não `symbol`)
-//        - `duration_unit` aceita "d","m","s","h","t"
-//        - profit/buy_price/payout vêm como STRING -> Number()
-//        - `is_sold` é 0/1 (integer)
-//        - não existe `exit_tick`; o campo certo é `exit_spot`
-//   ✅ NOVO: listener 'error' do derivWs é permanente (on, não once).
-//      Com once, um segundo erro depois de a ligação abrir ficava
-//      sem listener e derrubava o processo.
-//   ✅ NOVO: reconnectTimer anterior é cancelado antes de agendar
-//      outro — evita dois timers de reconexão em simultâneo.
-//   ✅ NOVO: proposal_open_contract reencaminha exit_spot (o campo
-//      real da Deriv) em vez de exit_tick.
+// Correcções vs v1 (além das já documentadas na versão anterior):
+//   ✅ Tráfego dos bots já NÃO é reencaminhado ao frontend: o router
+//      devolve se consumiu a mensagem (buy/proposal/poc/ticks dos bots
+//      geravam 3–5 mensagens inúteis por trade e por tick)
+//   ✅ Parse JSON único por mensagem Deriv (router.dispatch)
+//   ✅ Os bots SOBREVIVEM a reconexões do WS Deriv (antes: stopAll() +
+//      novo BotManager a cada queda → bots perdidos). O adapter volta a
+//      subscrever ticks/contratos na nova ligação.
+//   ✅ Keep-alive para a Deriv (ping a cada 30 s com deteção de ligação
+//      morta). Antes só se fazia ping ao cliente.
+//   ✅ Reconexão: 1ª tentativa em ~0,5 s (era 3 s); sem dupla contagem
+//      quando a ligação falha antes de abrir
+//   ✅ forget_all do frontend só cancela as subscrições DO FRONTEND
+//      (antes matava os ticks dos bots, que partilham a ligação)
+//   ✅ req_id do frontend < 1.000.000; o alocador interno usa >= 1.000.000
+//      (um req_id pequeno do cliente podia resolver o pedido de um bot)
+//   ✅ Operar Manual usa o adapter (buy directo, 1 viagem; dígito final
+//      a partir de exit_spot com as casas decimais reais do símbolo —
+//      lastDigitFromPrice usava toFixed(2): errado para R_10/R_50)
+//   ✅ Autenticação não reentra (url token + msg auth em simultâneo
+//      criavam dois WS Deriv, um deles órfão)
+//   ✅ Cliente "morto" detectado (ping/pong com isAlive) → sessão e bots
+//      libertados; limite de payload e de mensagens/s por cliente
 // ============================================================
 
 import 'express-async-errors';
@@ -72,17 +53,24 @@ import { DerivAPIService } from '@services/deriv-api.service.js';
 import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
-import { BotEvent, BotConfig, BotStrategyType } from './bots/bot.types.js';
+import { BotEvent, BotConfig, BotStrategyType, DerivWsAdapter } from './bots/bot.types.js';
 import { seedBotCatalog } from './bots/catalog-seed.js';
-import { getMessageRouter } from './bots/message-router.js';
+import { attachExternalRouter, destroyMessageRouter } from './bots/message-router.js';
+import { nextReqId } from '@utils/req-id.js';
 
 // ─── Limites ──────────────────────────────────────────────────
-const MAX_SESSIONS        = 100;
-const AUTH_TIMEOUT_MS     = 30_000;
-const RECONNECT_BASE_MS   = 3_000;
-const RECONNECT_MAX_MS    = 30_000;
-const RECONNECT_MAX_TRIES = 8;
-const WS_WAIT_TIMEOUT_MS  = 20_000;
+const MAX_SESSIONS         = 100;
+const AUTH_TIMEOUT_MS      = 30_000;
+const RECONNECT_BASE_MS    = 500;
+const RECONNECT_MAX_MS     = 30_000;
+const RECONNECT_MAX_TRIES  = 8;
+const WS_WAIT_TIMEOUT_MS   = 20_000;
+const DERIV_PING_MS        = 30_000;   // Deriv: ping a cada 30 s
+const DERIV_PING_TIMEOUT   = 10_000;
+const CLIENT_MAX_PAYLOAD   = 1_000_000;
+const CLIENT_MSGS_PER_SEC  = 60;
+const CLIENT_REQ_ID_LIMIT  = 1_000_000; // req_id do cliente < 1M; internos >= 1M
+const MAX_CLIENT_SUBS      = 200;
 
 // ─── Admins ───────────────────────────────────────────────────
 const ADMIN_IDS = new Set<string>(
@@ -91,31 +79,37 @@ const ADMIN_IDS = new Set<string>(
 
 // ─── App & HTTP Server ────────────────────────────────────────
 const app: Application = express();
-
-// CRÍTICO: trust proxy ANTES de qualquer middleware que dependa de
-// detecção correta de HTTPS (cookies secure, req.protocol, req.ip).
-// O Render fica atrás de um proxy reverso — sem isto, o Express pode
-// tratar a ligação como HTTP mesmo sendo HTTPS real.
 app.set('trust proxy', 1);
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  maxPayload: CLIENT_MAX_PAYLOAD,
+  perMessageDeflate: false,
+});
 
 // ─── Sessão ───────────────────────────────────────────────────
 interface ClientSession {
   derivWs:              WebSocket | null;
   derivMessageHandler:  ((raw: Buffer) => void) | null;
+  derivPingInterval:    NodeJS.Timeout | null;
+  adapter:              DerivWsAdapter | null;
   token:                string;
   accountId:            string | null;
-  currency:             string; // moeda da conta ativa (Operar Manual)
+  currency:             string;
   pingInterval:         NodeJS.Timeout | null;
   authTimeout:          NodeJS.Timeout | null;
   reconnectTimer:       NodeJS.Timeout | null;
   reconnectAttempts:    number;
   authenticated:        boolean;
+  authenticating:       boolean;
   isAdmin:              boolean;
+  isAlive:              boolean;
   botManager:           BotManager | null;
   nextReqId:            number;
+  clientSubs:           Map<string, string>; // subscription.id → msg_type (só do frontend)
+  msgWindowStart:       number;
+  msgCount:             number;
 }
 
 const sessions = new Map<WebSocket, ClientSession>();
@@ -133,19 +127,19 @@ function sendError(ws: WebSocket, message: string, code = 'ERROR'): void {
   sendToClient(ws, 'error', { payload: { code, message } });
 }
 
+// ids internos do server (< 1M): 900000+ para não colidir com os do frontend
 function getNextReqId(session: ClientSession): number {
-  return ++session.nextReqId;
+  session.nextReqId = session.nextReqId >= CLIENT_REQ_ID_LIMIT - 1 ? 900_000 : session.nextReqId + 1;
+  return session.nextReqId;
 }
 
 // ─── Encerrar derivWs com segurança ───────────────────────────
-// Nunca chamar terminate() logo após removeAllListeners() sem antes
-// verificar se o socket ainda está a meio do handshake (CONNECTING).
-// Nesse estado, terminate() invoca abortHandshake(), que emite um
-// 'error' síncrono ("WebSocket was closed before the connection was
-// established"). Sem nenhum listener de 'error', o Node trata isso
-// como excepção não tratada e o processo cai (uncaughtException ->
-// process.exit(1)). Usada em authenticateClient() e cleanupSession().
 function safeTerminateDerivWs(session: ClientSession): void {
+  if (session.derivPingInterval) {
+    clearInterval(session.derivPingInterval);
+    session.derivPingInterval = null;
+  }
+
   const ws = session.derivWs;
   if (!ws) return;
 
@@ -154,34 +148,25 @@ function safeTerminateDerivWs(session: ClientSession): void {
     session.derivMessageHandler = null;
   }
 
-  const isConnecting = ws.readyState === WebSocket.CONNECTING;
-
+  // removeAllListeners() também remove o 'close' do router → destruir à mão
+  destroyMessageRouter(ws);
   ws.removeAllListeners();
 
-  if (isConnecting) {
-    // Absorve o 'error' esperado do abortHandshake interno da lib ws.
-    ws.on('error', () => { /* esperado ao abortar handshake em curso — ignorar */ });
-  }
+  // Absorve o 'error' do abortHandshake (CONNECTING) e qualquer erro tardio.
+  ws.on('error', () => { /* esperado */ });
 
   try {
     ws.terminate();
   } catch (err: any) {
-    // Rede de segurança: socket internals do `ws` podem ter uma corrida
-    // (ex.: cleanup chamado duas vezes para a mesma sessão).
     logger.warn('[WS] Erro ao terminar derivWs (ignorado)', { message: err?.message });
   }
 }
 
 // ─── Aguardar WS disponível ───────────────────────────────────
 
-function waitForDerivWs(
-  session: ClientSession,
-  timeoutMs = WS_WAIT_TIMEOUT_MS,
-): Promise<WebSocket> {
+function waitForDerivWs(session: ClientSession, timeoutMs = WS_WAIT_TIMEOUT_MS): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    if (session.derivWs?.readyState === WebSocket.OPEN) {
-      return resolve(session.derivWs);
-    }
+    if (session.derivWs?.readyState === WebSocket.OPEN) return resolve(session.derivWs);
 
     const deadline = setTimeout(() => {
       clearInterval(poll);
@@ -194,7 +179,7 @@ function waitForDerivWs(
         clearInterval(poll);
         resolve(session.derivWs!);
       }
-    }, 500);
+    }, 100);
   });
 }
 
@@ -207,18 +192,61 @@ function subscribeAutomatic(derivWs: WebSocket, session: ClientSession): void {
   logger.debug('[WS] Subscrições automáticas enviadas');
 }
 
+// ─── forget_all do frontend: só as subscrições do frontend ───
+const FORGET_TYPE_TO_MSG: Record<string, string> = {
+  ticks: 'tick', ticks_history: 'ohlc', candles: 'ohlc', ohlc: 'ohlc',
+};
+
+function handleClientForgetAll(ws: WebSocket, session: ClientSession, payload: Record<string, unknown>): void {
+  const raw = payload.forget_all;
+  const types = (Array.isArray(raw) ? raw : [raw]).map(String);
+  const wanted = new Set(types.map((t) => FORGET_TYPE_TO_MSG[t] ?? t));
+  const forgotten: string[] = [];
+
+  for (const [subId, msgType] of session.clientSubs) {
+    if (!wanted.has(msgType)) continue;
+    if (session.derivWs?.readyState === WebSocket.OPEN) {
+      session.derivWs.send(JSON.stringify({ forget: subId, req_id: getNextReqId(session) }));
+    }
+    session.clientSubs.delete(subId);
+    forgotten.push(subId);
+  }
+
+  sendToClient(ws, 'forget_all', {
+    msg_type: 'forget_all',
+    forget_all: forgotten,
+    req_id: payload.req_id,
+    echo_req: payload,
+  });
+}
+
 // ─── Proxy Deriv → Frontend ───────────────────────────────────
 
 function buildDerivMessageHandler(
   clientWs: WebSocket,
+  session: ClientSession,
+  router: ReturnType<typeof attachExternalRouter>,
 ): (raw: Buffer) => void {
   return (raw: Buffer) => {
     let msg: Record<string, unknown>;
     try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
 
+    // Parse único: o router trata o tráfego dos bots (e do Operar Manual).
+    // Se consumiu a mensagem, não a reencaminhamos ao frontend.
+    if (router.dispatch(msg)) return;
+
     if (msg.msg_type === 'ping' || msg.msg_type === 'pong') return;
 
-    switch (msg.msg_type as string) {
+    // Regista subscrições abertas PELO frontend (para o forget_all seletivo)
+    const subId = (msg.subscription as { id?: string } | undefined)?.id;
+    const mt = msg.msg_type as string | undefined;
+    if (subId && mt && mt !== 'balance' && mt !== 'transaction'
+        && session.clientSubs.get(subId) !== mt
+        && (session.clientSubs.has(subId) || session.clientSubs.size < MAX_CLIENT_SUBS)) {
+      session.clientSubs.set(subId, mt);
+    }
+
+    switch (mt) {
       case 'balance':
         sendToClient(clientWs, 'balance', {
           balance:  (msg.balance as any)?.balance  ?? 0,
@@ -228,9 +256,10 @@ function buildDerivMessageHandler(
         break;
       case 'tick':
         sendToClient(clientWs, 'tick', {
-          quote:  (msg.tick as any)?.quote,
-          epoch:  (msg.tick as any)?.epoch,
-          symbol: (msg.tick as any)?.symbol,
+          quote:    (msg.tick as any)?.quote,
+          epoch:    (msg.tick as any)?.epoch,
+          symbol:   (msg.tick as any)?.symbol,
+          pip_size: (msg.tick as any)?.pip_size,
         });
         break;
       case 'transaction':
@@ -253,16 +282,17 @@ function buildDerivMessageHandler(
         sendToClient(clientWs, 'proposal_open_contract', {
           contract_id: poc?.contract_id, is_sold: poc?.is_sold,
           profit: poc?.profit, status: poc?.status,
-          entry_tick: poc?.entry_tick,
-          // A Deriv devolve `exit_spot`; `exit_tick` fica como fallback.
-          exit_tick: poc?.exit_spot ?? poc?.exit_tick,
+          entry_tick: poc?.entry_spot ?? poc?.entry_tick,
+          exit_tick:  poc?.exit_spot ?? poc?.exit_tick,
+          entry_spot: poc?.entry_spot,
+          exit_spot:  poc?.exit_spot,
           payout: poc?.payout,
         });
         break;
       }
       case 'ohlc':    sendToClient(clientWs, 'ohlc',    { ohlc:    msg.ohlc    }); break;
       case 'history': sendToClient(clientWs, 'history', { history: msg.history }); break;
-      default: sendToClient(clientWs, (msg.msg_type as string) ?? 'message', msg);
+      default: sendToClient(clientWs, mt ?? 'message', msg);
     }
   };
 }
@@ -277,45 +307,67 @@ async function connectToDerivWS(
   return new Promise((resolve, reject) => {
     logger.info('[WS] Connecting to Deriv WS', { url: wsUrl.replace(/otp=[^&]+/, 'otp=***') });
 
-    const derivWs = new WebSocket(wsUrl);
+    const derivWs = new WebSocket(wsUrl, { perMessageDeflate: false, handshakeTimeout: 10_000 });
     session.derivWs = derivWs;
+    const router = attachExternalRouter(derivWs);
+    let opened = false;
+
+    // listener de erro PERMANENTE e registado já (antes de qualquer terminate)
+    derivWs.on('error', (err) => {
+      clearTimeout(timeout);
+      logger.error('[WS] Deriv WS error', { message: err.message });
+      reject(err); // no-op se já resolvida
+    });
 
     const timeout = setTimeout(() => {
-      derivWs.terminate();
       reject(new Error('Timeout de conexão Deriv WS (10s)'));
+      try { derivWs.terminate(); } catch { /* ignorar */ }
     }, 10_000);
 
     derivWs.once('open', () => {
       clearTimeout(timeout);
+      opened = true;
       logger.info('[WS] Connected to Deriv WS');
 
-      if (session.derivMessageHandler) {
-        derivWs.removeListener('message', session.derivMessageHandler);
-      }
-      const handler = buildDerivMessageHandler(clientWs);
+      const handler = buildDerivMessageHandler(clientWs, session, router);
       session.derivMessageHandler = handler;
       derivWs.on('message', handler);
+
+      // Keep-alive (Deriv recomenda ping a cada 30 s). Se não responder,
+      // termina a ligação → o 'close' dispara a reconexão.
+      if (session.derivPingInterval) clearInterval(session.derivPingInterval);
+      session.derivPingInterval = setInterval(() => {
+        if (derivWs.readyState !== WebSocket.OPEN) return;
+        router.request({ ping: 1 }, nextReqId(), DERIV_PING_TIMEOUT).catch((err) => {
+          logger.warn('[WS] Ping Deriv sem resposta — a reiniciar ligação', { error: err.message });
+          try { derivWs.terminate(); } catch { /* ignorar */ }
+        });
+      }, DERIV_PING_MS);
+      session.derivPingInterval.unref?.();
 
       subscribeAutomatic(derivWs, session);
       resolve();
     });
 
-    // PERMANENTE (on, não once): erros depois de a ligação abrir também
-    // têm de ter listener, senão o Node trata-os como excepção não
-    // tratada. Se a Promise já estiver resolvida, reject() é no-op.
-    derivWs.on('error', (err) => {
-      clearTimeout(timeout);
-      logger.error('[WS] Deriv WS error', { message: err.message });
-      reject(err);
-    });
-
     derivWs.once('close', (code, reason) => {
+      clearTimeout(timeout);
       if (session.derivMessageHandler) {
         derivWs.removeListener('message', session.derivMessageHandler);
         session.derivMessageHandler = null;
       }
+      // socket substituído entretanto: este close já não interessa
+      if (session.derivWs !== derivWs) return;
+
+      if (session.derivPingInterval) {
+        clearInterval(session.derivPingInterval);
+        session.derivPingInterval = null;
+      }
       session.derivWs = null;
-      logger.warn('[WS] Deriv WS disconnected', { code, reason: reason?.toString() });
+      session.clientSubs.clear(); // ids de subscrição morrem com a ligação
+      logger.warn('[WS] Deriv WS disconnected', { code, reason: reason?.toString(), opened });
+
+      if (!opened) return; // falhou ao ligar: o chamador (reject) trata da nova tentativa
+
       if (clientWs.readyState === WebSocket.OPEN) {
         sendToClient(clientWs, 'deriv_disconnected', { message: 'Deriv WS desconectado. A reconectar...' });
       }
@@ -344,22 +396,22 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
     attempt: session.reconnectAttempts, delayMs: delay, accountId: session.accountId,
   });
 
-  // Garante um único timer de reconexão por sessão.
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
 
   session.reconnectTimer = setTimeout(async () => {
+    session.reconnectTimer = null;
     if (clientWs.readyState !== WebSocket.OPEN) return;
     try {
       const derivAPI = new DerivAPIService(session.token);
       const otpData  = await derivAPI.getOTP(session.accountId!);
+      // descarta um socket falhado que ainda esteja pendurado
+      if (session.derivWs) safeTerminateDerivWs(session);
       await connectToDerivWS(clientWs, otpData.url, session);
       session.reconnectAttempts = 0;
 
-      if (session.botManager) {
-        await session.botManager.stopAll();
-        session.botManager.removeAllListeners();
-      }
-      initBotManagerForSession(clientWs, session);
+      // Os bots NÃO são parados: o adapter lê session.derivWs e volta a
+      // subscrever ticks/contratos sozinho na nova ligação.
+      if (!session.botManager) initBotManagerForSession(clientWs, session);
       sendToClient(clientWs, 'deriv_reconnected', { message: 'Conexão Deriv restabelecida' });
     } catch (err: any) {
       logger.error('[WS] Falha na reconexão Deriv', { error: err.message });
@@ -370,12 +422,15 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
 
 // ─── BotManager ───────────────────────────────────────────────
 
+function getAdapter(session: ClientSession): DerivWsAdapter {
+  if (!session.adapter) session.adapter = createDerivWsAdapter(() => session.derivWs);
+  return session.adapter;
+}
+
 function initBotManagerForSession(clientWs: WebSocket, session: ClientSession): void {
   if (!session.derivWs) return;
 
-  const adapter = createDerivWsAdapter(() => session.derivWs);
-
-  const manager = new BotManager(adapter);
+  const manager = new BotManager(getAdapter(session));
   manager.on('bot_event', (event: BotEvent) => {
     sendToClient(clientWs, event.type, { payload: { botId: event.botId, ...event.payload } });
   });
@@ -466,7 +521,7 @@ async function handleBotMessage(
       case 'delete_bot': {
         const botId = payload.botId as string;
         if (!botId) { sendError(ws, 'botId obrigatório.', 'MISSING_PARAM'); break; }
-        manager.deleteBot(botId);
+        await manager.deleteBot(botId); // agora async (aguarda o stop)
         sendToClient(ws, 'bot_deleted', { payload: { botId } }); break;
       }
 
@@ -511,42 +566,14 @@ async function handleBotMessage(
   }
 }
 
-// ─── Compra manual (Over/Under, Matches/Differs, Rise/Fall...) ─
-// Segue à risca a documentação oficial da Deriv:
-//   - proposal / buy usam `underlying_symbol` (não `symbol`)
-//   - duration_unit: "d","m","s","h","t" (não "ticks")
-//   - proposal_open_contract.profit / buy_price / payout são STRING
-//     na resposta da Deriv — sempre convertidos com Number()
-//   - is_sold é 0/1 (integer), não boolean
-//   - não existe `exit_tick`; o campo certo é `exit_spot` (preço,
-//     string) — o dígito de saída é calculado a partir dele
-//   - erros chegam como { error: { code, message }, msg_type } (o
-//     MessageRouter.request() já rejeita a Promise nesse caso)
+// ─── Compra manual ────────────────────────────────────────────
+// Usa o adapter (buy directo: 1 viagem de rede) e acompanha o fecho
+// com o mesmo mecanismo dos bots. O dígito final vem de exit_spot
+// (string) com as casas decimais reais do símbolo.
 
 const DIGIT_CONTRACT_TYPES = new Set([
   'DIGITOVER', 'DIGITUNDER', 'DIGITMATCH', 'DIGITDIFF', 'DIGITODD', 'DIGITEVEN',
 ]);
-
-// Deriv usa 't' para ticks — o frontend envia 'ticks' (mais legível
-// na UI), por isso convertemos aqui antes de enviar à Deriv.
-function mapDurationUnit(u: string): string {
-  switch (u) {
-    case 'ticks': return 't';
-    case 't':     return 't';
-    case 's':     return 's';
-    case 'm':     return 'm';
-    case 'h':     return 'h';
-    case 'd':     return 'd';
-    default:      return u;
-  }
-}
-
-// O último dígito é calculado a partir do preço (exit_spot), tal
-// como o resto da app já faz (ChartSection.tsx / OperarManualPage.tsx).
-function lastDigitFromPrice(price: number): number {
-  const s = Number(price).toFixed(2);
-  return parseInt(s[s.length - 1], 10);
-}
 
 async function handleManualBuy(
   ws: WebSocket, session: ClientSession, payload: Record<string, unknown>,
@@ -567,91 +594,47 @@ async function handleManualBuy(
     return;
   }
 
-  const derivWs = session.derivWs;
-  const router  = getMessageRouter(derivWs);
+  const adapter = getAdapter(session);
 
   try {
-    // ── 1) Proposta de preço ──────────────────────────────────
-    const proposalPayload: Record<string, unknown> = {
-      proposal: 1,
-      amount: stake,
-      basis: 'stake',
-      contract_type: contractType,
-      currency: session.currency || 'USD',
+    const bought = await adapter.buyContract({
+      symbol,
+      contractType,
+      stake,
       duration,
-      duration_unit: mapDurationUnit(durationUnit),
-      underlying_symbol: symbol, // campo correcto segundo a doc Deriv
-    };
-    if (DIGIT_CONTRACT_TYPES.has(contractType) && barrier !== undefined && barrier !== null && barrier !== '') {
-      proposalPayload.barrier = String(barrier);
-    }
-
-    const proposalRes = await router.request(proposalPayload, getNextReqId(session), 15_000);
-    const proposal = proposalRes.proposal as any;
-    if (!proposal?.id) throw new Error('Não foi possível obter proposta da Deriv.');
-
-    // ── 2) Compra do contrato pelo id da proposta ─────────────
-    const buyRes = await router.request(
-      { buy: proposal.id, price: Number(proposal.ask_price) },
-      getNextReqId(session),
-      15_000,
-    );
-    const buy = buyRes.buy as any;
-    if (!buy?.contract_id) throw new Error('Compra não confirmada pela Deriv.');
+      durationUnit, // o adapter converte 'ticks' → 't'
+      currency: session.currency || 'USD',
+      ...(DIGIT_CONTRACT_TYPES.has(contractType) && barrier !== undefined && barrier !== null && barrier !== ''
+        ? { barrier: String(barrier) }
+        : {}),
+    });
 
     sendToClient(ws, 'manual_buy_result', {
       payload: {
         success: true,
-        contractId: String(buy.contract_id),
-        payout: Number(buy.payout),
+        contractId: bought.contractId,
+        payout: (bought as { payout?: number }).payout,
       },
     });
 
-    // ── 3) Acompanhar o contrato até fechar (proposal_open_contract) ──
-    const contractId = buy.contract_id as number;
-    const subKey = `manual_poc_${contractId}`;
-    let derivSubId: string | null = null;
-
-    const { unsubscribe } = router.subscribe(
-      subKey,
-      (msg) => (msg as any).msg_type === 'proposal_open_contract'
-        && Number((msg as any).proposal_open_contract?.contract_id) === contractId,
-      (msg) => {
-        const poc = (msg as any).proposal_open_contract;
-        if ((msg as any).subscription?.id) derivSubId = (msg as any).subscription.id;
-
-        // is_sold vem como 0/1 (integer) — nunca truthy directo
-        if (Number(poc?.is_sold) !== 1) return;
-
-        const profit = Number(poc.profit ?? 0);
-        const exitSpot = poc.exit_spot != null ? Number(poc.exit_spot) : undefined;
-
+    // Fecho do contrato (não bloqueia o handler)
+    adapter.waitForContract(bought.contractId)
+      .then((res) => {
         sendToClient(ws, 'manual_trade_closed', {
           payload: {
-            contractId: String(contractId),
-            profit,
-            won: profit >= 0,
+            contractId: bought.contractId,
+            profit: res.profit,
+            won: res.won,
             stake,
-            exitTick: exitSpot,
-            exitDigit: typeof exitSpot === 'number' && !Number.isNaN(exitSpot)
-              ? lastDigitFromPrice(exitSpot)
-              : undefined,
+            exitTick: res.exitTick || undefined,
+            exitDigit: (res as { exitDigit?: number }).exitDigit,
           },
         });
-
-        unsubscribe();
-        if (derivSubId && derivWs.readyState === WebSocket.OPEN) {
-          derivWs.send(JSON.stringify({ forget: derivSubId, req_id: getNextReqId(session) }));
-        }
-      },
-    );
-
-    derivWs.send(JSON.stringify({
-      proposal_open_contract: 1,
-      contract_id: contractId,
-      subscribe: 1,
-      req_id: getNextReqId(session),
-    }));
+      })
+      .catch((err: Error) => {
+        logger.error('[WS] Erro ao acompanhar contrato manual', { contractId: bought.contractId, error: err.message });
+        sendError(ws, `Erro ao acompanhar contrato ${bought.contractId}: ${err.message}`, 'MANUAL_TRADE_ERROR');
+      });
   } catch (err: any) {
     logger.error('[WS] Erro na compra manual', { error: err.message });
     sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: err.message ?? 'Erro ao comprar.' } });
@@ -664,22 +647,26 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
   const session = sessions.get(ws);
   if (!session) return;
 
-  if (session.authTimeout) { clearTimeout(session.authTimeout); session.authTimeout = null; }
-
-  if (session.botManager) {
-    await session.botManager.stopAll();
-    session.botManager.removeAllListeners();
-    session.botManager = null;
+  if (session.authenticating) {
+    sendError(ws, 'Autenticação já em curso.', 'AUTH_IN_PROGRESS');
+    return;
   }
-
-  // safeTerminateDerivWs() em vez de removeAllListeners() + terminate()
-  // diretos, para evitar uncaught exception com o socket em CONNECTING.
-  safeTerminateDerivWs(session);
-  session.derivWs = null;
-
-  if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
+  session.authenticating = true;
 
   try {
+    if (session.authTimeout) { clearTimeout(session.authTimeout); session.authTimeout = null; }
+
+    if (session.botManager) {
+      await session.botManager.stopAll();
+      session.botManager.removeAllListeners();
+      session.botManager = null;
+    }
+
+    if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
+    safeTerminateDerivWs(session);
+    session.derivWs = null;
+    session.clientSubs.clear();
+
     const derivAPI    = new DerivAPIService(token);
     const accountsRes = await derivAPI.getAccounts();
     const accounts: any[] = accountsRes.data ?? [];
@@ -697,6 +684,12 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
       logger.warn('[WS] Sessão duplicada detectada, a fechar a antiga', { accountId: targetAccountId });
       await cleanupSession(existingWs);
       existingWs.close(1001, 'Sessão substituída por nova conexão');
+    }
+
+    // troca de conta: libertar o registo da conta anterior
+    if (session.accountId && session.accountId !== targetAccountId
+        && sessionsByAccount.get(session.accountId) === ws) {
+      sessionsByAccount.delete(session.accountId);
     }
 
     session.token         = token;
@@ -738,6 +731,8 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     logger.error('[WS] Authentication failed', { error: err.message });
     sendError(ws, err.message ?? 'Falha na autenticação', 'AUTH_FAILED');
     ws.close();
+  } finally {
+    session.authenticating = false;
   }
 }
 
@@ -761,8 +756,9 @@ async function cleanupSession(ws: WebSocket): Promise<void> {
     session.botManager.removeAllListeners();
   }
 
-  // safeTerminateDerivWs() — ver comentário completo na definição.
   safeTerminateDerivWs(session);
+  session.derivWs = null;
+  session.adapter = null;
 }
 
 // ─── Tipos de mensagem de bots ────────────────────────────────
@@ -785,15 +781,24 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   logger.info('[WS] Client connected', { ip, sessions: sessions.size + 1 });
 
   const session: ClientSession = {
-    derivWs: null, derivMessageHandler: null,
+    derivWs: null, derivMessageHandler: null, derivPingInterval: null, adapter: null,
     token: '', accountId: null, currency: 'USD',
     pingInterval: null, authTimeout: null, reconnectTimer: null,
-    reconnectAttempts: 0, authenticated: false, isAdmin: false,
-    botManager: null, nextReqId: 1000,
+    reconnectAttempts: 0, authenticated: false, authenticating: false,
+    isAdmin: false, isAlive: true,
+    botManager: null, nextReqId: 900_000,
+    clientSubs: new Map(), msgWindowStart: 0, msgCount: 0,
   };
   sessions.set(ws, session);
 
+  // Ping ao cliente com deteção de ligação morta (half-open)
   session.pingInterval = setInterval(() => {
+    if (!session.isAlive) {
+      logger.warn('[WS] Cliente sem pong — a terminar sessão', { ip });
+      ws.terminate();
+      return;
+    }
+    session.isAlive = false;
     if (ws.readyState === WebSocket.OPEN) ws.ping();
   }, config.websocket.heartbeatInterval);
 
@@ -811,6 +816,16 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   }
 
   ws.on('message', async (raw: Buffer) => {
+    session.isAlive = true; // qualquer tráfego prova que está vivo
+
+    // limite de mensagens por segundo
+    const now = Date.now();
+    if (now - session.msgWindowStart >= 1000) { session.msgWindowStart = now; session.msgCount = 0; }
+    if (++session.msgCount > CLIENT_MSGS_PER_SEC) {
+      sendError(ws, 'Demasiadas mensagens. Abranda.', 'RATE_LIMITED');
+      return;
+    }
+
     let data: Record<string, unknown>;
     try { data = JSON.parse(raw.toString('utf8')); } catch {
       sendError(ws, 'JSON inválido', 'PARSE_ERROR'); return;
@@ -819,60 +834,73 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     const type    = data.type as string | undefined;
     const payload = (data.payload ?? {}) as Record<string, unknown>;
 
-    if (type === 'auth') {
-      const token = (payload.token ?? data.token) as string;
-      if (!token) { sendError(ws, 'Token em falta', 'MISSING_TOKEN'); return; }
-      await authenticateClient(ws, token, (payload.accountId ?? data.accountId) as string | undefined);
-      return;
-    }
+    try {
+      if (type === 'auth') {
+        const token = (payload.token ?? data.token) as string;
+        if (!token) { sendError(ws, 'Token em falta', 'MISSING_TOKEN'); return; }
+        await authenticateClient(ws, token, (payload.accountId ?? data.accountId) as string | undefined);
+        return;
+      }
 
-    if (type === 'ping') { sendToClient(ws, 'pong'); return; }
+      if (type === 'ping') { sendToClient(ws, 'pong'); return; }
 
-    if (type === 'switch_account') {
-      if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
-      const newId = (payload.accountId ?? data.accountId) as string;
-      if (!newId) { sendError(ws, 'accountId em falta', 'MISSING_ACCOUNT'); return; }
-      await authenticateClient(ws, session.token, newId);
-      return;
-    }
+      if (type === 'switch_account') {
+        if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
+        const newId = (payload.accountId ?? data.accountId) as string;
+        if (!newId) { sendError(ws, 'accountId em falta', 'MISSING_ACCOUNT'); return; }
+        await authenticateClient(ws, session.token, newId);
+        return;
+      }
 
-    // ── Operar Manual ──────────────────────────────────────────
-    if (type === 'manual_buy') {
-      if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
-      await handleManualBuy(ws, session, payload);
-      return;
-    }
+      if (type === 'manual_buy') {
+        if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
+        await handleManualBuy(ws, session, payload);
+        return;
+      }
 
-    if (type && BOT_MESSAGE_TYPES.has(type)) {
-      if (type !== 'list_bots' && !session.authenticated) {
+      if (type && BOT_MESSAGE_TYPES.has(type)) {
+        if (type !== 'list_bots' && !session.authenticated) {
+          sendError(ws, 'Não autenticado', 'NOT_AUTH'); return;
+        }
+        await handleBotMessage(ws, session, type, payload);
+        return;
+      }
+
+      if (!session.authenticated || !session.derivWs) {
         sendError(ws, 'Não autenticado', 'NOT_AUTH'); return;
       }
-      await handleBotMessage(ws, session, type, payload);
-      return;
-    }
+      if (session.derivWs.readyState !== WebSocket.OPEN) {
+        sendError(ws, 'Deriv WS não conectado', 'DERIV_DISCONNECTED'); return;
+      }
 
-    if (!session.authenticated || !session.derivWs) {
-      sendError(ws, 'Não autenticado', 'NOT_AUTH'); return;
-    }
-    if (session.derivWs.readyState === WebSocket.OPEN) {
+      // ── Proxy genérico frontend → Deriv ──
       const { type: _t, payload: _p, ...rest } = data;
       const rawPayload = (_p && Object.keys(_p as object).length > 0)
         ? _p as Record<string, unknown>
         : rest as Record<string, unknown>;
 
+      // forget_all do frontend: só as suas subscrições (os bots partilham o WS)
+      if ('forget_all' in rawPayload) {
+        handleClientForgetAll(ws, session, rawPayload);
+        return;
+      }
+      if (typeof rawPayload.forget === 'string') session.clientSubs.delete(rawPayload.forget);
+
+      // req_id do frontend fica abaixo de 1M; ids internos (bots) são >= 1M
       const existingReqId = rawPayload.req_id;
-      const numericReqId = (typeof existingReqId === 'number' && Number.isInteger(existingReqId) && existingReqId > 0)
+      const numericReqId = (typeof existingReqId === 'number' && Number.isInteger(existingReqId)
+        && existingReqId > 0 && existingReqId < CLIENT_REQ_ID_LIMIT)
         ? existingReqId
         : getNextReqId(session);
 
-      const derivPayload = { ...rawPayload, req_id: numericReqId };
-      session.derivWs.send(JSON.stringify(derivPayload));
-    } else {
-      sendError(ws, 'Deriv WS não conectado', 'DERIV_DISCONNECTED');
+      session.derivWs.send(JSON.stringify({ ...rawPayload, req_id: numericReqId }));
+    } catch (err: any) {
+      logger.error('[WS] Erro ao processar mensagem do cliente', { type, error: err?.message });
+      sendError(ws, err?.message ?? 'Erro interno', 'INTERNAL_ERROR');
     }
   });
 
-  ws.on('pong', () => { /* vivo */ });
+  ws.on('pong', () => { session.isAlive = true; });
 
   ws.on('close', async () => {
     logger.info('[WS] Client disconnected', { ip });
@@ -895,10 +923,7 @@ app.use(sanitizationMiddleware);
 app.use(urlEncodedMiddleware);
 app.use(requestLoggerMiddleware);
 
-// ── Health check ANTES do rate limiter ──────────────────────
-// Plataformas como o Render fazem polling frequente deste endpoint.
-// Se ficasse depois do apiLimiter, o polling normal estourava o rate
-// limit (429) e o Render reiniciava a instância por a achar doente.
+// /health ANTES do rate limiter (o polling do Render recebia 429)
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok', timestamp: new Date().toISOString(),
@@ -935,9 +960,9 @@ app.use('/api/trading',              tradingRoutes);
 app.use('/api/bots',                 botsRoutes);
 app.use('/api/admin',                adminRoutes);
 app.use('/api/admin/labels',         labelsRoutes);
-app.use('/api/admin/users',          adminUsersRoutes);         // stats/listagem/bloqueio de utilizadores locais
-app.use('/api/notifications',        notificationsRoutes);      // leitura de notificações (dashboard)
-app.use('/api/admin/notifications',  adminNotificationsRoutes); // gestão de notificações (painel admin)
+app.use('/api/admin/users',          adminUsersRoutes);
+app.use('/api/notifications',        notificationsRoutes);
+app.use('/api/admin/notifications',  adminNotificationsRoutes);
 app.use(notFoundHandler);
 app.use(errorHandler);
 
@@ -963,14 +988,18 @@ const startServer = async () => {
 // ============================================
 const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} recebido, a encerrar...`);
-  for (const [clientWs] of sessions) { await cleanupSession(clientWs); clientWs.close(); }
+  const forceExit = setTimeout(() => process.exit(1), 30_000);
+  forceExit.unref?.();
+  await Promise.allSettled([...sessions.keys()].map(async (clientWs) => {
+    await cleanupSession(clientWs);
+    clientWs.close();
+  }));
   wss.close(() => logger.info('WS server fechado'));
   server.close(async () => {
     try { await closeRedis(); } catch { /* ignorar */ }
     destroyMemoryStore();
     process.exit(0);
   });
-  setTimeout(() => process.exit(1), 30_000);
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

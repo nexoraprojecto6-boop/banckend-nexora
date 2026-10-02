@@ -4,60 +4,45 @@
 // CORRECÇÕES DESTA VERSÃO:
 //   ✅ setupDerivMessageHandler: remove listener 'message' antigo
 //      antes de adicionar novo — evita acumulação de listeners em
-//      cada reconexão (cada reconexão criava um novo handler mas
-//      nunca removia o anterior, causando mensagens duplicadas e
-//      fuga de memória)
+//      cada reconexão
 //   ✅ Deduplicação de sessões por accountId
 //   ✅ Reconexão Deriv com novo OTP obrigatório
 //   ✅ Bot aguarda WS disponível (waitForDerivWs)
 //   ✅ Limite de sessões simultâneas (DoS protection)
 //   ✅ Timeout de autenticação (30s)
 //   ✅ Cleanup completo em todos os caminhos
-//   ✅ trust proxy + cookie-parser — corrige "Cookie PKCE
-//      não encontrado" no fluxo OAuth entre Vercel (frontend) e
-//      Render (backend, atrás de proxy reverso)
-//   ✅ NOVO: rotas de administração de utilizadores locais
+//   ✅ trust proxy + cookie-parser — corrige "Cookie PKCE não
+//      encontrado" no fluxo OAuth entre Vercel (frontend) e Render
+//      (backend, atrás de proxy reverso)
+//   ✅ Rotas de administração de utilizadores locais
 //      (/api/admin/users) — login local com email/senha,
 //      independente do fluxo OAuth Deriv
-//   ✅ NOVO: rotas de notificações broadcast
-//      (/api/notifications leitura, /api/admin/notifications
-//      gestão) — sino no dashboard + criação/remoção no painel admin
-//   ✅ CORREÇÃO CRÍTICA (uncaught exception):
-//      terminate() num WebSocket que ainda está em handshake
-//      (readyState === CONNECTING) faz a lib `ws` emitir
-//      internamente um evento 'error' com a mensagem
-//      "WebSocket was closed before the connection was
-//      established". Como removeAllListeners() era chamado
-//      IMEDIATAMENTE ANTES de terminate(), esse 'error' ficava
-//      sem nenhum listener — e o Node trata EventEmitter 'error'
-//      sem listener como excepção não tratada, derrubando o
-//      processo inteiro (ver process.on('uncaughtException')
-//      no fim deste ficheiro, que faz process.exit(1)).
-//      Correção: antes de terminate(), se o socket ainda está
-//      CONNECTING, anexa-se um listener 'error' no-op para
-//      absorver esse evento esperado. Aplicado em dois pontos:
-//      authenticateClient() e cleanupSession().
-//   ✅ CORREÇÃO: /health movido para ANTES do apiLimiter — o
-//      healthcheck do Render faz polling frequente nesse
-//      endpoint e estava sendo bloqueado com 429 pelo rate
-//      limiter, o que fazia o Render considerar a instância
-//      "não saudável" e reiniciá-la (visto no log de 21/07,
-//      00:12–00:14: "Rate limit exceeded" em loop → SIGTERM →
-//      restart da instância).
-//   ✅ NOVO (Operar Manual): handler `manual_buy` — faz
-//      proposal→buy→acompanhamento do fecho do contrato na
-//      Deriv, reaproveitando o MessageRouter (message-router.ts)
-//      sobre a MESMA ligação Deriv da sessão (não abre segunda
-//      ligação, não interfere com o BotManager). Campos e tipos
-//      seguem a documentação oficial da Deriv:
-//        - o campo do símbolo é `underlying_symbol` (não `symbol`)
-//        - `duration_unit` aceita "d","m","s","h","t" (não "ticks")
-//        - `proposal_open_contract.profit`/`buy_price`/`payout`
-//          vêm como STRING — sempre convertidos com Number()
-//        - `is_sold` é 0/1 (integer), não boolean
+//   ✅ Rotas de notificações broadcast (/api/notifications leitura,
+//      /api/admin/notifications gestão)
+//   ✅ CORREÇÃO CRÍTICA (uncaught exception): terminate() num
+//      WebSocket em handshake (CONNECTING) faz a lib `ws` emitir um
+//      'error' interno. Se removeAllListeners() foi chamado antes,
+//      esse 'error' fica sem listener e derruba o processo. Por isso
+//      safeTerminateDerivWs() anexa um listener 'error' no-op antes
+//      de terminar um socket ainda a ligar.
+//   ✅ CORREÇÃO: /health antes do apiLimiter — o healthcheck do
+//      Render fazia polling e recebia 429, o que reiniciava a
+//      instância.
+//   ✅ Operar Manual: handler `manual_buy` (proposal → buy →
+//      acompanhamento do fecho), sobre a MESMA ligação Deriv da
+//      sessão. Campos segundo a doc oficial da Deriv:
+//        - `underlying_symbol` (não `symbol`)
+//        - `duration_unit` aceita "d","m","s","h","t"
+//        - profit/buy_price/payout vêm como STRING -> Number()
+//        - `is_sold` é 0/1 (integer)
 //        - não existe `exit_tick`; o campo certo é `exit_spot`
-//          (string, preço) — o último dígito é calculado a partir
-//          dele, tal como no ChartSection/OperarManualPage
+//   ✅ NOVO: listener 'error' do derivWs é permanente (on, não once).
+//      Com once, um segundo erro depois de a ligação abrir ficava
+//      sem listener e derrubava o processo.
+//   ✅ NOVO: reconnectTimer anterior é cancelado antes de agendar
+//      outro — evita dois timers de reconexão em simultâneo.
+//   ✅ NOVO: proposal_open_contract reencaminha exit_spot (o campo
+//      real da Deriv) em vez de exit_tick.
 // ============================================================
 
 import 'express-async-errors';
@@ -81,15 +66,15 @@ import botsRoutes              from '@routes/bots.routes.js';
 import adminRoutes             from '@routes/admin.routes.js';
 import labelsRoutes            from '@routes/labels.routes.js';
 import adminUsersRoutes        from '@routes/admin-users.routes.js';
-import notificationsRoutes     from '@routes/notifications.routes.js';        // ← NOVO
-import adminNotificationsRoutes from '@routes/admin-notifications.routes.js'; // ← NOVO
+import notificationsRoutes     from '@routes/notifications.routes.js';
+import adminNotificationsRoutes from '@routes/admin-notifications.routes.js';
 import { DerivAPIService } from '@services/deriv-api.service.js';
 import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
 import { BotEvent, BotConfig, BotStrategyType } from './bots/bot.types.js';
 import { seedBotCatalog } from './bots/catalog-seed.js';
-import { getMessageRouter } from './bots/message-router.js'; // ← NOVO (Operar Manual)
+import { getMessageRouter } from './bots/message-router.js';
 
 // ─── Limites ──────────────────────────────────────────────────
 const MAX_SESSIONS        = 100;
@@ -107,14 +92,10 @@ const ADMIN_IDS = new Set<string>(
 // ─── App & HTTP Server ────────────────────────────────────────
 const app: Application = express();
 
-// CRÍTICO: trust proxy ANTES de qualquer middleware que dependa
-// de detecção correta de HTTPS (cookies secure, req.protocol,
-// req.ip, etc.). O Render (como o Railway) fica atrás de um
-// proxy reverso — sem isto, o Express não confia no header
-// X-Forwarded-Proto e pode tratar a ligação como HTTP mesmo
-// sendo HTTPS real, fazendo cookies com `secure: true` falharem
-// silenciosamente. Isto era a causa de "Cookie PKCE não
-// encontrado" no fluxo de login.
+// CRÍTICO: trust proxy ANTES de qualquer middleware que dependa de
+// detecção correta de HTTPS (cookies secure, req.protocol, req.ip).
+// O Render fica atrás de um proxy reverso — sem isto, o Express pode
+// tratar a ligação como HTTP mesmo sendo HTTPS real.
 app.set('trust proxy', 1);
 
 const server = http.createServer(app);
@@ -126,7 +107,7 @@ interface ClientSession {
   derivMessageHandler:  ((raw: Buffer) => void) | null;
   token:                string;
   accountId:            string | null;
-  currency:             string; // ← NOVO (Operar Manual): moeda da conta activa
+  currency:             string; // moeda da conta ativa (Operar Manual)
   pingInterval:         NodeJS.Timeout | null;
   authTimeout:          NodeJS.Timeout | null;
   reconnectTimer:       NodeJS.Timeout | null;
@@ -157,21 +138,13 @@ function getNextReqId(session: ClientSession): number {
 }
 
 // ─── Encerrar derivWs com segurança ───────────────────────────
-// CORREÇÃO CRÍTICA: nunca chamar terminate() logo após
-// removeAllListeners() sem antes verificar se o socket ainda
-// está a meio do handshake (CONNECTING). Nesse estado, o
-// terminate() da lib `ws` invoca internamente abortHandshake(),
-// que emite um evento 'error' síncrono com a mensagem
-// "WebSocket was closed before the connection was established".
-// Se não houver NENHUM listener de 'error' registado nesse
-// momento (porque acabámos de os remover todos), o Node trata
-// isso como uma excepção não tratada (EventEmitter sem listener
-// de 'error' == throw), o que derruba o processo inteiro através
-// do handler process.on('uncaughtException') → process.exit(1).
-//
-// Esta função centraliza o encerramento seguro do derivWs e é
-// usada tanto em authenticateClient() como em cleanupSession(),
-// eliminando a duplicação do bug nos dois pontos.
+// Nunca chamar terminate() logo após removeAllListeners() sem antes
+// verificar se o socket ainda está a meio do handshake (CONNECTING).
+// Nesse estado, terminate() invoca abortHandshake(), que emite um
+// 'error' síncrono ("WebSocket was closed before the connection was
+// established"). Sem nenhum listener de 'error', o Node trata isso
+// como excepção não tratada e o processo cai (uncaughtException ->
+// process.exit(1)). Usada em authenticateClient() e cleanupSession().
 function safeTerminateDerivWs(session: ClientSession): void {
   const ws = session.derivWs;
   if (!ws) return;
@@ -186,19 +159,15 @@ function safeTerminateDerivWs(session: ClientSession): void {
   ws.removeAllListeners();
 
   if (isConnecting) {
-    // Absorve o 'error' esperado do abortHandshake interno da lib
-    // ws — isto é comportamento normal quando se aborta um
-    // handshake ainda em curso, não um erro real da aplicação.
+    // Absorve o 'error' esperado do abortHandshake interno da lib ws.
     ws.on('error', () => { /* esperado ao abortar handshake em curso — ignorar */ });
   }
 
   try {
     ws.terminate();
   } catch (err: any) {
-    // Rede de segurança adicional: mesmo com a checagem de
-    // readyState acima, socket internals do `ws` podem ter uma
-    // corrida (ex: cleanup chamado duas vezes para a mesma
-    // sessão). Nunca deixar isto escapar como uncaught exception.
+    // Rede de segurança: socket internals do `ws` podem ter uma corrida
+    // (ex.: cleanup chamado duas vezes para a mesma sessão).
     logger.warn('[WS] Erro ao terminar derivWs (ignorado)', { message: err?.message });
   }
 }
@@ -284,7 +253,10 @@ function buildDerivMessageHandler(
         sendToClient(clientWs, 'proposal_open_contract', {
           contract_id: poc?.contract_id, is_sold: poc?.is_sold,
           profit: poc?.profit, status: poc?.status,
-          entry_tick: poc?.entry_tick, exit_tick: poc?.exit_tick, payout: poc?.payout,
+          entry_tick: poc?.entry_tick,
+          // A Deriv devolve `exit_spot`; `exit_tick` fica como fallback.
+          exit_tick: poc?.exit_spot ?? poc?.exit_tick,
+          payout: poc?.payout,
         });
         break;
       }
@@ -328,9 +300,12 @@ async function connectToDerivWS(
       resolve();
     });
 
-    derivWs.once('error', (err) => {
+    // PERMANENTE (on, não once): erros depois de a ligação abrir também
+    // têm de ter listener, senão o Node trata-os como excepção não
+    // tratada. Se a Promise já estiver resolvida, reject() é no-op.
+    derivWs.on('error', (err) => {
       clearTimeout(timeout);
-      logger.error('[WS] Deriv WS error on connect', { message: err.message });
+      logger.error('[WS] Deriv WS error', { message: err.message });
       reject(err);
     });
 
@@ -368,6 +343,9 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
   logger.info('[WS] Reconexão Deriv agendada', {
     attempt: session.reconnectAttempts, delayMs: delay, accountId: session.accountId,
   });
+
+  // Garante um único timer de reconexão por sessão.
+  if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
 
   session.reconnectTimer = setTimeout(async () => {
     if (clientWs.readyState !== WebSocket.OPEN) return;
@@ -534,18 +512,16 @@ async function handleBotMessage(
 }
 
 // ─── Compra manual (Over/Under, Matches/Differs, Rise/Fall...) ─
-// ============================================================
 // Segue à risca a documentação oficial da Deriv:
 //   - proposal / buy usam `underlying_symbol` (não `symbol`)
 //   - duration_unit: "d","m","s","h","t" (não "ticks")
-//   - proposal_open_contract.profit / buy_price / payout são
-//     STRING na resposta da Deriv — sempre convertidos com Number()
+//   - proposal_open_contract.profit / buy_price / payout são STRING
+//     na resposta da Deriv — sempre convertidos com Number()
 //   - is_sold é 0/1 (integer), não boolean
-//   - não existe `exit_tick`; o campo certo é `exit_spot`
-//     (preço, string) — o dígito de saída é calculado a partir dele
-//   - erros chegam como { error: { code, message }, msg_type }
-//     (o MessageRouter.request() já rejeita a Promise nesse caso)
-// ============================================================
+//   - não existe `exit_tick`; o campo certo é `exit_spot` (preço,
+//     string) — o dígito de saída é calculado a partir dele
+//   - erros chegam como { error: { code, message }, msg_type } (o
+//     MessageRouter.request() já rejeita a Promise nesse caso)
 
 const DIGIT_CONTRACT_TYPES = new Set([
   'DIGITOVER', 'DIGITUNDER', 'DIGITMATCH', 'DIGITDIFF', 'DIGITODD', 'DIGITEVEN',
@@ -604,7 +580,7 @@ async function handleManualBuy(
       currency: session.currency || 'USD',
       duration,
       duration_unit: mapDurationUnit(durationUnit),
-      underlying_symbol: symbol, // ← campo correcto segundo a doc Deriv
+      underlying_symbol: symbol, // campo correcto segundo a doc Deriv
     };
     if (DIGIT_CONTRACT_TYPES.has(contractType) && barrier !== undefined && barrier !== null && barrier !== '') {
       proposalPayload.barrier = String(barrier);
@@ -696,9 +672,8 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     session.botManager = null;
   }
 
-  // CORREÇÃO: usa safeTerminateDerivWs() em vez de
-  // removeAllListeners() + terminate() diretos, para evitar
-  // uncaught exception quando o socket ainda está CONNECTING.
+  // safeTerminateDerivWs() em vez de removeAllListeners() + terminate()
+  // diretos, para evitar uncaught exception com o socket em CONNECTING.
   safeTerminateDerivWs(session);
   session.derivWs = null;
 
@@ -726,7 +701,7 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
 
     session.token         = token;
     session.accountId     = targetAccountId;
-    session.currency      = target.currency ?? 'USD'; // ← NOVO (Operar Manual)
+    session.currency      = target.currency ?? 'USD';
     session.isAdmin       = ADMIN_IDS.has(targetAccountId);
     session.authenticated = true;
     session.reconnectAttempts = 0;
@@ -786,10 +761,7 @@ async function cleanupSession(ws: WebSocket): Promise<void> {
     session.botManager.removeAllListeners();
   }
 
-  // CORREÇÃO CRÍTICA (era a causa do crash original):
-  // usa safeTerminateDerivWs() em vez de removeAllListeners() +
-  // terminate() diretos. Ver comentário completo na definição
-  // da função, no topo do ficheiro.
+  // safeTerminateDerivWs() — ver comentário completo na definição.
   safeTerminateDerivWs(session);
 }
 
@@ -814,7 +786,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
 
   const session: ClientSession = {
     derivWs: null, derivMessageHandler: null,
-    token: '', accountId: null, currency: 'USD', // ← NOVO (Operar Manual)
+    token: '', accountId: null, currency: 'USD',
     pingInterval: null, authTimeout: null, reconnectTimer: null,
     reconnectAttempts: 0, authenticated: false, isAdmin: false,
     botManager: null, nextReqId: 1000,
@@ -864,7 +836,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       return;
     }
 
-    // ── NOVO: Operar Manual ────────────────────────────────────
+    // ── Operar Manual ──────────────────────────────────────────
     if (type === 'manual_buy') {
       if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
       await handleManualBuy(ws, session, payload);
@@ -924,17 +896,9 @@ app.use(urlEncodedMiddleware);
 app.use(requestLoggerMiddleware);
 
 // ── Health check ANTES do rate limiter ──────────────────────
-// CORREÇÃO: plataformas como o Render fazem polling frequente
-// deste endpoint (a cada poucos segundos) para decidir se a
-// instância está saudável. Enquanto /health ficava DEPOIS do
-// apiLimiter, esse polling normal estourava o rate limit e
-// passava a receber 429 — o Render interpretou isso como
-// instância não saudável e forçou um restart (ver log de
-// 21/07 00:12–00:14: "Rate limit exceeded" em loop seguido de
-// "SIGTERM recebido, a encerrar..." e restart da instância).
-// Colocando /health antes do apiLimiter, ele nunca passa pelo
-// rate limiter e o healthcheck da plataforma nunca mais falha
-// por esse motivo.
+// Plataformas como o Render fazem polling frequente deste endpoint.
+// Se ficasse depois do apiLimiter, o polling normal estourava o rate
+// limit (429) e o Render reiniciava a instância por a achar doente.
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok', timestamp: new Date().toISOString(),
@@ -972,8 +936,8 @@ app.use('/api/bots',                 botsRoutes);
 app.use('/api/admin',                adminRoutes);
 app.use('/api/admin/labels',         labelsRoutes);
 app.use('/api/admin/users',          adminUsersRoutes);         // stats/listagem/bloqueio de utilizadores locais
-app.use('/api/notifications',        notificationsRoutes);      // ← NOVO: leitura de notificações (dashboard)
-app.use('/api/admin/notifications',  adminNotificationsRoutes); // ← NOVO: gestão de notificações (painel admin)
+app.use('/api/notifications',        notificationsRoutes);      // leitura de notificações (dashboard)
+app.use('/api/admin/notifications',  adminNotificationsRoutes); // gestão de notificações (painel admin)
 app.use(notFoundHandler);
 app.use(errorHandler);
 

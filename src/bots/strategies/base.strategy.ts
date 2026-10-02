@@ -1,5 +1,21 @@
 // ============================================================
-// NEXORA FOREX — Base Strategy
+// NEXORA FOREX — Base Strategy v2
+// ============================================================
+// Correcções vs v1:
+//   ✅ Loop sem "tempo morto": o atraso do próximo ciclo desconta o
+//      tempo que o tick() já demorou (antes: +1 s extra DEPOIS de cada
+//      contrato terminar)
+//   ✅ Geração do loop: stop()+start() rápido já não cria 2 loops
+//   ✅ start(): se onStart() falhar, o bot não fica "running" fantasma
+//   ✅ setError(): limpa timer e chama onStop() (subscrições de ticks
+//      ficavam vivas e podiam continuar a operar um bot em erro)
+//   ✅ checkStopConditions: não dispara 2× goal_reached/stop; stop()
+//      sem await já não gera unhandled rejection
+//   ✅ maxLoss compara a PERDA LÍQUIDA (era a soma bruta das perdas:
+//      um bot com +50 de lucro líquido parava por "max loss")
+//   ✅ Um erro transitório (timeout/rate limit) já não mata o bot:
+//      só após 3 erros seguidos. Erros de auth/saldo param logo.
+//   ✅ getState() devolve cópias de stats/config
 // ============================================================
 
 import { EventEmitter } from 'events';
@@ -17,6 +33,11 @@ import {
   DerivWsAdapter,
 } from '../bot.types.js';
 import { DerivApiError } from '../deriv-ws.adapter.js';
+
+const FATAL_AUTH_CODES = new Set([
+  'InvalidToken', 'AuthorizationRequired', 'Unauthorized', 'PermissionDenied',
+]);
+const MAX_CONSECUTIVE_ERRORS = 3;
 
 export function createInitialStats(initialStake: number): BotStats {
   return {
@@ -38,17 +59,12 @@ export abstract class BaseStrategy extends EventEmitter {
   protected state: BotState;
   protected active = false;
   protected derivWs: DerivWsAdapter;
+  protected consecutiveErrors = 0;
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
+  private generation = 0;
 
-  // Estratégias orientadas a EVENTOS DE TICK (Scalper, Alfha,
-  // Over1Recovery) já abrem os seus trades a partir da subscrição de
-  // ticks (onTick), fora deste loop. Para essas, o loop periódico
-  // abaixo não faz nada útil (o tick() delas é um no-op) — só
-  // desperdiça um timer e atrasava até getTickDelay() a verificação
-  // de stop loss / take profit. As subclasses marcam
-  // `this.skipTickLoop = true` no construtor e chamam
-  // `this.checkStopConditions()` elas próprias, logo a seguir a cada
-  // resultado de trade.
+  // Estratégias orientadas a tick marcam skipTickLoop = true e chamam
+  // checkStopConditions() elas próprias após cada resultado.
   protected skipTickLoop = false;
 
   constructor(
@@ -76,29 +92,46 @@ export abstract class BaseStrategy extends EventEmitter {
   async start(): Promise<void> {
     if (this.active) return;
     this.active = true;
+    this.consecutiveErrors = 0;
+    this.generation++;
     this.setStatus('running');
     this.state.startedAt = new Date();
     this.log('info', `Bot "${this.state.name}" iniciado — estratégia: ${this.state.strategy}`);
     this.emit('bot:started', this.buildEvent('bot:started', {}));
-    await this.onStart();
+
+    try {
+      await this.onStart();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log('error', `Falha ao iniciar: ${msg}`);
+      this.setError(msg);
+      throw err;
+    }
+
     if (!this.skipTickLoop) this.scheduleNextTick();
   }
 
   async stop(reason = 'manual'): Promise<void> {
     if (!this.active && this.state.status === 'stopped') return;
     this.active = false;
-    if (this.loopTimer) clearTimeout(this.loopTimer);
+    this.generation++;
+    this.clearLoopTimer();
     this.setStatus('stopped');
     this.state.stoppedAt = new Date();
     this.log('info', `Bot parado — motivo: ${reason}`);
     this.emit('bot:stopped', this.buildEvent('bot:stopped', { reason }));
-    await this.onStop();
+    try {
+      await this.onStop();
+    } catch (err) {
+      this.log('error', `Erro no onStop: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   pause(): void {
     if (this.state.status !== 'running') return;
     this.active = false;
-    if (this.loopTimer) clearTimeout(this.loopTimer);
+    this.generation++;
+    this.clearLoopTimer();
     this.setStatus('paused');
     this.log('info', 'Bot pausado');
     this.emit('bot:paused', this.buildEvent('bot:paused', {}));
@@ -107,6 +140,7 @@ export abstract class BaseStrategy extends EventEmitter {
   async resume(): Promise<void> {
     if (this.state.status !== 'paused') return;
     this.active = true;
+    this.generation++;
     this.setStatus('running');
     this.log('info', 'Bot retomado');
     this.emit('bot:resumed', this.buildEvent('bot:resumed', {}));
@@ -114,7 +148,12 @@ export abstract class BaseStrategy extends EventEmitter {
   }
 
   getState(): BotState {
-    return { ...this.state, logs: [...this.state.logs] };
+    return {
+      ...this.state,
+      config: { ...this.state.config },
+      stats: { ...this.state.stats },
+      logs: [...this.state.logs],
+    };
   }
 
   // ─── Hooks abstratos ──────────────────────────────────────
@@ -126,27 +165,33 @@ export abstract class BaseStrategy extends EventEmitter {
 
   // ─── Loop interno ─────────────────────────────────────────
 
-  private scheduleNextTick(): void {
+  private clearLoopTimer(): void {
+    if (this.loopTimer) {
+      clearTimeout(this.loopTimer);
+      this.loopTimer = null;
+    }
+  }
+
+  private scheduleNextTick(elapsedMs = 0): void {
     if (!this.active) return;
+    const gen = this.generation;
+    // desconta o tempo que o tick() anterior já gastou
+    const delay = Math.max(0, this.getTickDelay() - elapsedMs);
+
     this.loopTimer = setTimeout(async () => {
+      if (!this.active || gen !== this.generation) return;
+      const t0 = Date.now();
       try {
         await this.tick();
         this.checkStopConditions();
       } catch (err) {
         await this.handleUnexpectedError(err);
       }
-      if (this.active) this.scheduleNextTick();
-    }, this.getTickDelay());
+      if (this.active && gen === this.generation) this.scheduleNextTick(Date.now() - t0);
+    }, delay);
   }
 
   // ─── Tratamento de erros partilhado ───────────────────────
-  // Usado tanto pelo loop acima como pelas estratégias orientadas a
-  // tick (que chamam isto diretamente no catch do seu placeTrade,
-  // já que o erro delas nunca passaria por aqui — acontece fora do
-  // loop, na subscrição de ticks). Antes desta extração, as
-  // estratégias orientadas a tick tinham cada uma o seu próprio
-  // tratamento de erro (ou nenhum), e nenhuma delas parava o bot ao
-  // detetar saldo insuficiente — só esta função central o fazia.
 
   protected async handleUnexpectedError(err: unknown): Promise<void> {
     if (err instanceof DerivApiError && err.code === 'InsufficientBalance') {
@@ -157,41 +202,51 @@ export abstract class BaseStrategy extends EventEmitter {
       await this.stop('insufficient_balance');
       return;
     }
+
     const msg = err instanceof Error ? err.message : String(err);
-    this.log('error', `Erro na operação: ${msg}`);
-    this.setError(msg);
+
+    if (err instanceof DerivApiError && FATAL_AUTH_CODES.has(err.code)) {
+      this.log('error', `Erro de autenticação (${err.code}): ${msg} — bot parado.`);
+      this.setError(`${err.code}: ${msg}`);
+      return;
+    }
+
+    this.consecutiveErrors++;
+    this.log('error', `Erro na operação (${this.consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${msg}`);
+    if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      this.setError(msg);
+    }
   }
 
-  // ─── Verificação de condições de parada ───────────────────
-  // Emite bot:goal_reached com o motivo exacto ANTES de parar,
-  // para o frontend poder mostrar uma mensagem clara: meta atingida
-  // (take profit), stop de perda (max loss), ou limite de trades.
+  // ─── Condições de paragem ─────────────────────────────────
 
   protected checkStopConditions(): void {
+    if (!this.active) return; // já parado/pausado: evita eventos duplicados
+
     const { maxTrades, maxLoss, maxProfit } = this.state.config;
     const { totalTrades, totalLoss, netPnL } = this.state.stats;
+    const netLoss = -netPnL;
+
+    let reason: string | null = null;
+    let extra: Record<string, unknown> = {};
 
     if (maxTrades && maxTrades > 0 && totalTrades >= maxTrades) {
-      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
-        reason: 'max_trades_reached', totalTrades, maxTrades,
-      }));
-      this.stop('max_trades_reached');
-      return;
+      reason = 'max_trades_reached';
+      extra = { totalTrades, maxTrades };
+    } else if (maxLoss && maxLoss > 0 && netLoss >= maxLoss) {
+      reason = 'max_loss_reached';
+      extra = { totalLoss, netLoss, maxLoss };
+    } else if (maxProfit && maxProfit > 0 && netPnL >= maxProfit) {
+      reason = 'max_profit_reached';
+      extra = { netPnL, maxProfit };
     }
-    if (maxLoss && totalLoss >= maxLoss) {
-      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
-        reason: 'max_loss_reached', totalLoss, maxLoss,
-      }));
-      this.stop('max_loss_reached');
-      return;
-    }
-    if (maxProfit && netPnL >= maxProfit) {
-      this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', {
-        reason: 'max_profit_reached', netPnL, maxProfit,
-      }));
-      this.stop('max_profit_reached');
-      return;
-    }
+
+    if (!reason) return;
+
+    this.emit('bot:goal_reached', this.buildEvent('bot:goal_reached', { reason, ...extra }));
+    this.stop(reason).catch((err) => {
+      this.log('error', `Falha ao parar (${reason}): ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   // ─── Registo de resultado de trade ───────────────────────
@@ -199,6 +254,7 @@ export abstract class BaseStrategy extends EventEmitter {
   protected recordTradeResult(result: TradeResult): void {
     const s = this.state.stats;
     s.totalTrades += 1;
+    this.consecutiveErrors = 0;
 
     if (result.won) {
       s.wins += 1;
@@ -215,9 +271,6 @@ export abstract class BaseStrategy extends EventEmitter {
     s.peakProfit = Math.max(s.peakProfit, s.netPnL);
     s.maxDrawdown = Math.max(s.maxDrawdown, s.peakProfit - s.netPnL);
 
-    // contractType incluído para a UI mostrar a coluna "Tipo" (ex: CALL,
-    // PUT, DIGITOVER); exitTick/entryTick e exitDigit (já calculado pela
-    // estratégia, quando disponível) para a coluna "Tick Final".
     this.emit('bot:trade_closed', this.buildEvent('bot:trade_closed', {
       contractId:   result.contractId,
       profit:       result.profit,
@@ -238,10 +291,16 @@ export abstract class BaseStrategy extends EventEmitter {
   }
 
   protected setError(message: string): void {
+    this.active = false;
+    this.generation++;
+    this.clearLoopTimer();
     this.state.status = 'error';
     this.state.lastError = message;
-    this.active = false;
     this.emit('bot:error', this.buildEvent('bot:error', { error: message }));
+    // libertar subscrições de ticks/contratos
+    this.onStop().catch((err) => {
+      this.log('error', `Erro no onStop (após erro): ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   protected log(level: LogLevel, message: string, data?: Record<string, unknown>): void {

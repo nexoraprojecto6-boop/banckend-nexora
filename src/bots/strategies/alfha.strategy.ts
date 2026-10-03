@@ -157,6 +157,7 @@ export class AlfhaStrategy extends BaseStrategy {
         exitTime: new Date(),
       };
 
+      this.tradeContractType = side;
       this.recordTradeResult(tradeResult);
       this.adjustStake(result.won, Math.abs(result.profit));
 

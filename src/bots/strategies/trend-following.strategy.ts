@@ -1,34 +1,47 @@
 // ============================================================
-// NEXORA FOREX — Trend Following Strategy
+// NEXORA FOREX — Trend Following Strategy v2
 // ============================================================
-// Subscreve ticks ao vivo. Analisa janela deslizante.
-// CALL se tendência ascendente, PUT se descendente.
+// Subscreve ticks ao vivo e analisa uma janela deslizante.
+// CALL se a tendência é ascendente, PUT se descendente.
+//
+// Correcções vs v1:
+//   ✅ Orientada a TICK (skipTickLoop = true). Antes, a decisão só era
+//      tomada a cada 3 s por um timer, por isso a entrada podia chegar
+//      até 3 s depois do tick que confirmou a tendência.
+//   ✅ Erros tratados aqui (handleUnexpectedError) e stop loss / take
+//      profit verificados logo após cada resultado
+//   ✅ Sem log "Aguardando ticks" a cada ciclo (spam)
+//   ✅ Params parciais mantêm os defaults
 // ============================================================
+
 import { BotConfig, TrendFollowingParams, TradeDirection, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
+import { withDefaults } from './digit-utils.js';
 
 export class TrendFollowingStrategy extends BaseStrategy {
   private params: TrendFollowingParams;
   private pending = false;
   private tickBuffer: number[] = [];
+  private bufferReadyLogged = false;
   private tickSub: { unsubscribe: () => void } | null = null;
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
     super(id, name, 'trend_following', config, derivWs);
-    this.params = (config.strategyParams ?? {
+    this.params = withDefaults<TrendFollowingParams>({
       ticksWindow: 10,
       trendThreshold: 0.002,
-    }) as unknown as TrendFollowingParams;
+    }, config.strategyParams);
+    this.skipTickLoop = true;
   }
 
   protected async onStart(): Promise<void> {
     const { symbol } = this.state.config;
     const { ticksWindow } = this.params;
     this.tickBuffer = [];
-    this.tickSub = this.derivWs.subscribeToTicks(symbol, (price) => {
-      this.tickBuffer.push(price);
-      if (this.tickBuffer.length > ticksWindow) this.tickBuffer.shift();
-    });
+    this.bufferReadyLogged = false;
+    this.pending = false;
+
+    this.tickSub = this.derivWs.subscribeToTicks(symbol, (price: number) => this.onTick(price));
     this.log('info', `Trend Following — símbolo: ${symbol}, janela: ${ticksWindow} ticks`);
   }
 
@@ -39,31 +52,38 @@ export class TrendFollowingStrategy extends BaseStrategy {
     this.pending = false;
   }
 
-  protected getTickDelay(): number { return 3000; }
+  protected async tick(): Promise<void> { /* no-op: ação em onTick() */ }
 
-  protected async tick(): Promise<void> {
-    if (this.pending) return;
+  // ─── Lógica orientada a tick ──────────────────────────────
+
+  private onTick(price: number): void {
     const { ticksWindow, trendThreshold } = this.params;
-    const { symbol, duration, durationUnit, currency } = this.state.config;
 
-    if (this.tickBuffer.length < ticksWindow) {
-      this.log('info', `Aguardando ticks: ${this.tickBuffer.length}/${ticksWindow}`);
-      return;
+    this.tickBuffer.push(price);
+    if (this.tickBuffer.length > ticksWindow) this.tickBuffer.shift();
+
+    if (!this.active || this.pending) return;
+    if (this.tickBuffer.length < ticksWindow) return;
+
+    if (!this.bufferReadyLogged) {
+      this.bufferReadyLogged = true;
+      this.log('info', `Janela completa (${ticksWindow} ticks) — a analisar tendência a cada tick.`);
     }
 
     const direction = this.detectTrend(trendThreshold);
-    if (!direction) {
-      this.log('info', 'Sem tendência clara — aguardando');
-      return;
-    }
+    if (direction) void this.placeTrade(direction);
+  }
 
+  private async placeTrade(direction: TradeDirection): Promise<void> {
+    this.pending = true;
+    const { symbol, duration, durationUnit, currency } = this.state.config;
     const stake = this.state.stats.currentStake;
+
     this.log('trade', `Tendência detectada: ${direction} — stake: $${stake.toFixed(2)}`, {
       first: this.tickBuffer[0],
       last: this.tickBuffer[this.tickBuffer.length - 1],
     });
 
-    this.pending = true;
     try {
       const entryTime = new Date();
       const { contractId } = await this.derivWs.buyContract({
@@ -84,9 +104,15 @@ export class TrendFollowingStrategy extends BaseStrategy {
       };
 
       this.recordTradeResult(tradeResult);
-      result.won
-        ? this.log('trade', `✅ Ganhou $${result.profit.toFixed(2)}`)
-        : this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)}`);
+      this.log('trade', result.won
+        ? `✅ Ganhou $${result.profit.toFixed(2)}`
+        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)}`);
+
+      this.checkStopConditions();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log('error', `[Trend] Falha ao operar: ${message}`, { stake });
+      await this.handleUnexpectedError(err);
     } finally {
       this.pending = false;
     }

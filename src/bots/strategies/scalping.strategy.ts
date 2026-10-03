@@ -31,7 +31,7 @@ export class ScalpingStrategy extends BaseStrategy {
   protected async onStart(): Promise<void> {
     this.consecutiveLosses = 0;
     this.pending = false;
-    this.log('info', `Scalping — stake: $${this.state.config.initialStake}, símbolo: ${this.state.config.symbol}`);
+    this.log('info', `Scalping — stake: ${this.money(this.state.config.initialStake)}, símbolo: ${this.state.config.symbol}`);
   }
 
   protected async onStop(): Promise<void> {
@@ -54,7 +54,7 @@ export class ScalpingStrategy extends BaseStrategy {
 
     const stake = this.state.stats.currentStake;
     const direction = this.chooseDirection();
-    this.log('trade', `Abrindo ${direction} — stake: $${stake.toFixed(2)}`, { symbol, direction, stake });
+    this.log('trade', `Abrindo ${direction} — stake: ${this.money(stake.toFixed(2))}`, { symbol, direction, stake });
 
     this.pending = true;
     // Erros de execução (rede, saldo…) NÃO mexem no contador de perdas:
@@ -78,13 +78,14 @@ export class ScalpingStrategy extends BaseStrategy {
         entryTime, exitTime: new Date(),
       };
 
+      this.tradeContractType = direction;
       this.recordTradeResult(tradeResult);
       if (result.won) {
         this.consecutiveLosses = 0;
-        this.log('trade', `✅ Ganhou $${result.profit.toFixed(2)}`);
+        this.log('trade', `✅ Ganhou ${this.money(result.profit.toFixed(2))}`);
       } else {
         this.consecutiveLosses += 1;
-        this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — perdas consecutivas: ${this.consecutiveLosses}`);
+        this.log('trade', `❌ Perdeu ${this.money(Math.abs(result.profit).toFixed(2))} — perdas consecutivas: ${this.consecutiveLosses}`);
       }
     } finally {
       this.pending = false;

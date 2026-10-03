@@ -54,6 +54,14 @@ export class TrendFollowingStrategy extends BaseStrategy {
 
   protected async tick(): Promise<void> { /* no-op: ação em onTick() */ }
 
+  // Mudança de mercado: janela nova e re-subscrição
+  protected async onSymbolChanged(): Promise<void> {
+    this.tickBuffer = [];
+    this.bufferReadyLogged = false;
+    this.tickSub?.unsubscribe();
+    this.tickSub = this.derivWs.subscribeToTicks(this.state.config.symbol, (price: number) => this.onTick(price));
+  }
+
   // ─── Lógica orientada a tick ──────────────────────────────
 
   private onTick(price: number): void {
@@ -62,7 +70,7 @@ export class TrendFollowingStrategy extends BaseStrategy {
     this.tickBuffer.push(price);
     if (this.tickBuffer.length > ticksWindow) this.tickBuffer.shift();
 
-    if (!this.active || this.pending) return;
+    if (!this.active || this.pending || this.coolingDown) return;
     if (this.tickBuffer.length < ticksWindow) return;
 
     if (!this.bufferReadyLogged) {
@@ -79,7 +87,7 @@ export class TrendFollowingStrategy extends BaseStrategy {
     const { symbol, duration, durationUnit, currency } = this.state.config;
     const stake = this.state.stats.currentStake;
 
-    this.log('trade', `Tendência detectada: ${direction} — stake: $${stake.toFixed(2)}`, {
+    this.log('trade', `Tendência detectada: ${direction} — stake: ${this.money(stake.toFixed(2))}`, {
       first: this.tickBuffer[0],
       last: this.tickBuffer[this.tickBuffer.length - 1],
     });
@@ -105,8 +113,8 @@ export class TrendFollowingStrategy extends BaseStrategy {
 
       this.recordTradeResult(tradeResult);
       this.log('trade', result.won
-        ? `✅ Ganhou $${result.profit.toFixed(2)}`
-        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)}`);
+        ? `✅ Ganhou ${this.money(result.profit.toFixed(2))}`
+        : `❌ Perdeu ${this.money(Math.abs(result.profit).toFixed(2))}`);
 
       this.checkStopConditions();
     } catch (err) {

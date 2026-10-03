@@ -21,7 +21,7 @@
 
 import { BotConfig, ScalperParams, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { decimalsFromPip, exitDigitOf, lastDigit, roundMoney, withDefaults } from './digit-utils.js';
+import { decimalsFromPip, exitDigitOf, lastDigit, withDefaults } from './digit-utils.js';
 
 export class ScalperStrategy extends BaseStrategy {
   private params: ScalperParams;
@@ -61,7 +61,7 @@ export class ScalperStrategy extends BaseStrategy {
     this.log(
       'info',
       `Scalper — symbol: ${this.state.config.symbol}, predict: over ${this.params.predictDigit}, ` +
-      `stake inicial: $${this.state.config.initialStake}, gale: ${this.params.gale}x`,
+      `stake inicial: ${this.money(this.state.config.initialStake)}, gale: ${this.params.gale}x`,
     );
 
     this.tickSub = this.derivWs.subscribeToTicks(
@@ -82,6 +82,16 @@ export class ScalperStrategy extends BaseStrategy {
 
   protected async tick(): Promise<void> { /* no-op: ação em onTick() */ }
 
+  // Mudança de mercado: re-subscrever ticks e reaprender as casas decimais
+  protected async onSymbolChanged(): Promise<void> {
+    this.pipDecimals = undefined;
+    this.tickSub?.unsubscribe();
+    this.tickSub = this.derivWs.subscribeToTicks(
+      this.state.config.symbol,
+      (price: number, pipSize?: number) => this.onTick(price, pipSize),
+    );
+  }
+
   // ─── Lógica orientada a tick ──────────────────────────────
 
   private get decimals(): number {
@@ -92,7 +102,7 @@ export class ScalperStrategy extends BaseStrategy {
     if (pipSize !== undefined && this.pipDecimals === undefined) {
       this.pipDecimals = decimalsFromPip(pipSize, this.params.decimalPlaces ?? 2);
     }
-    if (!this.active || this.pending || this.paused) return;
+    if (!this.active || this.pending || this.paused || this.coolingDown) return;
 
     if (lastDigit(price, this.decimals) <= this.params.predictDigit) {
       void this.placeTrade();
@@ -105,7 +115,7 @@ export class ScalperStrategy extends BaseStrategy {
     const { predictDigit } = this.params;
     const stake = this.state.stats.currentStake;
 
-    this.log('trade', `[Scalper] Abrindo DIGITOVER > ${predictDigit} — stake: $${stake.toFixed(2)}`, {
+    this.log('trade', `[Scalper] Abrindo DIGITOVER > ${predictDigit} — stake: ${this.money(stake.toFixed(2))}`, {
       stake, lossCount: this.lossCount,
     });
 
@@ -145,8 +155,8 @@ export class ScalperStrategy extends BaseStrategy {
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
       this.log('trade', result.won
-        ? `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`
-        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
+        ? `✅ Ganhou ${this.money(result.profit.toFixed(2))} — próximo stake: ${this.money(nextStake)}`
+        : `❌ Perdeu ${this.money(Math.abs(result.profit).toFixed(2))} — próximo stake: ${this.money(nextStake)}`);
 
       this.checkStopConditions();
       if (!this.active) return;
@@ -179,7 +189,7 @@ export class ScalperStrategy extends BaseStrategy {
 
     if (this.lossCount > lossesToStartGale && this.martingaleSteps < maxMartingaleSteps) {
       this.martingaleSteps += 1;
-      this.state.stats.currentStake = roundMoney(this.state.stats.currentStake * gale);
+      this.state.stats.currentStake = this.round(this.state.stats.currentStake * gale);
     } else {
       // atingiu o teto de níveis → reseta (corte de perdas)
       this.lossCount = 0;
@@ -197,7 +207,7 @@ export class ScalperStrategy extends BaseStrategy {
 
     this.paused = true;
     this.lossAccum = 0;
-    this.log('info', `Pausa automática — perda acumulada atingiu $${pauseLossLimit}. Retomando em ${pauseSeconds}s.`);
+    this.log('info', `Pausa automática — perda acumulada atingiu ${this.money(pauseLossLimit)}. Retomando em ${pauseSeconds}s.`);
 
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = setTimeout(() => {

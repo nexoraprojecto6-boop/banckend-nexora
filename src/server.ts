@@ -49,7 +49,7 @@ import labelsRoutes            from '@routes/labels.routes.js';
 import adminUsersRoutes        from '@routes/admin-users.routes.js';
 import notificationsRoutes     from '@routes/notifications.routes.js';
 import adminNotificationsRoutes from '@routes/admin-notifications.routes.js';
-import { DerivAPIService } from '@services/deriv-api.service.js';
+import { DerivAPIService, DerivTokenExpiredError } from '@services/deriv-api.service.js';
 import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
@@ -247,15 +247,20 @@ function buildDerivMessageHandler(
     try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
 
     // Parse único: o router trata o tráfego dos bots (e do Operar Manual).
-    // Se consumiu a mensagem, não a reencaminhamos ao frontend.
-    if (router.dispatch(msg)) return;
+    // Se consumiu a mensagem, não a reencaminhamos ao frontend — EXCETO os
+    // ticks: o gráfico/dígitos do dashboard alimentam-se dos ticks que os
+    // bots subscrevem, por isso continuam a ser reenviados.
+    const consumed = router.dispatch(msg);
+    if (consumed && msg.msg_type !== 'tick') return;
 
     if (msg.msg_type === 'ping' || msg.msg_type === 'pong') return;
 
-    // Regista subscrições abertas PELO frontend (para o forget_all seletivo)
+    // Regista subscrições abertas PELO frontend (para o forget_all seletivo).
+    // Ticks consumidos pelo router são dos BOTS: nunca entram aqui, senão um
+    // forget_all do frontend cancelaria a subscrição dos bots.
     const subId = (msg.subscription as { id?: string } | undefined)?.id;
     const mt = msg.msg_type as string | undefined;
-    if (subId && mt && mt !== 'balance' && mt !== 'transaction'
+    if (!consumed && subId && mt && mt !== 'balance' && mt !== 'transaction'
         && session.clientSubs.get(subId) !== mt
         && (session.clientSubs.has(subId) || session.clientSubs.size < MAX_CLIENT_SUBS)) {
       session.clientSubs.set(subId, mt);
@@ -723,21 +728,24 @@ async function handleManualBuy(
   const durationUnit = payload.durationUnit as string;
   const stake        = Number(payload.stake);
   const barrier      = payload.barrier;
+  // o frontend envia um clientRef e recebe-o de volta: liga cada resposta ao pedido
+  // certo (várias compras seguidas já não trocam os dados entre si)
+  const clientRef    = typeof payload.clientRef === 'string' ? payload.clientRef : undefined;
+
+  const fail = (error: string) =>
+    sendToClient(ws, 'manual_buy_result', { payload: { clientRef, success: false, error } });
 
   if (!symbol || !contractType || !duration || !durationUnit || !stake) {
-    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: 'Parâmetros em falta.' } });
+    fail('Parâmetros em falta.');
     return;
   }
   if (!session.derivWs || session.derivWs.readyState !== WebSocket.OPEN) {
-    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: 'Conexão Deriv indisponível.' } });
+    fail('Conexão Deriv indisponível.');
     return;
   }
 
   const stakeErr = stakeSanityError(session.currency || 'USD', stake);
-  if (stakeErr) {
-    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: stakeErr } });
-    return;
-  }
+  if (stakeErr) { fail(stakeErr); return; }
 
   const adapter = getAdapter(session);
 
@@ -756,6 +764,7 @@ async function handleManualBuy(
 
     sendToClient(ws, 'manual_buy_result', {
       payload: {
+        clientRef,
         success: true,
         contractId: bought.contractId,
         payout: (bought as { payout?: number }).payout,
@@ -767,6 +776,7 @@ async function handleManualBuy(
       .then((res) => {
         sendToClient(ws, 'manual_trade_closed', {
           payload: {
+            clientRef,
             contractId: bought.contractId,
             profit: res.profit,
             won: res.won,
@@ -778,13 +788,18 @@ async function handleManualBuy(
       })
       .catch((err: Error) => {
         logger.error('[WS] Erro ao acompanhar contrato manual', { contractId: bought.contractId, error: err.message });
-        sendError(ws, `Erro ao acompanhar contrato ${bought.contractId}: ${err.message}`, 'MANUAL_TRADE_ERROR');
+        // o frontend desbloqueia o ecrã (o contrato pode ainda estar aberto na Deriv)
+        sendToClient(ws, 'manual_trade_error', {
+          payload: {
+            clientRef,
+            contractId: bought.contractId,
+            message: `Não foi possível acompanhar o contrato ${bought.contractId}. Confirme o resultado na Deriv.`,
+          },
+        });
       });
   } catch (err: any) {
     logger.error('[WS] Erro na compra manual', { error: err.message });
-    sendToClient(ws, 'manual_buy_result', {
-      payload: { success: false, error: classifyDerivError(err).userMessage || 'Erro ao comprar.' },
-    });
+    fail(classifyDerivError(err).userMessage || 'Erro ao comprar.');
   }
 }
 
@@ -878,7 +893,13 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     logger.info('[WS] Client authenticated', { accountId: targetAccountId, isAdmin: session.isAdmin });
   } catch (err: any) {
     logger.error('[WS] Authentication failed', { error: err.message });
-    sendError(ws, err.message ?? 'Falha na autenticação', 'AUTH_FAILED');
+    if (err instanceof DerivTokenExpiredError) {
+      // token inválido/expirado: o frontend deve terminar a sessão
+      sendError(ws, 'A sessão Deriv expirou. Faça login novamente.', 'AUTH_FAILED');
+    } else {
+      // falha temporária (rede, Deriv em baixo, rate limit): NÃO terminar a sessão
+      sendError(ws, 'Não foi possível ligar à Deriv agora. A tentar de novo…', 'AUTH_TEMPORARY');
+    }
     ws.close();
   } finally {
     session.authenticating = false;

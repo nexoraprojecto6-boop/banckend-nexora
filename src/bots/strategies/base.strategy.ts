@@ -172,22 +172,25 @@ export abstract class BaseStrategy extends EventEmitter {
     }
   }
 
-  private scheduleNextTick(elapsedMs = 0): void {
+  private scheduleNextTick(elapsedMs = 0, minDelayMs = 0): void {
     if (!this.active) return;
     const gen = this.generation;
     // desconta o tempo que o tick() anterior já gastou
-    const delay = Math.max(0, this.getTickDelay() - elapsedMs);
+    const delay = Math.max(minDelayMs, this.getTickDelay() - elapsedMs);
 
     this.loopTimer = setTimeout(async () => {
       if (!this.active || gen !== this.generation) return;
       const t0 = Date.now();
+      let backoff = 0;
       try {
         await this.tick();
         this.checkStopConditions();
       } catch (err) {
         await this.handleUnexpectedError(err);
+        // erros seguidos → espera crescente (1 s, 2 s, ... máx 5 s)
+        backoff = this.consecutiveErrors > 0 ? Math.min(1000 * this.consecutiveErrors, 5000) : 0;
       }
-      if (this.active && gen === this.generation) this.scheduleNextTick(Date.now() - t0);
+      if (this.active && gen === this.generation) this.scheduleNextTick(Date.now() - t0, backoff);
     }, delay);
   }
 

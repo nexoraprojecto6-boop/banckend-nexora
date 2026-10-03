@@ -54,8 +54,11 @@ import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
 import { BotEvent, BotConfig, BotStrategyType, DerivWsAdapter } from './bots/bot.types.js';
+import type { SymbolResolution } from './bots/strategies/base.strategy.js';
 import { seedBotCatalog } from './bots/catalog-seed.js';
-import { attachExternalRouter, destroyMessageRouter } from './bots/message-router.js';
+import { attachExternalRouter, destroyMessageRouter, getMessageRouter } from './bots/message-router.js';
+import { classifyDerivError } from '@utils/deriv-errors.js';
+import { stakeSanityError } from '@utils/currency.js';
 import { nextReqId } from '@utils/req-id.js';
 
 // ─── Limites ──────────────────────────────────────────────────
@@ -108,8 +111,20 @@ interface ClientSession {
   botManager:           BotManager | null;
   nextReqId:            number;
   clientSubs:           Map<string, string>; // subscription.id → msg_type (só do frontend)
+  symbolsCache:         { at: number; list: ActiveSymbol[] } | null;
+  symbolsByTypes:       Map<string, { at: number; list: ActiveSymbol[] }>;
   msgWindowStart:       number;
   msgCount:             number;
+}
+
+interface ActiveSymbol {
+  underlying_symbol: string;
+  underlying_symbol_name?: string;
+  market?: string;
+  submarket?: string;
+  exchange_is_open?: number;
+  is_trading_suspended?: number;
+  pip_size?: number;
 }
 
 const sessions = new Map<WebSocket, ClientSession>();
@@ -435,8 +450,111 @@ function initBotManagerForSession(clientWs: WebSocket, session: ClientSession): 
     sendToClient(clientWs, event.type, { payload: { botId: event.botId, ...event.payload } });
   });
 
+  manager.setSymbolResolver((strategy, config, current) => resolveSymbol(session, strategy, config, current));
+
   session.botManager = manager;
   logger.info('[WS] BotManager inicializado para sessão');
+}
+
+// ─── Disponibilidade por conta/país ───────────────────────────
+// O que a Deriv oferece varia por país, conta e hora (forex fecha ao
+// fim de semana). Consultamos active_symbols da PRÓPRIA conta.
+
+const SYMBOLS_TTL_MS = 5 * 60_000;
+
+async function getAccountSymbols(session: ClientSession): Promise<ActiveSymbol[]> {
+  if (session.symbolsCache && Date.now() - session.symbolsCache.at < SYMBOLS_TTL_MS) {
+    return session.symbolsCache.list;
+  }
+  const ws = await waitForDerivWs(session, 5_000);
+  const res = await getMessageRouter(ws).request({ active_symbols: 'brief' }, nextReqId(), 15_000);
+  const list = (res.active_symbols as ActiveSymbol[] | undefined) ?? [];
+  session.symbolsCache = { at: Date.now(), list };
+  return list;
+}
+
+// ─── Mudança automática de mercado ────────────────────────────
+// Se o mercado do bot estiver fechado, suspenso ou não for oferecido a
+// esta conta/país, o bot passa para outro mercado ABERTO que ofereça o
+// mesmo tipo de contrato. Ordem de preferência:
+//   1) strategyParams.fallbackSymbols (lista do catálogo, por ordem)
+//   2) mesmo submercado  →  3) mesmo mercado  →  4) qualquer mercado aberto
+// Variáveis de ambiente:
+//   SYMBOL_FAILOVER=0               desliga a mudança automática
+//   SYMBOL_FAILOVER_ANY_MARKET=0    só muda dentro do mesmo mercado
+const FAILOVER_ENABLED    = process.env.SYMBOL_FAILOVER !== '0';
+const FAILOVER_ANY_MARKET = process.env.SYMBOL_FAILOVER_ANY_MARKET !== '0';
+const TYPED_SYMBOLS_TTL_MS = 30_000;
+
+function contractTypesFor(strategy: BotStrategyType, config: BotConfig): string[] {
+  const p = (config.strategyParams ?? {}) as Record<string, unknown>;
+  switch (strategy) {
+    case 'alfha':             return ['DIGITOVER', 'DIGITUNDER'];
+    case 'scalper':
+    case 'over1_recovery':    return ['DIGITOVER'];
+    case 'even_odd_recovery': return [p.targetParity === 'odd' ? 'DIGITODD' : 'DIGITEVEN'];
+    default:                  return ['CALL', 'PUT']; // martingale, scalping, trend_following
+  }
+}
+
+/** Símbolos que a conta pode operar para estes tipos de contrato (cache curto: o estado aberto/fechado muda). */
+async function getSymbolsFor(session: ClientSession, types: string[]): Promise<ActiveSymbol[]> {
+  const key = types.join(',');
+  const cached = session.symbolsByTypes.get(key);
+  if (cached && Date.now() - cached.at < TYPED_SYMBOLS_TTL_MS) return cached.list;
+
+  const ws = await waitForDerivWs(session, 5_000);
+  let list: ActiveSymbol[];
+  try {
+    const res = await getMessageRouter(ws).request(
+      { active_symbols: 'brief', contract_type: types }, nextReqId(), 15_000,
+    );
+    list = (res.active_symbols as ActiveSymbol[] | undefined) ?? [];
+  } catch (err: any) {
+    // filtro por contrato recusado → lista completa da conta
+    logger.warn('[WS] active_symbols com contract_type falhou — a usar lista completa', { error: err?.message });
+    list = await getAccountSymbols(session);
+  }
+  session.symbolsByTypes.set(key, { at: Date.now(), list });
+  return list;
+}
+
+async function resolveSymbol(
+  session: ClientSession, strategy: BotStrategyType, config: BotConfig, current: string,
+): Promise<SymbolResolution> {
+  let list: ActiveSymbol[];
+  try {
+    list = await getSymbolsFor(session, contractTypesFor(strategy, config));
+  } catch (err: any) {
+    logger.warn('[WS] Não foi possível verificar mercados — mantém o atual', { current, error: err?.message });
+    return { symbol: current, changed: false };
+  }
+  if (!list.length) return { symbol: current, changed: false };
+
+  const usable = (s: ActiveSymbol) => s.exchange_is_open !== 0 && s.is_trading_suspended !== 1;
+  const cur = list.find((s) => s.underlying_symbol === current);
+  if (cur && usable(cur)) return { symbol: current, changed: false };
+
+  const reason = !cur
+    ? 'não disponível para a sua conta/país'
+    : cur.is_trading_suspended === 1 ? 'negociação suspensa' : 'mercado fechado';
+
+  if (!FAILOVER_ENABLED) return { symbol: null, changed: false, reason };
+
+  const open = list.filter((s) => usable(s) && s.underlying_symbol !== current);
+  const pick = (pred: (s: ActiveSymbol) => boolean) => open.find(pred)?.underlying_symbol;
+
+  const params = (config.strategyParams ?? {}) as Record<string, unknown>;
+  const explicit = Array.isArray(params.fallbackSymbols) ? params.fallbackSymbols.map(String) : [];
+
+  const chosen =
+    explicit.find((sym) => open.some((s) => s.underlying_symbol === sym))
+    ?? (cur ? pick((s) => s.submarket === cur.submarket) : undefined)
+    ?? (cur ? pick((s) => s.market === cur.market) : undefined)
+    ?? (FAILOVER_ANY_MARKET || !cur ? pick(() => true) : undefined);
+
+  if (!chosen) return { symbol: null, changed: false, reason };
+  return { symbol: chosen, changed: true, reason };
 }
 
 // ─── Handler de mensagens de bots ─────────────────────────────
@@ -479,11 +597,32 @@ async function handleBotMessage(
 
         const finalConfig: BotConfig = {
           ...catalogBot.defaultConfig, ...configOverride,
+          // SEMPRE a moeda da conta ativa (EUR, GBP, BTC…): o catálogo traz "USD"
+          // e comprar com a moeda errada faz a Deriv rejeitar todos os contratos.
+          currency: session.currency || 'USD',
           strategyParams: {
             ...(catalogBot.defaultConfig.strategyParams ?? {}),
             ...((configOverride.strategyParams as Record<string, unknown>) ?? {}),
           },
         };
+
+        const stakeErr = stakeSanityError(finalConfig.currency, Number(finalConfig.initialStake));
+        if (stakeErr) { sendError(ws, stakeErr, 'INVALID_STAKE'); break; }
+
+        const originalSymbol = finalConfig.symbol;
+        const resolution = await resolveSymbol(session, catalogBot.strategy, finalConfig, originalSymbol);
+        if (resolution.symbol === null) {
+          sendError(ws,
+            `O mercado ${originalSymbol} está indisponível (${resolution.reason}) e não há outro mercado aberto para este bot agora.`,
+            'SYMBOL_UNAVAILABLE');
+          break;
+        }
+        if (resolution.changed) {
+          finalConfig.symbol = resolution.symbol;
+          sendToClient(ws, 'bot_symbol_fallback', {
+            payload: { from: originalSymbol, to: resolution.symbol, reason: resolution.reason },
+          });
+        }
 
         const created = manager.createBot({
           name: (payload.sessionName as string) ?? catalogBot.name,
@@ -561,8 +700,8 @@ async function handleBotMessage(
       default: sendError(ws, `Tipo desconhecido: ${type}`, 'UNKNOWN_BOT_MSG');
     }
   } catch (err: any) {
-    logger.error('[WS] Erro no handler de bot', { type, error: err.message });
-    sendError(ws, err.message ?? 'Erro interno', 'BOT_ERROR');
+    logger.error('[WS] Erro no handler de bot', { type, error: err.message, code: err.code });
+    sendError(ws, classifyDerivError(err).userMessage, 'BOT_ERROR');
   }
 }
 
@@ -591,6 +730,12 @@ async function handleManualBuy(
   }
   if (!session.derivWs || session.derivWs.readyState !== WebSocket.OPEN) {
     sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: 'Conexão Deriv indisponível.' } });
+    return;
+  }
+
+  const stakeErr = stakeSanityError(session.currency || 'USD', stake);
+  if (stakeErr) {
+    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: stakeErr } });
     return;
   }
 
@@ -637,7 +782,9 @@ async function handleManualBuy(
       });
   } catch (err: any) {
     logger.error('[WS] Erro na compra manual', { error: err.message });
-    sendToClient(ws, 'manual_buy_result', { payload: { success: false, error: err.message ?? 'Erro ao comprar.' } });
+    sendToClient(ws, 'manual_buy_result', {
+      payload: { success: false, error: classifyDerivError(err).userMessage || 'Erro ao comprar.' },
+    });
   }
 }
 
@@ -666,6 +813,8 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     safeTerminateDerivWs(session);
     session.derivWs = null;
     session.clientSubs.clear();
+    session.symbolsCache = null;
+    session.symbolsByTypes.clear();
 
     const derivAPI    = new DerivAPIService(token);
     const accountsRes = await derivAPI.getAccounts();
@@ -787,7 +936,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     reconnectAttempts: 0, authenticated: false, authenticating: false,
     isAdmin: false, isAlive: true,
     botManager: null, nextReqId: 900_000,
-    clientSubs: new Map(), msgWindowStart: 0, msgCount: 0,
+    clientSubs: new Map(), symbolsCache: null, symbolsByTypes: new Map(), msgWindowStart: 0, msgCount: 0,
   };
   sessions.set(ws, session);
 
@@ -855,6 +1004,29 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       if (type === 'manual_buy') {
         if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
         await handleManualBuy(ws, session, payload);
+        return;
+      }
+
+      if (type === 'get_available_symbols') {
+        if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
+        try {
+          const list = await getAccountSymbols(session);
+          sendToClient(ws, 'available_symbols', {
+            payload: {
+              currency: session.currency,
+              symbols: list.map((s) => ({
+                symbol: s.underlying_symbol,
+                name: s.underlying_symbol_name,
+                market: s.market,
+                submarket: s.submarket,
+                isOpen: s.exchange_is_open === 1 && s.is_trading_suspended !== 1,
+                pipSize: s.pip_size,
+              })),
+            },
+          });
+        } catch (err: any) {
+          sendError(ws, classifyDerivError(err).userMessage, 'SYMBOLS_ERROR');
+        }
         return;
       }
 

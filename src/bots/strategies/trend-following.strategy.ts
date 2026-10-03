@@ -111,6 +111,7 @@ export class TrendFollowingStrategy extends BaseStrategy {
         entryTime, exitTime: new Date(),
       };
 
+      this.tradeContractType = direction;
       this.recordTradeResult(tradeResult);
       this.log('trade', result.won
         ? `✅ Ganhou ${this.money(result.profit.toFixed(2))}`

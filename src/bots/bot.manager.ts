@@ -23,7 +23,7 @@ import {
   CreateBotRequest,
   DerivWsAdapter,
 } from './bot.types.js';
-import { BaseStrategy } from './strategies/base.strategy.js';
+import { BaseStrategy, SymbolResolver } from './strategies/base.strategy.js';
 import { ScalpingStrategy } from './strategies/scalping.strategy.js';
 import { MartingaleStrategy } from './strategies/martingale.strategy.js';
 import { TrendFollowingStrategy } from './strategies/trend-following.strategy.js';
@@ -50,6 +50,7 @@ const BOT_EVENTS = [
 export class BotManager extends EventEmitter {
   private bots = new Map<string, BaseStrategy>();
   private derivWs: DerivWsAdapter;
+  private symbolResolver: SymbolResolver | null = null;
 
   constructor(derivWs: DerivWsAdapter) {
     super();
@@ -66,6 +67,7 @@ export class BotManager extends EventEmitter {
       bot.on(event, (botEvent: BotEvent) => this.emit('bot_event', botEvent));
     });
 
+    if (this.symbolResolver) bot.setSymbolResolver(this.symbolResolver);
     this.bots.set(id, bot);
     logger.info(`[BotManager] Bot criado — id: ${id}, estratégia: ${req.strategy}, nome: ${req.name}`);
     return bot.getState();
@@ -128,6 +130,12 @@ export class BotManager extends EventEmitter {
 
   getBotLogs(botId: string, limit = 100): BotState['logs'] {
     return this.getOrThrow(botId).getState().logs.slice(-limit);
+  }
+
+  /** Ativa a mudança automática de mercado (mercado fechado/indisponível → outro aberto). */
+  setSymbolResolver(resolver: SymbolResolver | null): void {
+    this.symbolResolver = resolver;
+    this.bots.forEach((b) => b.setSymbolResolver(resolver));
   }
 
   // ─── Troca de conta (só afecta bots criados a seguir) ─────

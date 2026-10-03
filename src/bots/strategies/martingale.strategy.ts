@@ -1,28 +1,43 @@
 // ============================================================
-// NEXORA FOREX — Martingale & Anti-Martingale Strategy
+// NEXORA FOREX — Martingale & Anti-Martingale Strategy v2
 // ============================================================
 // Martingale:      multiplica stake após PERDA, reseta no win
 // Anti-Martingale: multiplica stake após WIN, reseta na perda
+//
+// Correcções vs v1:
+//   ✅ Params parciais mantêm os defaults (antes `?? {...}` só valia com
+//      strategyParams ausente: multiplier/maxStake em falta → NaN)
+//   ✅ Stake arredondado a 2 casas (0.35 × 2.2 gerava dízimas)
+//   ✅ Intervalo entre trades 1500 ms → 300 ms. Como o loop da
+//      BaseStrategy desconta o tempo do contrato, o próximo trade
+//      começa logo que o anterior fecha.
+//
+// ⚠️ A direção (CALL/PUT) continua a ser ALEATÓRIA: não há sinal. O
+//    martingale não cria vantagem; apenas altera o formato do risco.
+//    Recomendado apenas em conta demo.
 // ============================================================
+
 import { BotConfig, MartingaleParams, TradeDirection, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
+import { roundMoney, withDefaults } from './digit-utils.js';
 
 export class MartingaleStrategy extends BaseStrategy {
   private params: MartingaleParams;
   private pending = false;
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
-    const params = (config.strategyParams ?? {
+    const params = withDefaults<MartingaleParams>({
       multiplier: 2,
       maxStake: 100,
       resetOnWin: false,
-    }) as unknown as MartingaleParams;
+    }, config.strategyParams);
     super(id, name, params.resetOnWin ? 'anti_martingale' : 'martingale', config, derivWs);
     this.params = params;
   }
 
   protected async onStart(): Promise<void> {
     this.state.stats.currentStake = this.state.config.initialStake;
+    this.pending = false;
     const mode = this.params.resetOnWin ? 'Anti-Martingale' : 'Martingale';
     this.log('info', `${mode} — stake inicial: $${this.state.config.initialStake}, multiplicador: ${this.params.multiplier}x`);
   }
@@ -31,13 +46,13 @@ export class MartingaleStrategy extends BaseStrategy {
     this.pending = false;
   }
 
-  protected getTickDelay(): number { return 1500; }
+  protected getTickDelay(): number { return 300; }
 
   protected async tick(): Promise<void> {
     if (this.pending) return;
     const { symbol, duration, durationUnit, currency } = this.state.config;
     const { multiplier, maxStake, resetOnWin } = this.params;
-    const stake = Math.min(this.state.stats.currentStake, maxStake);
+    const stake = roundMoney(Math.min(this.state.stats.currentStake, maxStake));
     const direction = this.chooseDirection();
     const mode = resetOnWin ? 'Anti-Martingale' : 'Martingale';
 
@@ -69,11 +84,9 @@ export class MartingaleStrategy extends BaseStrategy {
       this.adjustStake(result.won, stake, multiplier, maxStake, resetOnWin);
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
-      if (result.won) {
-        this.log('trade', `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`);
-      } else {
-        this.log('trade', `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
-      }
+      this.log('trade', result.won
+        ? `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`
+        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
     } finally {
       this.pending = false;
     }
@@ -82,7 +95,7 @@ export class MartingaleStrategy extends BaseStrategy {
   private adjustStake(won: boolean, current: number, multiplier: number, max: number, resetOnWin: boolean): void {
     const shouldMultiply = resetOnWin ? won : !won;
     this.state.stats.currentStake = shouldMultiply
-      ? Math.min(current * multiplier, max)
+      ? roundMoney(Math.min(current * multiplier, max))
       : this.state.config.initialStake;
   }
 

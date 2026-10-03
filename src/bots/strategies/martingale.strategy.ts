@@ -19,7 +19,7 @@
 
 import { BotConfig, MartingaleParams, TradeDirection, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { roundMoney, withDefaults } from './digit-utils.js';
+import { withDefaults } from './digit-utils.js';
 
 export class MartingaleStrategy extends BaseStrategy {
   private params: MartingaleParams;
@@ -39,7 +39,7 @@ export class MartingaleStrategy extends BaseStrategy {
     this.state.stats.currentStake = this.state.config.initialStake;
     this.pending = false;
     const mode = this.params.resetOnWin ? 'Anti-Martingale' : 'Martingale';
-    this.log('info', `${mode} — stake inicial: $${this.state.config.initialStake}, multiplicador: ${this.params.multiplier}x`);
+    this.log('info', `${mode} — stake inicial: ${this.money(this.state.config.initialStake)}, multiplicador: ${this.params.multiplier}x`);
   }
 
   protected async onStop(): Promise<void> {
@@ -52,11 +52,11 @@ export class MartingaleStrategy extends BaseStrategy {
     if (this.pending) return;
     const { symbol, duration, durationUnit, currency } = this.state.config;
     const { multiplier, maxStake, resetOnWin } = this.params;
-    const stake = roundMoney(Math.min(this.state.stats.currentStake, maxStake));
+    const stake = this.round(Math.min(this.state.stats.currentStake, maxStake));
     const direction = this.chooseDirection();
     const mode = resetOnWin ? 'Anti-Martingale' : 'Martingale';
 
-    this.log('trade', `[${mode}] Abrindo ${direction} — stake: $${stake.toFixed(2)}`, {
+    this.log('trade', `[${mode}] Abrindo ${direction} — stake: ${this.money(stake.toFixed(2))}`, {
       stake, currentStreak: this.state.stats.currentStreak,
     });
 
@@ -80,13 +80,14 @@ export class MartingaleStrategy extends BaseStrategy {
         entryTime, exitTime: new Date(),
       };
 
+      this.tradeContractType = direction;
       this.recordTradeResult(tradeResult);
       this.adjustStake(result.won, stake, multiplier, maxStake, resetOnWin);
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
       this.log('trade', result.won
-        ? `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`
-        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
+        ? `✅ Ganhou ${this.money(result.profit.toFixed(2))} — próximo stake: ${this.money(nextStake)}`
+        : `❌ Perdeu ${this.money(Math.abs(result.profit).toFixed(2))} — próximo stake: ${this.money(nextStake)}`);
     } finally {
       this.pending = false;
     }
@@ -95,7 +96,7 @@ export class MartingaleStrategy extends BaseStrategy {
   private adjustStake(won: boolean, current: number, multiplier: number, max: number, resetOnWin: boolean): void {
     const shouldMultiply = resetOnWin ? won : !won;
     this.state.stats.currentStake = shouldMultiply
-      ? roundMoney(Math.min(current * multiplier, max))
+      ? this.round(Math.min(current * multiplier, max))
       : this.state.config.initialStake;
   }
 

@@ -25,7 +25,7 @@
 
 import { BotConfig, EvenOddRecoveryParams, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { decimalsFromPip, exitDigitOf, lastDigit, roundMoney, withDefaults } from './digit-utils.js';
+import { decimalsFromPip, exitDigitOf, lastDigit, withDefaults } from './digit-utils.js';
 
 const RATIO_REFRESH_MS = 120_000;   // renova em segundo plano
 const RATIO_MAX_AGE_MS = 600_000;   // acima disto, volta a pedir antes de usar
@@ -74,8 +74,8 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
       'info',
       `Even/Odd Recovery — symbol: ${this.state.config.symbol}, alvo: ${this.getContractType()}, ` +
       `gatilho: ${this.params.streakTrigger} ticks seguidos na paridade oposta, ` +
-      `stake inicial: $${this.state.config.initialStake}, margem: +${this.params.recoveryMarginPercent}%, ` +
-      `stake protetor: ${this.params.protectiveStakePercent}%, teto de stake: $${this.params.maxStakeCap}`,
+      `stake inicial: ${this.money(this.state.config.initialStake)}, margem: +${this.params.recoveryMarginPercent}%, ` +
+      `stake protetor: ${this.params.protectiveStakePercent}%, teto de stake: ${this.money(this.params.maxStakeCap)}`,
     );
 
     // pré-carrega o payout (não bloqueia o arranque)
@@ -98,6 +98,19 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
   }
 
   protected async tick(): Promise<void> { /* no-op: ação em onTick() */ }
+
+  // Mudança de mercado: re-subscrever ticks e reaprender as casas decimais
+  protected async onSymbolChanged(): Promise<void> {
+    this.pipDecimals = undefined;
+    this.oppositeStreak = 0;
+    this.payoutRatio = null;
+    void this.refreshPayoutRatio();
+    this.tickSub?.unsubscribe();
+    this.tickSub = this.derivWs.subscribeToTicks(
+      this.state.config.symbol,
+      (price: number, pipSize?: number) => this.onTick(price, pipSize),
+    );
+  }
 
   // ─── Lógica orientada a tick ──────────────────────────────
 
@@ -126,7 +139,7 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
     }
     this.oppositeStreak += 1;
 
-    if (this.pending || this.paused) return;
+    if (this.pending || this.paused || this.coolingDown) return;
 
     if (this.oppositeStreak >= this.params.streakTrigger) {
       this.oppositeStreak = 0;
@@ -140,7 +153,7 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
     const contractType = this.getContractType();
     const stake = this.state.stats.currentStake;
 
-    this.log('trade', `[Even/Odd Recovery] Abrindo ${contractType} — stake: $${stake.toFixed(2)}`, {
+    this.log('trade', `[Even/Odd Recovery] Abrindo ${contractType} — stake: ${this.money(stake.toFixed(2))}`, {
       stake, lossAccum: this.lossAccum, martingaleSteps: this.martingaleSteps,
     });
 
@@ -181,8 +194,8 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
       this.log('trade', result.won
-        ? `✅ Ganhou $${result.profit.toFixed(2)} — ciclo resetado, próximo stake: $${nextStake}`
-        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake (recuperação): $${nextStake}`);
+        ? `✅ Ganhou ${this.money(result.profit.toFixed(2))} — ciclo resetado, próximo stake: ${this.money(nextStake)}`
+        : `❌ Perdeu ${this.money(Math.abs(result.profit).toFixed(2))} — próximo stake (recuperação): ${this.money(nextStake)}`);
 
       this.checkStopConditions();
       if (!this.active) return;
@@ -226,7 +239,7 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
         this.state.stats.currentStake = stake;
         if (stake >= maxStakeCap) {
           this.log('warn',
-            `Stake de recuperação ($${stake.toFixed(2)}) atingiu o teto ($${maxStakeCap}). ` +
+            `Stake de recuperação (${this.money(stake.toFixed(2))}) atingiu o teto (${this.money(maxStakeCap)}). ` +
             `A recuperação total pode ficar incompleta — intencional para proteger a conta.`);
         }
       } catch (err) {
@@ -240,10 +253,10 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
     }
 
     const protectiveStake = Math.max(initial * (protectiveStakePercent / 100), minStake ?? 0);
-    this.state.stats.currentStake = roundMoney(protectiveStake);
+    this.state.stats.currentStake = this.round(protectiveStake);
     this.log('info',
       `Perda seguida (nível ${this.martingaleSteps}) — protegendo a banca, stake reduzido: ` +
-      `$${this.state.stats.currentStake.toFixed(2)} (${protectiveStakePercent}% do stake inicial).`);
+      `${this.money(this.state.stats.currentStake.toFixed(2))} (${protectiveStakePercent}% do stake inicial).`);
   }
 
   private async computeRecoveryStake(): Promise<number> {
@@ -259,7 +272,7 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
     let stake = target / ratio;
     if (minStake) stake = Math.max(stake, minStake);
     stake = Math.min(stake, maxStakeCap);
-    return roundMoney(stake);
+    return this.round(stake);
   }
 
   // ─── Payout ratio (cache) ─────────────────────────────────
@@ -316,7 +329,7 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
 
     this.paused = true;
     this.lossAccum = 0;
-    this.log('info', `Pausa automática — perda acumulada atingiu $${pauseLossLimit}. Retomando em ${pauseSeconds}s.`);
+    this.log('info', `Pausa automática — perda acumulada atingiu ${this.money(pauseLossLimit)}. Retomando em ${pauseSeconds}s.`);
 
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = setTimeout(() => {

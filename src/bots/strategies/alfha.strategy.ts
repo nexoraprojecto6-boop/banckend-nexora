@@ -25,7 +25,7 @@
 
 import { AlfhaParams, BotConfig, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
-import { decimalsFromPip, exitDigitOf, lastDigit, roundMoney, withDefaults } from './digit-utils.js';
+import { decimalsFromPip, exitDigitOf, lastDigit, withDefaults } from './digit-utils.js';
 
 type Side = 'DIGITOVER' | 'DIGITUNDER';
 type AlfhaParamsResolved = AlfhaParams & { decimalPlaces?: number };
@@ -69,7 +69,7 @@ export class AlfhaStrategy extends BaseStrategy {
     this.log(
       'info',
       `Alfha — symbol: ${this.state.config.symbol}, over: ${this.params.digitOver}, under: ${this.params.digitUnder}, ` +
-      `stake inicial: $${this.state.config.initialStake}, gale: ${this.params.gale}x`,
+      `stake inicial: ${this.money(this.state.config.initialStake)}, gale: ${this.params.gale}x`,
     );
 
     this.tickSub = this.derivWs.subscribeToTicks(
@@ -90,6 +90,16 @@ export class AlfhaStrategy extends BaseStrategy {
 
   protected async tick(): Promise<void> { /* no-op: ação em onTick() */ }
 
+  // Mudança de mercado: re-subscrever ticks e reaprender as casas decimais
+  protected async onSymbolChanged(): Promise<void> {
+    this.pipDecimals = undefined;
+    this.tickSub?.unsubscribe();
+    this.tickSub = this.derivWs.subscribeToTicks(
+      this.state.config.symbol,
+      (price: number, pipSize?: number) => this.onTick(price, pipSize),
+    );
+  }
+
   // ─── Lógica orientada a tick ──────────────────────────────
 
   private get decimals(): number {
@@ -100,7 +110,7 @@ export class AlfhaStrategy extends BaseStrategy {
     if (pipSize !== undefined && this.pipDecimals === undefined) {
       this.pipDecimals = decimalsFromPip(pipSize, this.params.decimalPlaces ?? 2);
     }
-    if (!this.active || this.pending || this.paused) return;
+    if (!this.active || this.pending || this.paused || this.coolingDown) return;
 
     const digit = lastDigit(price, this.decimals);
     const { digitOver, digitUnder } = this.params;
@@ -117,7 +127,7 @@ export class AlfhaStrategy extends BaseStrategy {
     const { symbol, duration, durationUnit, currency } = this.state.config;
     const stake = this.state.stats.currentStake;
 
-    this.log('trade', `[Alfha] Abrindo ${side} ${barrier} — stake: $${stake.toFixed(2)}`, {
+    this.log('trade', `[Alfha] Abrindo ${side} ${barrier} — stake: ${this.money(stake.toFixed(2))}`, {
       stake, lossCount: this.lossCount,
     });
 
@@ -152,8 +162,8 @@ export class AlfhaStrategy extends BaseStrategy {
 
       const nextStake = this.state.stats.currentStake.toFixed(2);
       this.log('trade', result.won
-        ? `✅ Ganhou $${result.profit.toFixed(2)} — próximo stake: $${nextStake}`
-        : `❌ Perdeu $${Math.abs(result.profit).toFixed(2)} — próximo stake: $${nextStake}`);
+        ? `✅ Ganhou ${this.money(result.profit.toFixed(2))} — próximo stake: ${this.money(nextStake)}`
+        : `❌ Perdeu ${this.money(Math.abs(result.profit).toFixed(2))} — próximo stake: ${this.money(nextStake)}`);
 
       this.checkStopConditions();
       if (!this.active) return;
@@ -186,7 +196,7 @@ export class AlfhaStrategy extends BaseStrategy {
 
     if (this.lossCount > lossesToStartGale && this.martingaleSteps < maxMartingaleSteps) {
       this.martingaleSteps += 1;
-      this.state.stats.currentStake = roundMoney(this.state.stats.currentStake * gale);
+      this.state.stats.currentStake = this.round(this.state.stats.currentStake * gale);
     } else {
       this.lossCount = 0;
       this.lossAccum = 0;
@@ -203,7 +213,7 @@ export class AlfhaStrategy extends BaseStrategy {
 
     this.paused = true;
     this.lossAccum = 0;
-    this.log('info', `Pausa automática — perda acumulada atingiu $${pauseLossLimit}. Retomando em ${pauseSeconds}s.`);
+    this.log('info', `Pausa automática — perda acumulada atingiu ${this.money(pauseLossLimit)}. Retomando em ${pauseSeconds}s.`);
 
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
     this.pauseTimer = setTimeout(() => {

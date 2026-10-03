@@ -150,6 +150,7 @@ export class ScalperStrategy extends BaseStrategy {
         exitTime: new Date(),
       };
 
+      this.tradeContractType = 'DIGITOVER';
       this.recordTradeResult(tradeResult);
       this.adjustStake(result.won, Math.abs(result.profit));
 

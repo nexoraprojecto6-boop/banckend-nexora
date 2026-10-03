@@ -71,6 +71,8 @@ export abstract class BaseStrategy extends EventEmitter {
   protected derivWs: DerivWsAdapter;
   protected consecutiveErrors = 0;
   private cooldownUntil = 0;
+  /** Contrato realmente comprado no último trade (as estratégias definem antes de recordTradeResult). */
+  protected tradeContractType?: string;
   private symbolResolver: SymbolResolver | null = null;
   private symbolTimer: ReturnType<typeof setInterval> | null = null;
   private switchingSymbol = false;
@@ -391,7 +393,7 @@ export abstract class BaseStrategy extends EventEmitter {
       entryTick:    result.entryTick,
       exitTick:     result.exitTick,
       exitDigit:    result.exitDigit,
-      contractType: this.state.config.contractType,
+      contractType: this.tradeContractType ?? this.state.config.contractType,
     }));
     this.emit('bot:stats_updated', this.buildEvent('bot:stats_updated', { stats: { ...s } }));
   }

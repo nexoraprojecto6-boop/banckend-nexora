@@ -32,12 +32,22 @@ import {
   TradeResult,
   DerivWsAdapter,
 } from '../bot.types.js';
-import { DerivApiError } from '../deriv-ws.adapter.js';
-
-const FATAL_AUTH_CODES = new Set([
-  'InvalidToken', 'AuthorizationRequired', 'Unauthorized', 'PermissionDenied',
-]);
+import { classifyDerivError } from '@utils/deriv-errors.js';
+import { formatMoney, roundToCurrency } from '@utils/currency.js';
 const MAX_CONSECUTIVE_ERRORS = 3;
+const SYMBOL_WATCH_MS = 60_000;
+
+/** Resultado da verificação/troca de mercado (ver server.ts → resolveSymbol). */
+export interface SymbolResolution {
+  symbol: string | null;   // símbolo a usar; null = nenhum disponível agora
+  changed: boolean;        // true = é diferente do atual
+  reason?: string;
+}
+export type SymbolResolver = (
+  strategy: BotStrategyType,
+  config: BotConfig,
+  current: string,
+) => Promise<SymbolResolution>;
 
 export function createInitialStats(initialStake: number): BotStats {
   return {
@@ -60,6 +70,10 @@ export abstract class BaseStrategy extends EventEmitter {
   protected active = false;
   protected derivWs: DerivWsAdapter;
   protected consecutiveErrors = 0;
+  private cooldownUntil = 0;
+  private symbolResolver: SymbolResolver | null = null;
+  private symbolTimer: ReturnType<typeof setInterval> | null = null;
+  private switchingSymbol = false;
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
 
@@ -109,6 +123,7 @@ export abstract class BaseStrategy extends EventEmitter {
     }
 
     if (!this.skipTickLoop) this.scheduleNextTick();
+    this.startSymbolWatch();
   }
 
   async stop(reason = 'manual'): Promise<void> {
@@ -116,6 +131,7 @@ export abstract class BaseStrategy extends EventEmitter {
     this.active = false;
     this.generation++;
     this.clearLoopTimer();
+    this.stopSymbolWatch();
     this.setStatus('stopped');
     this.state.stoppedAt = new Date();
     this.log('info', `Bot parado — motivo: ${reason}`);
@@ -132,6 +148,7 @@ export abstract class BaseStrategy extends EventEmitter {
     this.active = false;
     this.generation++;
     this.clearLoopTimer();
+    this.stopSymbolWatch();
     this.setStatus('paused');
     this.log('info', 'Bot pausado');
     this.emit('bot:paused', this.buildEvent('bot:paused', {}));
@@ -145,6 +162,24 @@ export abstract class BaseStrategy extends EventEmitter {
     this.log('info', 'Bot retomado');
     this.emit('bot:resumed', this.buildEvent('bot:resumed', {}));
     if (!this.skipTickLoop) this.scheduleNextTick();
+    this.startSymbolWatch();
+  }
+
+  // ─── Moeda da conta (nunca "USD" fixo) ────────────────────
+
+  /** "1.50 EUR" / "0.00010000 BTC" */
+  protected money(n: number | string): string {
+    return formatMoney(n, this.state.config.currency);
+  }
+
+  /** Arredonda às casas decimais da moeda da conta. */
+  protected round(n: number): number {
+    return roundToCurrency(n, this.state.config.currency);
+  }
+
+  /** true enquanto o bot espera (mercado fechado, rate limit…). Estratégias por tick usam-no. */
+  protected get coolingDown(): boolean {
+    return Date.now() < this.cooldownUntil;
   }
 
   getState(): BotState {
@@ -176,7 +211,8 @@ export abstract class BaseStrategy extends EventEmitter {
     if (!this.active) return;
     const gen = this.generation;
     // desconta o tempo que o tick() anterior já gastou
-    const delay = Math.max(minDelayMs, this.getTickDelay() - elapsedMs);
+    const cool = Math.max(0, this.cooldownUntil - Date.now());
+    const delay = Math.max(minDelayMs, cool, this.getTickDelay() - elapsedMs);
 
     this.loopTimer = setTimeout(async () => {
       if (!this.active || gen !== this.generation) return;
@@ -197,29 +233,102 @@ export abstract class BaseStrategy extends EventEmitter {
   // ─── Tratamento de erros partilhado ───────────────────────
 
   protected async handleUnexpectedError(err: unknown): Promise<void> {
-    if (err instanceof DerivApiError && err.code === 'InsufficientBalance') {
-      this.log('error', 'Saldo insuficiente para abrir o contrato — bot parado.');
+    const c = classifyDerivError(err);
+
+    if (c.kind === 'insufficient_balance') {
+      this.log('error', `${c.userMessage} Bot parado.`);
       this.emit('bot:insufficient_balance', this.buildEvent('bot:insufficient_balance', {
-        message: err.message,
+        message: c.message,
       }));
       await this.stop('insufficient_balance');
       return;
     }
 
-    const msg = err instanceof Error ? err.message : String(err);
+    // Mercado fechado/suspenso/indisponível: tenta mudar para outro mercado
+    // aberto (ver SymbolResolver) antes de esperar ou parar.
+    if (c.kind === 'market_closed' || c.kind === 'symbol_unavailable') {
+      if (await this.ensureSymbolAvailable(c.kind)) return; // mudou → tenta já no novo mercado
+    }
 
-    if (err instanceof DerivApiError && FATAL_AUTH_CODES.has(err.code)) {
-      this.log('error', `Erro de autenticação (${err.code}): ${msg} — bot parado.`);
-      this.setError(`${err.code}: ${msg}`);
+    // Erros em que repetir não adianta (auth, stake fora dos limites,
+    // contrato/mercado/moeda indisponível para o país): para já, com
+    // mensagem clara, em vez de 3 tentativas inúteis.
+    if (c.fatal) {
+      this.log('error', `${c.userMessage} Bot parado.`, { code: c.code });
+      this.setError(c.userMessage);
+      return;
+    }
+
+    // Mercado fechado / rate limit: espera sem contar como falha.
+    if (c.cooldownMs > 0) {
+      this.cooldownUntil = Date.now() + c.cooldownMs;
+      this.log('warn', c.userMessage, { code: c.code, waitMs: c.cooldownMs });
       return;
     }
 
     this.consecutiveErrors++;
-    this.log('error', `Erro na operação (${this.consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${msg}`);
+    this.log('error', `Erro na operação (${this.consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}): ${c.message}`);
     if (this.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-      this.setError(msg);
+      this.setError(c.message);
     }
   }
+
+  // ─── Mudança automática de mercado ────────────────────────
+
+  setSymbolResolver(resolver: SymbolResolver | null): void {
+    this.symbolResolver = resolver;
+    if (resolver && this.active) this.startSymbolWatch();
+    if (!resolver) this.stopSymbolWatch();
+  }
+
+  private startSymbolWatch(): void {
+    if (!this.symbolResolver || this.symbolTimer) return;
+    this.symbolTimer = setInterval(() => {
+      if (this.active) void this.ensureSymbolAvailable('verificação periódica');
+    }, SYMBOL_WATCH_MS);
+    this.symbolTimer.unref?.();
+  }
+
+  private stopSymbolWatch(): void {
+    if (this.symbolTimer) {
+      clearInterval(this.symbolTimer);
+      this.symbolTimer = null;
+    }
+  }
+
+  /**
+   * Verifica se o mercado atual está operável; se não, muda para outro.
+   * Devolve true se mudou de mercado.
+   */
+  protected async ensureSymbolAvailable(trigger: string): Promise<boolean> {
+    if (!this.symbolResolver || this.switchingSymbol || !this.active) return false;
+    this.switchingSymbol = true;
+    try {
+      const res = await this.symbolResolver(this.state.strategy, this.state.config, this.state.config.symbol);
+      if (res.symbol === null) {
+        this.log('warn', `Sem mercado alternativo aberto (${res.reason ?? trigger}) — a aguardar.`);
+        return false;
+      }
+      if (res.changed && res.symbol !== this.state.config.symbol) {
+        const from = this.state.config.symbol;
+        this.state.config = { ...this.state.config, symbol: res.symbol };
+        this.log('warn', `Mercado ${from} indisponível (${res.reason ?? trigger}) — a mudar para ${res.symbol}.`, {
+          from, to: res.symbol,
+        });
+        await this.onSymbolChanged(from, res.symbol);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      this.log('warn', `Não foi possível verificar o mercado: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    } finally {
+      this.switchingSymbol = false;
+    }
+  }
+
+  /** Estratégias com subscrição própria de ticks sobrepõem isto para re-subscrever no novo mercado. */
+  protected async onSymbolChanged(_from: string, _to: string): Promise<void> { /* por omissão: nada */ }
 
   // ─── Condições de paragem ─────────────────────────────────
 
@@ -297,6 +406,7 @@ export abstract class BaseStrategy extends EventEmitter {
     this.active = false;
     this.generation++;
     this.clearLoopTimer();
+    this.stopSymbolWatch();
     this.state.status = 'error';
     this.state.lastError = message;
     this.emit('bot:error', this.buildEvent('bot:error', { error: message }));

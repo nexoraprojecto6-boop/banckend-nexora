@@ -189,6 +189,7 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
         exitTime: new Date(),
       };
 
+      this.tradeContractType = contractType;
       this.recordTradeResult(tradeResult);
       await this.adjustStake(result.won, Math.abs(result.profit));
 

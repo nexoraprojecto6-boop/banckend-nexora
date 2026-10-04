@@ -1,15 +1,22 @@
 // ============================================================
 // NEXORA FOREX — Auth Routes
 //
-// 1) Deriv OAuth2 + PKCE — INTOCADO.
+// 1) Deriv OAuth2 + PKCE — INTOCADO (exceto validação de parâmetros).
 // 2) Login local (email + senha) — se o email ainda não existe, a
 //    conta é criada na hora e gravada no Redis. Não há registo
 //    separado e não há verificação de email.
+//
+// Correcções vs v1:
+//   ✅ /validate verificava só se a API da Deriv estava viva (health),
+//      NÃO se o token era válido → devolvia valid:true com token expirado.
+//      Agora valida o token de verdade (getAccounts).
+//   ✅ /login: `prompt` e parâmetros de afiliado vindos da query são validados
+//      (antes iam, sem filtro, para o URL de autorização da Deriv).
 // ============================================================
 
 import { Router, Request, Response, NextFunction } from 'express'
 import { AuthService } from '@services/auth.service.js'
-import { DerivAPIService } from '@services/deriv-api.service.js'
+import { DerivAPIService, DerivTokenExpiredError } from '@services/deriv-api.service.js'
 import { UserService, WeakPasswordError } from '@services/user.service.js'
 import { authLimiter } from '@middleware/security.js'
 import { signLocalToken, requireLocalAuth } from '@middleware/auth-local.middleware.js'
@@ -20,19 +27,23 @@ import { RegisterSchema, LocalLoginSchema } from '../types/schemas.js'
 const router: Router = Router()
 const FRONTEND_URL   = config.frontend.url
 
+// Só texto curto e simples: evita injetar lixo no URL de autorização
+const cleanParam = (v: unknown): string | undefined =>
+  typeof v === 'string' && v.length > 0 && v.length <= 100 && /^[\w.\-~:@+ ]+$/.test(v) ? v : undefined
+
 // ============================================================
-// 1) DERIV OAUTH — sem alterações
+// 1) DERIV OAUTH
 // ============================================================
 
 router.get('/login', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const prompt    = (req.query.prompt as 'login' | 'registration') || 'login'
+    const prompt: 'login' | 'registration' = req.query.prompt === 'registration' ? 'registration' : 'login'
     const isSignup  = prompt === 'registration'
 
-    const sidc        = (req.query.sidc        as string | undefined) ?? (isSignup ? config.affiliate.sidc        : undefined)
-    const utmCampaign = (req.query.utm_campaign as string | undefined) ?? (isSignup ? config.affiliate.utmCampaign : undefined)
-    const utmMedium   = (req.query.utm_medium   as string | undefined) ?? (isSignup ? config.affiliate.utmMedium   : undefined)
-    const utmSource   = (req.query.utm_source   as string | undefined) ?? (isSignup ? config.affiliate.utmSource   : undefined)
+    const sidc        = cleanParam(req.query.sidc)         ?? (isSignup ? config.affiliate.sidc        : undefined)
+    const utmCampaign = cleanParam(req.query.utm_campaign) ?? (isSignup ? config.affiliate.utmCampaign : undefined)
+    const utmMedium   = cleanParam(req.query.utm_medium)   ?? (isSignup ? config.affiliate.utmMedium   : undefined)
+    const utmSource   = cleanParam(req.query.utm_source)   ?? (isSignup ? config.affiliate.utmSource   : undefined)
 
     const { url: authUrl } = await AuthService.buildAuthorizationUrl({
       prompt, sidc, utmCampaign, utmMedium, utmSource,
@@ -46,7 +57,7 @@ router.get('/login', authLimiter, async (req: Request, res: Response, next: Next
   }
 })
 
-router.get('/callback', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/callback', authLimiter, async (req: Request, res: Response, _next: NextFunction) => {
   try {
     const code  = req.query.code  as string | undefined
     const state = req.query.state as string | undefined
@@ -71,7 +82,7 @@ router.get('/callback', authLimiter, async (req: Request, res: Response, next: N
     }
 
     const token   = await AuthService.exchangeCodeForToken(code, codeVerifier)
-    const session = AuthService.createSession(token.accessToken, token.expiresIn)
+    const session = AuthService.createSession(token.accessToken, token.expiresIn, token.refreshToken)
 
     logger.info('[Auth] User authenticated', { userId: session.userId })
 
@@ -86,10 +97,10 @@ router.get('/callback', authLimiter, async (req: Request, res: Response, next: N
 
 router.get('/signup', authLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const sidc        = (req.query.sidc        as string | undefined) ?? config.affiliate.sidc
-    const utmCampaign = (req.query.utm_campaign as string | undefined) ?? config.affiliate.utmCampaign
-    const utmMedium   = (req.query.utm_medium   as string | undefined) ?? config.affiliate.utmMedium
-    const utmSource   = (req.query.utm_source   as string | undefined) ?? config.affiliate.utmSource
+    const sidc        = cleanParam(req.query.sidc)         ?? config.affiliate.sidc
+    const utmCampaign = cleanParam(req.query.utm_campaign) ?? config.affiliate.utmCampaign
+    const utmMedium   = cleanParam(req.query.utm_medium)   ?? config.affiliate.utmMedium
+    const utmSource   = cleanParam(req.query.utm_source)   ?? config.affiliate.utmSource
 
     const { url: signupUrl } = await AuthService.buildAuthorizationUrl({
       prompt: 'registration', sidc, utmCampaign, utmMedium, utmSource,
@@ -113,12 +124,18 @@ router.post('/logout', (_req: Request, res: Response, next: NextFunction) => {
   }
 })
 
+// Valida o TOKEN (não só a saúde da API): getAccounts devolve 401/403 se o token
+// for inválido/expirado. Falhas de rede/Deriv NÃO dizem nada sobre o token → erro normal.
 router.get('/validate', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const token    = AuthService.extractBearerToken(req.headers.authorization)
-    const derivAPI = new DerivAPIService(token)
-    const health   = await derivAPI.healthCheck()
-    res.json({ success: true, valid: health.status === 'ok' })
+    const token = AuthService.extractBearerToken(req.headers.authorization)
+    try {
+      await new DerivAPIService(token).getAccounts()
+      return res.json({ success: true, valid: true })
+    } catch (e) {
+      if (e instanceof DerivTokenExpiredError) return res.json({ success: true, valid: false })
+      throw e
+    }
   } catch (error) {
     logger.error('[Auth] Token validation failed', { error })
     next(error)

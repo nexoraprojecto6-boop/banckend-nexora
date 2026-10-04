@@ -1,5 +1,5 @@
 // ============================================================
-// NEXORA FOREX — Server v2
+// NEXORA FOREX — Server v2.1
 // ============================================================
 // Correcções vs v1 (além das já documentadas na versão anterior):
 //   ✅ Tráfego dos bots já NÃO é reencaminhado ao frontend: o router
@@ -24,6 +24,26 @@
 //      criavam dois WS Deriv, um deles órfão)
 //   ✅ Cliente "morto" detectado (ping/pong com isAlive) → sessão e bots
 //      libertados; limite de payload e de mensagens/s por cliente
+//
+// Novo na v2.1 (anti-429 da Deriv — "Unexpected server response: 429"):
+//   ✅ FUGA de ligações corrigida: se o cliente saía a meio da
+//      autenticação (reload/fechar separador), a ligação à Deriv abria
+//      depois da limpeza e ficava órfã para sempre (ping incluído),
+//      ocupando um dos 5 slots por utilizador. Agora é fechada.
+//   ✅ Fecho limpo (close frame + espera pelo 'close', máx. 1,5 s) do WS
+//      da Deriv em trocas de conta, sessão duplicada e limpeza. Antes:
+//      terminate() (TCP destruído sem close frame) e a nova ligação
+//      abria logo a seguir, com o slot ainda ocupado do lado da Deriv.
+//   ✅ Lock por conta: sessão duplicada + OTP + handshake correm UM de
+//      cada vez por accountId (antes: rajada de pedidos em paralelo).
+//   ✅ Espaçamento mínimo de 1,5 s entre handshakes da mesma conta.
+//   ✅ Retry NO SERVIDOR (até 4 tentativas, OTP novo em cada uma, backoff
+//      com jitter; em 429 o dobro). Antes: 1 falha → AUTH_TEMPORARY →
+//      ws.close() → o frontend reconectava e repetia o ciclo todo.
+//   ✅ Reconexão da Deriv respeita o lock/espaçamento e não corre em
+//      paralelo com uma autenticação; em 429 espera ≥ 5 s.
+//   ✅ Pedido de auth durante outra auth já não é descartado: guarda o
+//      último e corre-o a seguir (trocas de conta demo ↔ real).
 // ============================================================
 
 import 'express-async-errors';
@@ -49,7 +69,7 @@ import labelsRoutes            from '@routes/labels.routes.js';
 import adminUsersRoutes        from '@routes/admin-users.routes.js';
 import notificationsRoutes     from '@routes/notifications.routes.js';
 import adminNotificationsRoutes from '@routes/admin-notifications.routes.js';
-import { DerivAPIService, DerivTokenExpiredError } from '@services/deriv-api.service.js';
+import { DerivAPIService, DerivTokenExpiredError, isHandshakeRateLimited } from '@services/deriv-api.service.js';
 import { BotManager }      from './bots/bot.manager.js';
 import { BotCatalog }      from './bots/bot-catalog.js';
 import { createDerivWsAdapter } from './bots/deriv-ws.adapter.js';
@@ -74,6 +94,14 @@ const CLIENT_MAX_PAYLOAD   = 1_000_000;
 const CLIENT_MSGS_PER_SEC  = 60;
 const CLIENT_REQ_ID_LIMIT  = 1_000_000; // req_id do cliente < 1M; internos >= 1M
 const MAX_CLIENT_SUBS      = 200;
+
+// ─── Ligação à Deriv (anti-429) ───────────────────────────────
+const UPSTREAM_CLOSE_WAIT_MS        = 1_500; // espera pelo close frame antes de terminate()
+const UPSTREAM_MIN_GAP_MS           = 1_500; // mínimo entre handshakes da mesma conta
+const UPSTREAM_CONNECT_TRIES        = 4;     // tentativas por autenticação
+const UPSTREAM_RETRY_BASE_MS        = 1_500;
+const UPSTREAM_RETRY_MAX_MS         = 8_000;
+const UPSTREAM_RATE_LIMIT_FLOOR_MS  = 5_000; // reconexão após 429: espera mínima
 
 // ─── Admins ───────────────────────────────────────────────────
 const ADMIN_IDS = new Set<string>(
@@ -106,6 +134,7 @@ interface ClientSession {
   reconnectAttempts:    number;
   authenticated:        boolean;
   authenticating:       boolean;
+  pendingAuth:          { token: string; accountId?: string } | null; // último auth pedido durante outro
   isAdmin:              boolean;
   isAlive:              boolean;
   botManager:           BotManager | null;
@@ -132,6 +161,8 @@ const sessionsByAccount = new Map<string, WebSocket>();
 
 // ─── Helpers ──────────────────────────────────────────────────
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 function sendToClient(ws: WebSocket, type: string, payload: Record<string, unknown> = {}): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type, ...payload }));
@@ -148,7 +179,15 @@ function getNextReqId(session: ClientSession): number {
   return session.nextReqId;
 }
 
+/** 429 do handshake do WS ou do REST (OTP/contas). */
+function isRateLimited(err: unknown): boolean {
+  return isHandshakeRateLimited(err) || (err as { status?: number } | null)?.status === 429;
+}
+
 // ─── Encerrar derivWs com segurança ───────────────────────────
+// terminate() imediato: usar só em ligações já mortas/falhadas ou
+// quando não vale a pena esperar. Para trocas de conta/limpeza de
+// sessão usar closeDerivWsGracefully().
 function safeTerminateDerivWs(session: ClientSession): void {
   if (session.derivPingInterval) {
     clearInterval(session.derivPingInterval);
@@ -175,6 +214,64 @@ function safeTerminateDerivWs(session: ClientSession): void {
   } catch (err: any) {
     logger.warn('[WS] Erro ao terminar derivWs (ignorado)', { message: err?.message });
   }
+}
+
+/**
+ * Fecha a ligação à Deriv com close frame e espera (máx. waitMs) pelo
+ * 'close', para a Deriv libertar o slot ANTES de abrirmos outra. Limite
+ * da Deriv: 5 ligações simultâneas por utilizador.
+ * Também faz session.derivWs = null.
+ */
+function closeDerivWsGracefully(
+  session: ClientSession,
+  waitMs = UPSTREAM_CLOSE_WAIT_MS,
+): Promise<void> {
+  if (session.derivPingInterval) {
+    clearInterval(session.derivPingInterval);
+    session.derivPingInterval = null;
+  }
+
+  const ws = session.derivWs;
+  if (!ws) return Promise.resolve();
+  session.derivWs = null;
+
+  // Ainda a ligar: terminate() faz o handshake falhar logo e o listener de
+  // erro de connectToDerivWS rejeita a promessa (sem ficar 10 s pendurada).
+  // Os listeners ficam de propósito.
+  if (ws.readyState === WebSocket.CONNECTING) {
+    destroyMessageRouter(ws);
+    ws.on('error', () => { /* esperado */ });
+    try { ws.terminate(); } catch { /* ignorar */ }
+    return Promise.resolve();
+  }
+
+  if (session.derivMessageHandler) {
+    ws.removeListener('message', session.derivMessageHandler);
+    session.derivMessageHandler = null;
+  }
+  destroyMessageRouter(ws);
+  ws.removeAllListeners();
+  ws.on('error', () => { /* esperado */ });
+
+  if (ws.readyState === WebSocket.CLOSED) return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch { /* ignorar */ }
+      resolve();
+    }, waitMs);
+    ws.once('close', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    try {
+      ws.close(1000, 'Sessão encerrada');
+    } catch {
+      clearTimeout(timer);
+      try { ws.terminate(); } catch { /* ignorar */ }
+      resolve();
+    }
+  });
 }
 
 // ─── Aguardar WS disponível ───────────────────────────────────
@@ -396,9 +493,104 @@ async function connectToDerivWS(
   });
 }
 
+// ─── Lock por conta + espaçamento entre handshakes ────────────
+// Sessão duplicada + OTP + handshake de UMA conta correm um de cada vez;
+// e há um intervalo mínimo entre handshakes da mesma conta.
+
+const accountLocks = new Map<string, Promise<unknown>>();
+const lastHandshakeAt = new Map<string, number>();
+
+function withAccountLock<T>(accountId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = accountLocks.get(accountId) ?? Promise.resolve();
+  const run = prev.catch(() => undefined).then(fn);
+  const tail = run.catch(() => undefined);
+  accountLocks.set(accountId, tail);
+  void tail.then(() => {
+    if (accountLocks.get(accountId) === tail) accountLocks.delete(accountId);
+  });
+  return run;
+}
+
+function noteHandshake(accountId: string): void {
+  const now = Date.now();
+  lastHandshakeAt.set(accountId, now);
+  if (lastHandshakeAt.size > 500) {
+    for (const [id, at] of lastHandshakeAt) {
+      if (now - at > 60_000) lastHandshakeAt.delete(id);
+    }
+  }
+}
+
+async function waitHandshakeGap(accountId: string): Promise<void> {
+  const wait = UPSTREAM_MIN_GAP_MS - (Date.now() - (lastHandshakeAt.get(accountId) ?? 0));
+  if (wait > 0) await sleep(wait);
+}
+
+/**
+ * OTP novo + handshake com a Deriv, com retry no servidor (backoff com
+ * jitter; o dobro quando é 429). O cliente do frontend não é fechado
+ * entre tentativas. Chamar SEMPRE dentro de withAccountLock.
+ */
+async function openUpstream(
+  clientWs: WebSocket,
+  session: ClientSession,
+  derivAPI: DerivAPIService,
+  accountId: string,
+): Promise<void> {
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= UPSTREAM_CONNECT_TRIES; attempt++) {
+    if (clientWs.readyState !== WebSocket.OPEN || !sessions.has(clientWs)) {
+      throw new Error('Cliente desligou durante a autenticação');
+    }
+
+    await waitHandshakeGap(accountId);
+
+    try {
+      // OTP é de uso único: um novo em CADA tentativa
+      const otpData = await derivAPI.getOTP(accountId);
+      noteHandshake(accountId);
+      await connectToDerivWS(clientWs, otpData.url, session);
+
+      // O cliente pode ter saído enquanto ligávamos: fechar já, senão a
+      // ligação à Deriv ficava órfã (e ocupava um dos 5 slots).
+      if (clientWs.readyState !== WebSocket.OPEN || !sessions.has(clientWs)) {
+        await closeDerivWsGracefully(session);
+        throw new Error('Cliente desligou durante a autenticação');
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (err instanceof DerivTokenExpiredError) throw err; // repetir não adianta
+      if (clientWs.readyState !== WebSocket.OPEN || !sessions.has(clientWs)) throw err;
+
+      // socket falhado ainda pendurado em session.derivWs
+      if (session.derivWs) safeTerminateDerivWs(session);
+      session.derivWs = null;
+
+      if (attempt === UPSTREAM_CONNECT_TRIES) break;
+
+      const limited = isRateLimited(err);
+      const base = Math.min(
+        UPSTREAM_RETRY_BASE_MS * 2 ** (attempt - 1) * (limited ? 2 : 1),
+        UPSTREAM_RETRY_MAX_MS,
+      );
+      const delay = Math.round(base * (0.8 + Math.random() * 0.4));
+      logger.warn('[WS] Ligação à Deriv falhou — nova tentativa', {
+        attempt, of: UPSTREAM_CONNECT_TRIES, delayMs: delay, rateLimited: limited,
+        error: (err as Error)?.message,
+      });
+      sendToClient(clientWs, 'deriv_retrying', { payload: { attempt, delayMs: delay, rateLimited: limited } });
+      await sleep(delay);
+    }
+  }
+
+  throw lastErr;
+}
+
 // ─── Reconexão Deriv com novo OTP ────────────────────────────
 
-function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): void {
+function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession, rateLimited = false): void {
   if (clientWs.readyState !== WebSocket.OPEN) return;
   if (!session.authenticated || !session.token || !session.accountId) return;
   if (session.reconnectAttempts >= RECONNECT_MAX_TRIES) {
@@ -408,34 +600,54 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession): vo
     return;
   }
 
-  const base  = Math.min(RECONNECT_BASE_MS * Math.pow(2, session.reconnectAttempts), RECONNECT_MAX_MS);
+  const base  = Math.max(
+    Math.min(RECONNECT_BASE_MS * Math.pow(2, session.reconnectAttempts), RECONNECT_MAX_MS),
+    rateLimited ? UPSTREAM_RATE_LIMIT_FLOOR_MS : 0,
+  );
   const delay = Math.floor(base + Math.random() * 0.3 * base);
   session.reconnectAttempts++;
 
   logger.info('[WS] Reconexão Deriv agendada', {
-    attempt: session.reconnectAttempts, delayMs: delay, accountId: session.accountId,
+    attempt: session.reconnectAttempts, delayMs: delay, accountId: session.accountId, rateLimited,
   });
 
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
 
   session.reconnectTimer = setTimeout(async () => {
     session.reconnectTimer = null;
-    if (clientWs.readyState !== WebSocket.OPEN) return;
-    try {
-      const derivAPI = new DerivAPIService(session.token);
-      const otpData  = await derivAPI.getOTP(session.accountId!);
-      // descarta um socket falhado que ainda esteja pendurado
-      if (session.derivWs) safeTerminateDerivWs(session);
-      await connectToDerivWS(clientWs, otpData.url, session);
-      session.reconnectAttempts = 0;
+    // Se há uma autenticação em curso, é ela que trata da ligação
+    if (clientWs.readyState !== WebSocket.OPEN || session.authenticating) return;
+    const accountId = session.accountId;
+    if (!accountId) return;
 
-      // Os bots NÃO são parados: o adapter lê session.derivWs e volta a
-      // subscrever ticks/contratos sozinho na nova ligação.
-      if (!session.botManager) initBotManagerForSession(clientWs, session);
-      sendToClient(clientWs, 'deriv_reconnected', { message: 'Conexão Deriv restabelecida' });
+    try {
+      await withAccountLock(accountId, async () => {
+        if (!sessions.has(clientWs) || session.authenticating) return;
+
+        await waitHandshakeGap(accountId);
+        const derivAPI = new DerivAPIService(session.token);
+        const otpData  = await derivAPI.getOTP(accountId);
+        // descarta um socket falhado que ainda esteja pendurado
+        if (session.derivWs) safeTerminateDerivWs(session);
+        noteHandshake(accountId);
+        await connectToDerivWS(clientWs, otpData.url, session);
+
+        // cliente saiu enquanto ligávamos: não deixar a ligação órfã
+        if (clientWs.readyState !== WebSocket.OPEN || !sessions.has(clientWs)) {
+          await closeDerivWsGracefully(session);
+          return;
+        }
+
+        session.reconnectAttempts = 0;
+
+        // Os bots NÃO são parados: o adapter lê session.derivWs e volta a
+        // subscrever ticks/contratos sozinho na nova ligação.
+        if (!session.botManager) initBotManagerForSession(clientWs, session);
+        sendToClient(clientWs, 'deriv_reconnected', { message: 'Conexão Deriv restabelecida' });
+      });
     } catch (err: any) {
       logger.error('[WS] Falha na reconexão Deriv', { error: err.message });
-      scheduleDerivReconnect(clientWs, session);
+      scheduleDerivReconnect(clientWs, session, isRateLimited(err));
     }
   }, delay);
 }
@@ -810,7 +1022,9 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
   if (!session) return;
 
   if (session.authenticating) {
-    sendError(ws, 'Autenticação já em curso.', 'AUTH_IN_PROGRESS');
+    // Autenticação em curso: guarda o ÚLTIMO pedido (ex: troca demo ↔ real)
+    // e corre-o quando a atual terminar, em vez de o descartar.
+    session.pendingAuth = { token, accountId };
     return;
   }
   session.authenticating = true;
@@ -825,8 +1039,8 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     }
 
     if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
-    safeTerminateDerivWs(session);
-    session.derivWs = null;
+    // fecho limpo: a Deriv liberta o slot antes de abrirmos a nova ligação
+    await closeDerivWsGracefully(session);
     session.clientSubs.clear();
     session.symbolsCache = null;
     session.symbolsByTypes.clear();
@@ -843,32 +1057,38 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
 
     const targetAccountId = target.account_id;
 
-    const existingWs = sessionsByAccount.get(targetAccountId);
-    if (existingWs && existingWs !== ws) {
-      logger.warn('[WS] Sessão duplicada detectada, a fechar a antiga', { accountId: targetAccountId });
-      await cleanupSession(existingWs);
-      existingWs.close(1001, 'Sessão substituída por nova conexão');
-    }
+    // Sessão duplicada + OTP + handshake: um de cada vez por conta
+    const connected = await withAccountLock(targetAccountId, async (): Promise<boolean> => {
+      if (!sessions.has(ws)) return false; // o cliente já saiu enquanto esperava
 
-    // troca de conta: libertar o registo da conta anterior
-    if (session.accountId && session.accountId !== targetAccountId
-        && sessionsByAccount.get(session.accountId) === ws) {
-      sessionsByAccount.delete(session.accountId);
-    }
+      const existingWs = sessionsByAccount.get(targetAccountId);
+      if (existingWs && existingWs !== ws) {
+        logger.warn('[WS] Sessão duplicada detectada, a fechar a antiga', { accountId: targetAccountId });
+        await cleanupSession(existingWs); // espera o fecho da ligação à Deriv
+        existingWs.close(1001, 'Sessão substituída por nova conexão');
+      }
 
-    session.token         = token;
-    session.accountId     = targetAccountId;
-    session.currency      = target.currency ?? 'USD';
-    session.isAdmin       = ADMIN_IDS.has(targetAccountId);
-    session.authenticated = true;
-    session.reconnectAttempts = 0;
+      // troca de conta: libertar o registo da conta anterior
+      if (session.accountId && session.accountId !== targetAccountId
+          && sessionsByAccount.get(session.accountId) === ws) {
+        sessionsByAccount.delete(session.accountId);
+      }
 
-    sessionsByAccount.set(targetAccountId, ws);
+      session.token         = token;
+      session.accountId     = targetAccountId;
+      session.currency      = target.currency ?? 'USD';
+      session.isAdmin       = ADMIN_IDS.has(targetAccountId);
+      session.authenticated = true;
+      session.reconnectAttempts = 0;
 
-    const otpData = await derivAPI.getOTP(targetAccountId);
-    if (!otpData.url) { sendError(ws, 'Falha ao obter URL WS', 'OTP_FAILED'); ws.close(); return; }
+      sessionsByAccount.set(targetAccountId, ws);
 
-    await connectToDerivWS(ws, otpData.url, session);
+      await openUpstream(ws, session, derivAPI, targetAccountId);
+      return true;
+    });
+
+    if (!connected) return;
+
     initBotManagerForSession(ws, session);
 
     sendToClient(ws, 'authenticated', {
@@ -897,12 +1117,29 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
       // token inválido/expirado: o frontend deve terminar a sessão
       sendError(ws, 'A sessão Deriv expirou. Faça login novamente.', 'AUTH_FAILED');
     } else {
-      // falha temporária (rede, Deriv em baixo, rate limit): NÃO terminar a sessão
-      sendError(ws, 'Não foi possível ligar à Deriv agora. A tentar de novo…', 'AUTH_TEMPORARY');
+      // falha temporária (rede, Deriv em baixo, 429): NÃO terminar a sessão.
+      // O frontend reconecta com backoff longo ao receber AUTH_TEMPORARY.
+      sendError(
+        ws,
+        isRateLimited(err)
+          ? 'A Deriv limitou temporariamente as ligações. A tentar de novo dentro de instantes…'
+          : 'Não foi possível ligar à Deriv agora. A tentar de novo…',
+        'AUTH_TEMPORARY',
+      );
     }
     ws.close();
   } finally {
     session.authenticating = false;
+
+    // houve outro pedido de auth enquanto este corria: processa o último
+    const next = session.pendingAuth;
+    session.pendingAuth = null;
+    if (next && ws.readyState === WebSocket.OPEN && sessions.has(ws)) {
+      const same = session.authenticated
+        && next.token === session.token
+        && (!next.accountId || next.accountId === session.accountId);
+      if (!same) void authenticateClient(ws, next.token, next.accountId);
+    }
   }
 }
 
@@ -920,14 +1157,15 @@ async function cleanupSession(ws: WebSocket): Promise<void> {
   if (session.pingInterval)   clearInterval(session.pingInterval);
   if (session.authTimeout)    clearTimeout(session.authTimeout);
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+  session.pendingAuth = null;
 
   if (session.botManager) {
     try { await session.botManager.stopAll(); } catch { /* ignorar */ }
     session.botManager.removeAllListeners();
   }
 
-  safeTerminateDerivWs(session);
-  session.derivWs = null;
+  // fecho limpo (close frame): liberta o slot na Deriv de imediato
+  await closeDerivWsGracefully(session);
   session.adapter = null;
 }
 
@@ -954,7 +1192,7 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     derivWs: null, derivMessageHandler: null, derivPingInterval: null, adapter: null,
     token: '', accountId: null, currency: 'USD',
     pingInterval: null, authTimeout: null, reconnectTimer: null,
-    reconnectAttempts: 0, authenticated: false, authenticating: false,
+    reconnectAttempts: 0, authenticated: false, authenticating: false, pendingAuth: null,
     isAdmin: false, isAlive: true,
     botManager: null, nextReqId: 900_000,
     clientSubs: new Map(), symbolsCache: null, symbolsByTypes: new Map(), msgWindowStart: 0, msgCount: 0,
@@ -1183,6 +1421,8 @@ const gracefulShutdown = async (signal: string) => {
   logger.info(`${signal} recebido, a encerrar...`);
   const forceExit = setTimeout(() => process.exit(1), 30_000);
   forceExit.unref?.();
+  // cleanupSession fecha o WS da Deriv com close frame (liberta o slot
+  // antes de a instância nova arrancar no deploy do Render)
   await Promise.allSettled([...sessions.keys()].map(async (clientWs) => {
     await cleanupSession(clientWs);
     clientWs.close();

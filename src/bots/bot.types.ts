@@ -51,6 +51,8 @@ export interface ScalperParams {
   pauseSeconds: number;        // duração da pausa automática, em segundos
   decimalPlaces?: number;      // casas decimais assumidas até chegar o 1.º tick (o pip_size real
                                 //   do tick tem prioridade). Padrão: 2
+  entryFilter?: boolean;       // true (padrão) = só entra quando o último dígito <= predictDigit;
+                                //   false = entra em todos os ticks (mais rápido)
 }
 
 // Parâmetros do bot ALFHA — opera Over e Under conforme o último dígito.

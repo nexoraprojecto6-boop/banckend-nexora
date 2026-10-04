@@ -1,5 +1,5 @@
 // ============================================================
-// NEXORA FOREX — Deriv API Service v2
+// NEXORA FOREX — Deriv API Service v2.1
 // ============================================================
 // Correcções vs v1:
 //   ✅ Erros REST lidos do envelope oficial (errors[0].code/message).
@@ -12,9 +12,19 @@
 //      → 2× JSON.parse por tick)
 //   ✅ perMessageDeflate desligado + handshakeTimeout
 //   ✅ healthCheck sem Authorization (endpoint público)
+//
+// Novo na v2.1 (anti-429):
+//   ✅ getAccounts com cache curto (5 s) + single-flight por token:
+//      /me, auth do WS e trocas de conta feitas em rajada partilham UMA
+//      chamada REST (limite Deriv: 60 req/min por token). Antes cada
+//      reconexão fazia GET contas + POST otp e a rajada ficava perto do teto.
+//      getAccounts({ fresh: true }) ignora o cache.
+//   ✅ isHandshakeRateLimited(err): detecta o 429 do handshake do WS
+//      ("Unexpected server response: 429") para o server.ts reagir.
 // ============================================================
 
 import axios, { AxiosError } from 'axios';
+import { createHash } from 'crypto';
 import WebSocket from 'ws';
 import logger from '@utils/logger.js';
 import { config } from '@config/index.js';
@@ -41,6 +51,15 @@ export class DerivRestError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+/**
+ * O handshake do WebSocket foi recusado com 429 (limite de ligações/taxa
+ * da Deriv). A lib `ws` expõe isto só como mensagem de erro.
+ */
+export function isHandshakeRateLimited(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /Unexpected server response:\s*429/.test(msg);
 }
 
 const TOKEN_ERROR_CODES = ['InvalidToken', 'AuthorizationRequired', 'Unauthorized', 'PermissionDenied'];
@@ -131,6 +150,30 @@ export interface MarkupStatisticsResponse {
   meta: { endpoint: string; method: string; timing: number };
 }
 
+// ─── Cache curto de contas (anti-rajada) ─────────────────────
+// Partilhado entre instâncias do serviço (que são criadas por pedido).
+// Chave = hash do token (o token nunca fica como chave em claro).
+
+const ACCOUNTS_TTL_MS = 5_000;
+const ACCOUNTS_PRUNE_MS = 60_000;
+
+interface AccountsCacheEntry {
+  at: number;
+  data?: AccountsResponse;
+  inflight?: Promise<AccountsResponse>;
+}
+
+const accountsCache = new Map<string, AccountsCacheEntry>();
+
+const tokenKey = (token: string): string =>
+  createHash('sha256').update(token).digest('hex').slice(0, 32);
+
+function pruneAccountsCache(now: number): void {
+  for (const [key, entry] of accountsCache) {
+    if (!entry.inflight && now - entry.at > ACCOUNTS_PRUNE_MS) accountsCache.delete(key);
+  }
+}
+
 // ─── DerivAPIService ──────────────────────────────────────────
 
 export class DerivAPIService {
@@ -152,7 +195,35 @@ export class DerivAPIService {
 
   // ── Contas ───────────────────────────────────────────────
 
-  async getAccounts(): Promise<AccountsResponse> {
+  /**
+   * Cache de 5 s + single-flight: chamadas simultâneas (ex: /me e auth do
+   * WS) partilham o mesmo pedido REST. Use { fresh: true } para forçar.
+   */
+  async getAccounts(opts: { fresh?: boolean } = {}): Promise<AccountsResponse> {
+    const key = tokenKey(this.token);
+    const now = Date.now();
+    const hit = accountsCache.get(key);
+
+    if (!opts.fresh && hit) {
+      if (hit.inflight) return hit.inflight;
+      if (hit.data && now - hit.at < ACCOUNTS_TTL_MS) return hit.data;
+    }
+
+    const inflight = this.fetchAccounts();
+    accountsCache.set(key, { at: now, inflight });
+
+    try {
+      const data = await inflight;
+      accountsCache.set(key, { at: Date.now(), data });
+      pruneAccountsCache(Date.now());
+      return data;
+    } catch (error) {
+      accountsCache.delete(key);
+      throw error;
+    }
+  }
+
+  private async fetchAccounts(): Promise<AccountsResponse> {
     try {
       const response = await withRetry(() =>
         axios.get<AccountsResponse>(`${DERIV_REST_BASE}/trading/v1/options/accounts`, {

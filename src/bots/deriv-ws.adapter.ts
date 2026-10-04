@@ -32,6 +32,7 @@ import { WebSocket } from 'ws';
 import { DerivWsAdapter } from './bot.types.js';
 import { getMessageRouter } from './message-router.js';
 import { nextReqId } from '@utils/req-id.js';
+import { roundToCurrency } from '@utils/currency.js';
 import logger from '@utils/logger.js';
 
 // ─── Erro tipado da Deriv ────────────────────────────────────
@@ -59,12 +60,8 @@ const DURATION_UNIT_MAP: Record<string, string> = {
   ticks: 't', t: 't', s: 's', m: 'm', h: 'h', d: 'd',
 };
 
-const CRYPTO_8_DECIMALS = new Set(['BTC', 'ETH', 'LTC']);
-
-function roundStake(stake: number, currency: string): number {
-  const decimals = CRYPTO_8_DECIMALS.has(currency.toUpperCase()) ? 8 : 2;
-  return Number(stake.toFixed(decimals));
-}
+// Casas decimais por moeda (BTC/ETH/LTC: 8; fiat e stablecoins: 2) — ver utils/currency.ts
+const roundStake = roundToCurrency;
 
 /** Tempo máximo razoável até o contrato fechar (duração + margem). */
 function maxWaitMs(duration: number, unit: string): number {

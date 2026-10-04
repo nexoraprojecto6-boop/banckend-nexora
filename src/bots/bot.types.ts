@@ -14,11 +14,13 @@ export interface BotConfig {
   duration: number;
   durationUnit: 'ticks' | 's' | 'm' | 'h' | 'd';
   initialStake: number;
-  currency: string;            // "USD"
+  currency: string;            // moeda da conta ativa (o servidor força este valor)
   maxTrades?: number;          // 0 = ilimitado
-  maxLoss?: number;            // para se perda total > valor
+  maxLoss?: number;            // para quando a perda LÍQUIDA (−netPnL) >= valor
   maxProfit?: number;          // para se lucro total > valor
   strategyParams?: Record<string, unknown>;
+  // strategyParams.fallbackSymbols?: string[]  → mercados alternativos, por ordem de
+  //   preferência, se o mercado do bot ficar fechado/suspenso/indisponível na conta.
 }
 
 // ─── Parâmetros específicos por estratégia ───────────────────
@@ -47,8 +49,8 @@ export interface ScalperParams {
   maxMartingaleSteps: number;  // nº de níveis de Gale antes de resetar o stake
   pauseLossLimit: number;      // perda acumulada que pausa o bot temporariamente (0 = desactivado)
   pauseSeconds: number;        // duração da pausa automática, em segundos
-  decimalPlaces?: number;      // nº de casas decimais do símbolo, usado para extrair
-                                //   o último dígito corretamente (padrão: 2 se omitido)
+  decimalPlaces?: number;      // casas decimais assumidas até chegar o 1.º tick (o pip_size real
+                                //   do tick tem prioridade). Padrão: 2
 }
 
 // Parâmetros do bot ALFHA — opera Over e Under conforme o último dígito.
@@ -154,9 +156,8 @@ export interface TradeResult {
   won: boolean;
   entryTick?: number;
   exitTick?: number;
-  exitDigit?: number;   // último algarismo do exitTick, já calculado pela
-                          // estratégia (evita recalcular no frontend com
-                          // casas decimais desconhecidas do símbolo)
+  exitDigit?: number;   // último algarismo de exit_spot (string original da Deriv),
+                          // com as casas decimais reais do símbolo
   entryTime: Date;
   exitTime?: Date;
 }
@@ -168,8 +169,7 @@ export interface TradeResult {
 //   automaticamente por ter atingido uma condição de paragem (take
 //   profit, stop de perda, ou limite de trades). payload.reason
 //   identifica qual: 'max_profit_reached' | 'max_loss_reached' |
-//   'max_trades_reached'. O frontend usa isto para mostrar a
-//   mensagem certa ("Meta atingida!", "Stop de perda atingido", etc).
+//   'max_trades_reached'.
 //
 // bot:insufficient_balance — emitido quando uma compra falha por
 //   saldo insuficiente na conta Deriv (erro InsufficientBalance da
@@ -224,18 +224,27 @@ export interface DerivWsAdapter {
     durationUnit: string;
     currency: string;
     barrier?: string;       // necessário para contratos de dígitos (DIGITOVER/DIGITUNDER)
-  }): Promise<{ contractId: string }>;
+  }): Promise<{
+    contractId: string;
+    payout?: number;
+    buyPrice?: number;
+    balanceAfter?: number;
+  }>;
 
   waitForContract(contractId: string): Promise<{
     profit: number;
     won: boolean;
     entryTick: number;
     exitTick: number;
+    entrySpot?: string;     // preço tal como a Deriv o envia (mantém zeros finais)
+    exitSpot?: string;
+    exitDigit?: number;     // último dígito de exitSpot — usar nas estratégias de dígitos
   }>;
 
+  // pipSize: casas decimais do símbolo, enviado pela Deriv em cada tick
   subscribeToTicks(
     symbol: string,
-    onTick: (price: number) => void,
+    onTick: (price: number, pipSize?: number) => void,
   ): { unsubscribe: () => void };
 
   // Pedido único de proposta (payout) sem comprar — usado pelas

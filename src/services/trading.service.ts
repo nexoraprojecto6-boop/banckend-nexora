@@ -4,6 +4,16 @@ import logger from '@utils/logger.js';
 import { DerivAPIService } from './deriv-api.service.js';
 import { ProposalRequest, BuyRequest, SellRequest, ContractUpdate } from '../types/schemas.js';
 
+// ─── Correcções vs v1 ────────────────────────────────────────
+//   ✅ getBalance: já não envia subscribe:1 (cada chamada criava uma subscrição
+//      que nunca era cancelada → esgotava o limite de 100). Para stream use
+//      subscribeBalance().
+//   ✅ getProposal: já não envia `subscribe: 0` (o schema só aceita 1) e é pedido
+//      ÚNICO. Para stream use subscribeProposal(). Aceita `barrier`.
+//   ✅ getTicksHistory: a resposta da Deriv traz `history` (ticks) ou `candles`,
+//      não `ticks_history` (devolvia sempre undefined).
+//   ✅ Erros da Deriv chegam como DerivWsError (com .code) — ver websocket/manager.ts
+
 export class TradingService {
   // público para permitir acesso direto em trading.routes.ts
   public wsManager: WebSocketManager;
@@ -91,6 +101,12 @@ export class TradingService {
     }, onTick);
   }
 
+  /**
+   * Histórico de ticks ou velas.
+   * Devolve { history, candles, pip_size }:
+   *   style 'ticks'   → history: { prices[], times[] }
+   *   style 'candles' → candles: [{ open, high, low, close, epoch }]
+   */
   async getTicksHistory(symbol: string, options: {
     count?: number;
     start?: number;
@@ -102,21 +118,27 @@ export class TradingService {
       const response = await this.wsManager.send({
         ticks_history: symbol,
         end: options.end || 'latest',
-        start: options.start || 1,
         count: options.count || 100,
         style: options.style || 'ticks',
+        adjust_start_time: 1,
+        ...(options.start ? { start: options.start } : {}),
         ...(options.granularity && { granularity: options.granularity }),
       });
-      return response.ticks_history;
+      return {
+        history: response.history,
+        candles: response.candles,
+        pip_size: response.pip_size,
+      };
     } catch (error) {
       logger.error('Failed to get ticks history', { error, symbol });
       throw error;
     }
   }
 
+  // Pedido ÚNICO de saldo. Para acompanhar o saldo use subscribeBalance().
   async getBalance() {
     try {
-      const response = await this.wsManager.send({ balance: 1, subscribe: 1 });
+      const response = await this.wsManager.send({ balance: 1 });
       return response.balance;
     } catch (error) {
       logger.error('Failed to get balance', { error });
@@ -172,18 +194,20 @@ export class TradingService {
     return this.wsManager.subscribe('transaction', { transaction: 1 }, onTransaction);
   }
 
+  // Pedido ÚNICO de proposta. Para acompanhar o preço use subscribeProposal().
   async getProposal(request: ProposalRequest) {
     try {
+      const r = request as ProposalRequest & { barrier?: string };
       const response = await this.wsManager.send({
         proposal: 1,
-        amount: request.amount,
-        basis: request.basis,
-        contract_type: request.contractType,
-        currency: request.currency,
-        duration: request.duration,
-        duration_unit: request.durationUnit,
-        underlying_symbol: request.underlyingSymbol,
-        subscribe: request.subscribe ? 1 : 0,
+        amount: r.amount,
+        basis: r.basis,
+        contract_type: r.contractType,
+        currency: r.currency,
+        duration: r.duration,
+        duration_unit: r.durationUnit,
+        underlying_symbol: r.underlyingSymbol,
+        ...(r.barrier !== undefined ? { barrier: r.barrier } : {}),
       });
 
       return {
@@ -203,15 +227,17 @@ export class TradingService {
   }
 
   subscribeProposal(request: ProposalRequest, onProposal: (proposal: any) => void): string {
+    const r = request as ProposalRequest & { barrier?: string };
     return this.wsManager.subscribe('proposal', {
       proposal: 1,
-      amount: request.amount,
-      basis: request.basis,
-      contract_type: request.contractType,
-      currency: request.currency,
-      duration: request.duration,
-      duration_unit: request.durationUnit,
-      underlying_symbol: request.underlyingSymbol,
+      amount: r.amount,
+      basis: r.basis,
+      contract_type: r.contractType,
+      currency: r.currency,
+      duration: r.duration,
+      duration_unit: r.durationUnit,
+      underlying_symbol: r.underlyingSymbol,
+      ...(r.barrier !== undefined ? { barrier: r.barrier } : {}),
       subscribe: 1,
     }, onProposal);
   }

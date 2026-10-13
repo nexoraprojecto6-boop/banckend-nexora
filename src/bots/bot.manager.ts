@@ -10,6 +10,7 @@
 //   ✅ even_odd_recovery (bot LITECOIN) NÃO estava registado no
 //      buildStrategy → "Estratégia desconhecida". Se a classe tiver outro
 //      nome, ajuste o import.
+//   ✅ even_odd_smart (bot BITCOIN) registado
 // ============================================================
 
 import { EventEmitter } from 'events';
@@ -31,6 +32,7 @@ import { ScalperStrategy } from './strategies/scalper.strategy.js';
 import { AlfhaStrategy } from './strategies/alfha.strategy.js';
 import { Over1RecoveryStrategy } from './strategies/over1-recovery.strategy.js';
 import { EvenOddRecoveryStrategy } from './strategies/even-odd-recovery.strategy.js';
+import { EvenOddSmartStrategy } from './strategies/even-odd-smart.strategy.js';
 import logger from '@utils/logger.js';
 
 const BOT_EVENTS = [
@@ -178,6 +180,8 @@ export class BotManager extends EventEmitter {
         return new Over1RecoveryStrategy(id, name, config, this.derivWs);
       case 'even_odd_recovery': // 'LITECOIN' — antes não registado → "Estratégia desconhecida"
         return new EvenOddRecoveryStrategy(id, name, config, this.derivWs);
+      case 'even_odd_smart': // 'BITCOIN'
+        return new EvenOddSmartStrategy(id, name, config, this.derivWs);
       default:
         throw new Error(`Estratégia desconhecida: ${strategy}`);
     }

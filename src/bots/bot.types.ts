@@ -3,7 +3,7 @@
 // ============================================================
 
 export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
-export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery' | 'even_odd_recovery';
+export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery' | 'even_odd_recovery' | 'even_odd_smart';
 export type TradeDirection = 'CALL' | 'PUT';
 
 // ─── Configuração base (comum a todas as estratégias) ────────
@@ -105,6 +105,25 @@ export interface EvenOddRecoveryParams {
   pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
   pauseSeconds: number;           // duração da pausa automática, em segundos
   decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
+}
+
+// Parâmetros do bot EVEN_ODD_SMART (nome de exibição: "BITCOIN") —
+// Par/Ímpar em 1 tick (DIGITEVEN/DIGITODD escolhido a cada sinal) com
+// martingale de recuperação: stake = (perda acumulada + lucro alvo) / retorno
+// líquido real do payout. Tetos: níveis, múltiplo da stake inicial e o que
+// resta do config.maxLoss. A sequência de paridade (streakLength) é só um
+// filtro de entrada — NÃO muda a probabilidade real do próximo dígito.
+// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
+export interface EvenOddSmartParams {
+  mode: 'follow' | 'reverse';     // follow = mesma paridade da sequência; reverse = oposta
+  streakLength: number;           // ticks seguidos com a mesma paridade para disparar (0 = todo tick)
+  payoutRatio: number;            // retorno líquido por 1 de stake (reserva; o real vem de getProposal)
+  recoveryProfitFactor: number;   // lucro alvo extra na recuperação, × stake inicial
+  maxMartingaleSteps: number;     // níveis máximos antes de cortar e resetar
+  maxStakeMultiplier: number;     // teto da stake = stake inicial × este valor
+  pauseAfterLosses: number;       // perdas seguidas que disparam a pausa (0 = desativado)
+  pauseSeconds: number;           // duração da pausa automática, em segundos
+  decimalPlaces?: number;         // casas decimais assumidas até chegar o 1.º tick (padrão 2)
 }
 
 // ─── Estatísticas do bot ─────────────────────────────────────

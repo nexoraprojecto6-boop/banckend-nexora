@@ -1,54 +1,36 @@
 // ============================================================
 // NEXORA FOREX — Even/Odd Smart Strategy (DIGITEVEN / DIGITODD, 1 tick)
 // ============================================================
-// - Contrato: DIGITEVEN ou DIGITODD, duração fixa de 1 tick (sem barrier).
-// - Orientada a eventos de tick (skipTickLoop = true) → entra de imediato.
+// - Contrato: DIGITEVEN ou DIGITODD, 1 tick, sem barrier.
+// - Orientada a eventos de tick (skipTickLoop = true): entra no tick
+//   seguinte ao sinal, e reentra de imediato após cada resultado.
 // - Sinal: sequência (streak) de paridade nos últimos dígitos.
 //     mode 'follow'  → aposta na mesma paridade da sequência
 //     mode 'reverse' → aposta na paridade oposta
 //     streakLength = 0 → entra em todos os ticks (usa a última paridade)
 // - Martingale inteligente (recuperação):
-//     próxima stake = (perda acumulada + lucro alvo) / payoutRatio
+//     stake = (perda acumulada + lucro alvo) / retorno líquido real
+//     • retorno líquido vem do payout real da Deriv (getProposal, 1 vez
+//       por mercado — não atrasa as entradas); fallback = payoutRatio
 //     • vitória parcial reduz a dívida em vez de resetar tudo
-//     • tetos: maxMartingaleSteps, maxStakeMultiplier, maxStakePctBalance
-//     • atingiu teto → corta a perda e volta à stake inicial
-//     • pausa curta após sequência de perdas (cooldown)
+//     • tetos: maxMartingaleSteps, maxStakeMultiplier e o que resta do
+//       config.maxLoss → atingido = corta a perda e volta à stake inicial
+//     • pausa curta após N perdas seguidas
 // - STOP LOSS / TAKE PROFIT: config.maxLoss / config.maxProfit (BaseStrategy).
 //
-// AVISO: dígitos par/ímpar nos índices sintéticos são aleatórios; nenhum
-// filtro cria vantagem estatística. O martingale só altera a distribuição
-// dos resultados (muitos ganhos pequenos, raras perdas grandes). Teste em demo.
+// AVISO: dígitos par/ímpar em índices sintéticos são independentes entre
+// ticks; nenhum filtro cria vantagem estatística. O martingale só muda o
+// formato do risco. Usar em conta demo.
 // ============================================================
 
-import { BotConfig, TradeResult, DerivWsAdapter } from '../bot.types.js';
+import { BotConfig, EvenOddSmartParams, TradeResult, DerivWsAdapter } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
 import { decimalsFromPip, exitDigitOf, lastDigit, withDefaults } from './digit-utils.js';
-
-export interface EvenOddParams {
-  /** 'follow' = segue a sequência; 'reverse' = aposta contra */
-  mode: 'follow' | 'reverse';
-  /** nº de ticks seguidos com a mesma paridade para disparar (0 = todo tick) */
-  streakLength: number;
-  /** retorno líquido por 1 de stake (Deriv even/odd ≈ 0.95) */
-  payoutRatio: number;
-  /** lucro alvo extra ao recuperar, como fração da stake inicial */
-  recoveryProfitFactor: number;
-  /** máximo de níveis de martingale */
-  maxMartingaleSteps: number;
-  /** teto da stake = stake inicial × este valor */
-  maxStakeMultiplier: number;
-  /** teto da stake em % do saldo (0 = desligado) */
-  maxStakePctBalance: number;
-  /** perdas seguidas que disparam a pausa (0 = desligado) */
-  pauseAfterLosses: number;
-  pauseSeconds: number;
-  decimalPlaces: number;
-}
 
 type Parity = 'EVEN' | 'ODD';
 
 export class EvenOddSmartStrategy extends BaseStrategy {
-  private params: EvenOddParams;
+  private params: EvenOddSmartParams;
   private pending = false;
   private paused = false;
   private lossStreak = 0;
@@ -57,33 +39,32 @@ export class EvenOddSmartStrategy extends BaseStrategy {
   private pipDecimals?: number;
   private lastParity?: Parity;
   private streak = 0;
+  private netRatio: number;                 // lucro líquido por 1 de stake
   private tickSub: { unsubscribe: () => void } | null = null;
   private pauseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(id: string, name: string, config: BotConfig, derivWs: DerivWsAdapter) {
-    const params = withDefaults<EvenOddParams>({
+    const params = withDefaults<EvenOddSmartParams>({
       mode: 'follow',
       streakLength: 3,
       payoutRatio: 0.95,
       recoveryProfitFactor: 0.5,
       maxMartingaleSteps: 6,
       maxStakeMultiplier: 40,
-      maxStakePctBalance: 5,
       pauseAfterLosses: 4,
       pauseSeconds: 8,
       decimalPlaces: 2,
     }, config.strategyParams);
 
-    // ATENÇÃO: adicionar 'even-odd-smart' à união de tipos de estratégia em bot.types.ts
-    super(id, name, 'even-odd-smart' as any, config, derivWs);
+    super(id, name, 'even_odd_smart', config, derivWs);
     this.params = params;
+    this.netRatio = params.payoutRatio;
     this.skipTickLoop = true;
   }
 
   // ─── Ciclo de vida ────────────────────────────────────────
 
   protected async onStart(): Promise<void> {
-    this.state.stats.currentStake = this.state.config.initialStake;
     this.resetRecovery();
     this.paused = false;
     this.pending = false;
@@ -97,6 +78,7 @@ export class EvenOddSmartStrategy extends BaseStrategy {
     );
 
     this.subscribe();
+    void this.refreshPayout(); // não bloqueia: entradas começam já
   }
 
   protected async onStop(): Promise<void> {
@@ -117,6 +99,7 @@ export class EvenOddSmartStrategy extends BaseStrategy {
     this.streak = 0;
     this.tickSub?.unsubscribe();
     this.subscribe();
+    void this.refreshPayout();
   }
 
   private subscribe(): void {
@@ -124,6 +107,28 @@ export class EvenOddSmartStrategy extends BaseStrategy {
       this.state.config.symbol,
       (price: number, pipSize?: number) => this.onTick(price, pipSize),
     );
+  }
+
+  /** Lê o payout real (1 pedido, fora do caminho crítico) → retorno líquido por 1 de stake. */
+  private async refreshPayout(): Promise<void> {
+    const { symbol, currency, initialStake } = this.state.config;
+    try {
+      const { payout } = await this.derivWs.getProposal({
+        symbol,
+        contractType: 'DIGITEVEN',
+        duration: 1,
+        durationUnit: 't',
+        currency,
+        stake: initialStake,
+      });
+      const ratio = payout / initialStake - 1;
+      if (Number.isFinite(ratio) && ratio > 0.3 && ratio < 1.5) {
+        this.netRatio = ratio;
+        this.log('info', `Payout real: retorno líquido ${(ratio * 100).toFixed(1)}% por trade.`);
+      }
+    } catch {
+      /* mantém o payoutRatio configurado */
+    }
   }
 
   // ─── Lógica orientada a tick ──────────────────────────────
@@ -137,7 +142,7 @@ export class EvenOddSmartStrategy extends BaseStrategy {
       this.pipDecimals = decimalsFromPip(pipSize, this.params.decimalPlaces ?? 2);
     }
 
-    // Atualiza a sequência de paridade (mesmo durante trade/pausa, para o sinal ficar fresco)
+    // a sequência é atualizada em todos os ticks, mesmo durante trade/pausa
     const parity: Parity = lastDigit(price, this.decimals) % 2 === 0 ? 'EVEN' : 'ODD';
     this.streak = parity === this.lastParity ? this.streak + 1 : 1;
     this.lastParity = parity;
@@ -148,11 +153,10 @@ export class EvenOddSmartStrategy extends BaseStrategy {
   private pickContract(): 'DIGITEVEN' | 'DIGITODD' | null {
     if (!this.lastParity) return null;
     const { streakLength, mode } = this.params;
-
     if (streakLength > 0 && this.streak < streakLength) return null;
 
-    const follow = this.lastParity;
-    const target: Parity = mode === 'follow' ? follow : follow === 'EVEN' ? 'ODD' : 'EVEN';
+    const last = this.lastParity;
+    const target: Parity = mode === 'follow' ? last : last === 'EVEN' ? 'ODD' : 'EVEN';
     return target === 'EVEN' ? 'DIGITEVEN' : 'DIGITODD';
   }
 
@@ -183,8 +187,7 @@ export class EvenOddSmartStrategy extends BaseStrategy {
         duration: 1,
         durationUnit: 't',
         currency,
-        // DIGITEVEN/DIGITODD não usam barrier
-      } as any);
+      });
 
       this.emit('bot:trade_opened', {
         type: 'bot:trade_opened',
@@ -223,7 +226,6 @@ export class EvenOddSmartStrategy extends BaseStrategy {
       await this.handleUnexpectedError(err);
     } finally {
       this.pending = false;
-      // reentrada imediata com o estado de tick mais recente
       if (this.active && !this.paused) setImmediate(() => this.tryTrade());
     }
   }
@@ -237,25 +239,26 @@ export class EvenOddSmartStrategy extends BaseStrategy {
     this.state.stats.currentStake = this.state.config.initialStake;
   }
 
+  /** Teto da stake: múltiplo da inicial e, se houver maxLoss, o que ainda resta dele. */
   private stakeCap(): number {
     const initial = this.state.config.initialStake;
-    const { maxStakeMultiplier, maxStakePctBalance } = this.params;
-    let cap = initial * maxStakeMultiplier;
+    let cap = initial * this.params.maxStakeMultiplier;
 
-    const balance = (this.state.stats as any).balance ?? (this.state as any).balance;
-    if (maxStakePctBalance > 0 && typeof balance === 'number' && balance > 0) {
-      cap = Math.min(cap, (balance * maxStakePctBalance) / 100);
+    const { maxLoss } = this.state.config;
+    if (maxLoss && maxLoss > 0) {
+      const remaining = maxLoss + this.state.stats.netPnL; // netPnL < 0 em perda
+      if (remaining > 0) cap = Math.min(cap, remaining);
     }
     return Math.max(cap, initial);
   }
 
   private adjustStake(won: boolean, profit: number): void {
-    const { payoutRatio, recoveryProfitFactor, maxMartingaleSteps } = this.params;
+    const { recoveryProfitFactor, maxMartingaleSteps } = this.params;
     const initial = this.state.config.initialStake;
 
     if (won) {
       this.lossStreak = 0;
-      // vitória reduz a dívida; só reseta quando ela é totalmente recuperada
+      // vitória reduz a dívida; só reseta quando está totalmente recuperada
       this.lossAccum = Math.max(0, this.lossAccum - profit);
       if (this.lossAccum <= 0) {
         this.resetRecovery();
@@ -267,17 +270,15 @@ export class EvenOddSmartStrategy extends BaseStrategy {
       this.martingaleSteps += 1;
     }
 
-    // Teto de níveis atingido → corta a perda e recomeça
     if (this.martingaleSteps > maxMartingaleSteps) {
-      this.log('info', `Teto de martingale (${maxMartingaleSteps}) atingido — corte de perda de ${this.money(this.lossAccum.toFixed(2))}.`);
+      this.log('info', `Teto de martingale (${maxMartingaleSteps}) atingido — corte de ${this.money(this.lossAccum.toFixed(2))}.`);
       this.resetRecovery();
       return;
     }
 
-    // stake necessária para recuperar a dívida + lucro alvo num único acerto
+    // stake que recupera a dívida + lucro alvo com um único acerto
     const target = this.lossAccum + initial * recoveryProfitFactor;
-    let next = this.round(target / payoutRatio);
-    next = Math.max(initial, next);
+    const next = Math.max(initial, this.round(target / this.netRatio));
 
     const cap = this.stakeCap();
     if (next > cap) {

@@ -17,6 +17,7 @@
 //   'alfha'                  → AlfhaStrategy (DIGITOVER/DIGITUNDER conforme o dígito + Gale)
 //   'over1_recovery'         → Over1RecoveryStrategy (DIGITOVER 1 + Gale de recuperação por payout real) — nome de exibição: "ETHEREUM"
 //   'even_odd_recovery'      → EvenOddRecoveryStrategy (DIGITEVEN/DIGITODD + Gale de recuperação por payout real) — nome de exibição: "LITECOIN"
+//   'even_odd_smart'         → EvenOddSmartStrategy (DIGITEVEN/DIGITODD 1 tick + martingale de recuperação com tetos de risco) — nome de exibição: "BITCOIN"
 //
 // ACESSO:
 //   Apenas o administrador gere este ficheiro.
@@ -277,6 +278,58 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
         pauseLossLimit:         20,   // pausa temporária ao acumular $20 de perda
         pauseSeconds:           10,   // duração da pausa automática
         decimalPlaces:          2,    // casas decimais do símbolo
+      },
+    },
+  },
+
+  // ──────────────────────────────────────────────────────────
+  // BOT 7 — BITCOIN (Digit Even/Odd 1 tick + Martingale Inteligente)
+  // ──────────────────────────────────────────────────────────
+  // Nome de exibição "BITCOIN"; estratégia interna 'even_odd_smart'
+  // (só o nome comercial, no mesmo padrão do ETHEREUM/LITECOIN).
+  //
+  // Compra DIGITEVEN ou DIGITODD (1 tick) depois de `streakLength`
+  // ticks seguidos com a mesma paridade ('follow' = aposta na mesma
+  // paridade; 'reverse' = na oposta).
+  //   • Cada perda: stake = (perda acumulada + lucro alvo) / retorno
+  //     líquido real do payout (lido uma vez da Deriv, sem atrasar
+  //     as entradas).
+  //   • Vitória parcial só reduz a dívida; o ciclo reseta quando ela
+  //     é totalmente recuperada.
+  //   • Tetos: maxMartingaleSteps, maxStakeMultiplier e o que resta
+  //     do maxLoss — ao atingir qualquer um, corta a perda e volta à
+  //     stake inicial. Pausa curta após pauseAfterLosses perdas seguidas.
+  // ATENÇÃO: alto risco — usar apenas em conta demo. Os dígitos são
+  // independentes entre ticks; a sequência é só um filtro de entrada,
+  // não uma previsão, e a recuperação não muda o valor esperado do
+  // jogo, só o formato do risco.
+  {
+    name:        'BITCOIN',
+    description: 'Compra DIGITEVEN ou DIGITODD (1 tick) no Volatility 100 (1s) Index após uma sequência de dígitos com a mesma paridade. Martingale de recuperação calculado sobre o payout real, com tetos de risco ligados ao stop de perda e pausa automática após perdas seguidas. Recomendado apenas em conta demo.',
+    strategy:    'even_odd_smart',
+    tags:        ['digitos', 'par-impar', 'martingale', 'recuperação', 'risco-alto', 'demo'],
+    isActive:    true,
+    createdBy:   'admin',
+    defaultConfig: {
+      symbol:       '1HZ100V',       // Volatility 100 (1s) Index
+      contractType: 'DIGITEVEN',     // só referência; a estratégia escolhe EVEN/ODD a cada sinal
+      duration:     1,
+      durationUnit: 'ticks',
+      initialStake: 0.5,
+      currency:     'USD',
+      maxTrades:    0,
+      maxLoss:      40,
+      maxProfit:    5,
+      strategyParams: {
+        mode:                 'follow', // 'follow' = mesma paridade da sequência | 'reverse' = oposta
+        streakLength:         3,        // ticks seguidos com a mesma paridade (0 = todo tick)
+        payoutRatio:          0.95,     // reserva; o retorno líquido real vem de getProposal
+        recoveryProfitFactor: 0.5,      // lucro alvo extra na recuperação (× stake inicial)
+        maxMartingaleSteps:   6,        // teto de níveis antes de cortar e resetar
+        maxStakeMultiplier:   40,       // teto da stake = stake inicial × 40
+        pauseAfterLosses:     4,        // pausa temporária após 4 perdas seguidas
+        pauseSeconds:         8,        // duração da pausa automática
+        decimalPlaces:        2,        // casas decimais do símbolo
       },
     },
   },

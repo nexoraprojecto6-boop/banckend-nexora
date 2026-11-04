@@ -51,9 +51,14 @@ import {
 } from '../bot.types.js';
 import { BaseStrategy } from './base.strategy.js';
 
+const RATIO_REFRESH_MS = 120_000;   // renova em segundo plano
+const RATIO_MAX_AGE_MS = 600_000;   // acima disto, volta a pedir antes de usar
+
 export class Over1RecoveryStrategy extends BaseStrategy {
   private params: OverOneRecoveryParams;
   private pending = false;
+  private payoutCache: { value: number; at: number } | null = null;
+  private refreshing = false;
   private lossAccum = 0;          // perda acumulada desde o último reset/pausa
   private martingaleSteps = 0;
   private paused = false;
@@ -90,6 +95,9 @@ export class Over1RecoveryStrategy extends BaseStrategy {
       `stake inicial: $${this.state.config.initialStake}, margem de recuperação: +${this.params.recoveryMarginPercent}%, ` +
       `stake protetor: ${this.params.protectiveStakePercent}% após perdas seguidas, teto de stake: $${this.params.maxStakeCap}`,
     );
+
+    // Pré-aquece o payout: a 1ª perda já não espera pela rede (perdia 1–2 ticks de entrada).
+    void this.refreshPayout();
 
     this.tickSub = this.derivWs.subscribeToTicks(this.state.config.symbol, (price) => {
       this.onTick(price);
@@ -216,9 +224,26 @@ export class Over1RecoveryStrategy extends BaseStrategy {
     const initial = this.state.config.initialStake;
 
     if (won) {
-      this.lossAccum = 0;
-      this.martingaleSteps = 0;
-      this.state.stats.currentStake = initial;
+      // CORRIGIDO: antes zerava a dívida ao primeiro ganho (mesmo com stake
+      // protetor pequeno) e "esquecia" a perda. Agora abate o lucro à dívida
+      // e só reseta o ciclo quando a dívida estiver recuperada.
+      this.lossAccum = Math.max(0, this.lossAccum - lossValue);
+      if (this.lossAccum < 0.01) {
+        this.lossAccum = 0;
+        this.martingaleSteps = 0;
+        this.state.stats.currentStake = initial;
+        return;
+      }
+      try {
+        this.state.stats.currentStake = await this.computeRecoveryStake();
+        this.log('info', `Ganhou, mas ainda faltam $${this.lossAccum.toFixed(2)} para recuperar — próximo stake: $${this.state.stats.currentStake.toFixed(2)}.`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log('error', `Falha ao calcular stake de recuperação (${message}) — resetando ao stake inicial por segurança.`);
+        this.lossAccum = 0;
+        this.martingaleSteps = 0;
+        this.state.stats.currentStake = initial;
+      }
       return;
     }
 
@@ -305,26 +330,48 @@ export class Over1RecoveryStrategy extends BaseStrategy {
     return parseFloat(stake.toFixed(2));
   }
 
-  // payoutRatio = lucro por unidade de stake (ex: 0.11 = ganha 11% do stake)
-  private async getPayoutRatio(stake: number): Promise<number> {
-    const { symbol, duration, durationUnit, currency, contractType } = this.state.config;
-    const { digitBarrier } = this.params;
+  // payoutRatio = lucro por unidade de stake (ex: 0.11 = ganha 11% do stake).
+  // Cache: a razão payout/stake é praticamente constante → sem espera de rede.
+  private async getPayoutRatio(_stake: number): Promise<number> {
+    const c = this.payoutCache;
+    const now = Date.now();
+    if (c && now - c.at < RATIO_MAX_AGE_MS) {
+      if (now - c.at > RATIO_REFRESH_MS) void this.refreshPayout();
+      return c.value;
+    }
+    return this.fetchPayout();
+  }
 
+  private async refreshPayout(): Promise<void> {
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      await this.fetchPayout();
+    } catch (err) {
+      this.log('warn', `Não foi possível atualizar o payout em segundo plano: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  private async fetchPayout(): Promise<number> {
+    const { symbol, duration, durationUnit, currency, contractType, initialStake } = this.state.config;
+    const stake = initialStake > 0 ? initialStake : 1;
     const proposal = await this.derivWs.getProposal({
       symbol,
       contractType,
       duration,
       durationUnit,
       currency,
-      barrier: String(digitBarrier),
+      barrier: String(this.params.digitBarrier),
       stake,
     });
-
     if (!proposal || !Number.isFinite(proposal.payout) || proposal.payout <= 0) {
       throw new Error('resposta de proposta inválida ou payout ausente');
     }
-
-    return proposal.payout / stake - 1;
+    const value = proposal.payout / stake - 1;
+    this.payoutCache = { value, at: Date.now() };
+    return value;
   }
 
   // ─── Pausa automática temporária ──────────────────────────

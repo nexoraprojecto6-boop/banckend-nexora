@@ -3,8 +3,9 @@ module.exports = {
     {
       name: 'deriv-trading-backend',
       script: 'dist/server.js',
-      instances: 'max',
-      exec_mode: 'cluster',
+      // 1 processo: sessões, bots e catálogo vivem em memória — cluster partia tudo.
+      instances: 1,
+      exec_mode: 'fork',
       watch: false,
       env: {
         NODE_ENV: 'development',

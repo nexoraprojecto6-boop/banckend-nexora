@@ -698,9 +698,10 @@ async function getAccountSymbols(session: ClientSession): Promise<ActiveSymbol[]
 //   2) mesmo submercado  →  3) mesmo mercado  →  4) qualquer mercado aberto
 // Variáveis de ambiente:
 //   SYMBOL_FAILOVER=0               desliga a mudança automática
-//   SYMBOL_FAILOVER_ANY_MARKET=0    só muda dentro do mesmo mercado
+//   SYMBOL_FAILOVER_ANY_MARKET=1    permite mudar para QUALQUER mercado (desligado por omissão:
+//                                   podia trocar para um mercado sem dígitos)
 const FAILOVER_ENABLED    = process.env.SYMBOL_FAILOVER !== '0';
-const FAILOVER_ANY_MARKET = process.env.SYMBOL_FAILOVER_ANY_MARKET !== '0';
+const FAILOVER_ANY_MARKET = process.env.SYMBOL_FAILOVER_ANY_MARKET === '1';
 const TYPED_SYMBOLS_TTL_MS = 30_000;
 
 function contractTypesFor(strategy: BotStrategyType, config: BotConfig): string[] {
@@ -709,6 +710,7 @@ function contractTypesFor(strategy: BotStrategyType, config: BotConfig): string[
     case 'alfha':             return ['DIGITOVER', 'DIGITUNDER'];
     case 'scalper':
     case 'over1_recovery':    return ['DIGITOVER'];
+    case 'even_odd_smart':    return ['DIGITEVEN', 'DIGITODD'];
     case 'even_odd_recovery': return [p.targetParity === 'odd' ? 'DIGITODD' : 'DIGITEVEN'];
     default:                  return ['CALL', 'PUT']; // martingale, scalping, trend_following
   }

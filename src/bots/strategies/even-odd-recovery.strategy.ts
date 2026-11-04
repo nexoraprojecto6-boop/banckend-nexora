@@ -217,9 +217,26 @@ export class EvenOddRecoveryStrategy extends BaseStrategy {
     const initial = this.state.config.initialStake;
 
     if (won) {
-      this.lossAccum = 0;
-      this.martingaleSteps = 0;
-      this.state.stats.currentStake = initial;
+      // CORRIGIDO: antes zerava a dívida ao primeiro ganho (mesmo com stake
+      // protetor pequeno) e "esquecia" a perda. Agora abate o lucro à dívida
+      // e só reseta o ciclo quando a dívida estiver recuperada.
+      this.lossAccum = Math.max(0, this.lossAccum - lossValue);
+      if (this.lossAccum < 0.01) {
+        this.lossAccum = 0;
+        this.martingaleSteps = 0;
+        this.state.stats.currentStake = initial;
+        return;
+      }
+      try {
+        this.state.stats.currentStake = await this.computeRecoveryStake();
+        this.log('info', `Ganhou, mas ainda faltam $${this.lossAccum.toFixed(2)} para recuperar — próximo stake: $${this.state.stats.currentStake.toFixed(2)}.`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.log('error', `Falha ao calcular stake de recuperação (${message}) — resetando ao stake inicial por segurança.`);
+        this.lossAccum = 0;
+        this.martingaleSteps = 0;
+        this.state.stats.currentStake = initial;
+      }
       return;
     }
 

@@ -120,8 +120,8 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       initialStake: 0.35,
       currency:     'USD',
       maxTrades:    0,
-      maxLoss:      40,
-      maxProfit:    1,
+      maxLoss:      10,
+      maxProfit:    5,
       strategyParams: {
         predictDigit:        2,      // barreira: dígito > 2 (gatilho cobre 0,1,2)
         gale:                2,      // multiplicador do stake por perda
@@ -157,8 +157,8 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       initialStake: 0.4,
       currency:     'USD',
       maxTrades:    0,
-      maxLoss:      20,
-      maxProfit:    1,
+      maxLoss:      10,
+      maxProfit:    5,
       strategyParams: {
         digitOver:           2,      // entra em Over quando o dígito é <= 2
         digitUnder:          7,      // entra em Under quando o dígito é >= 7
@@ -208,8 +208,8 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       initialStake: 0.5,
       currency:     'USD',
       maxTrades:    0,
-      maxLoss:      40,
-      maxProfit:    5,
+      maxLoss:      20,
+      maxProfit:    10,
       strategyParams: {
         digitBarrier:           1,    // Over 1 — perde se o dígito for 0 ou 1
         recoveryMarginPercent:  10,   // margem extra de +10% sobre o stake inicial (só na 1ª perda)
@@ -265,8 +265,8 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       initialStake: 0.5,
       currency:     'USD',
       maxTrades:    0,
-      maxLoss:      40,
-      maxProfit:    5,
+      maxLoss:      20,
+      maxProfit:    10,
       strategyParams: {
         targetParity:           'even', // 'even' -> DIGITEVEN | 'odd' -> DIGITODD
         streakTrigger:          4,     // entra após 4 ticks seguidos com paridade ímpar
@@ -318,8 +318,8 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
       initialStake: 0.5,
       currency:     'USD',
       maxTrades:    0,
-      maxLoss:      40,
-      maxProfit:    5,
+      maxLoss:      20,
+      maxProfit:    10,
       strategyParams: {
         mode:                 'follow', // 'follow' = mesma paridade da sequência | 'reverse' = oposta
         streakLength:         3,        // ticks seguidos com a mesma paridade (0 = todo tick)

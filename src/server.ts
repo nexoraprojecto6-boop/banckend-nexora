@@ -44,6 +44,8 @@
 //      paralelo com uma autenticação; em 429 espera ≥ 5 s.
 //   ✅ Pedido de auth durante outra auth já não é descartado: guarda o
 //      último e corre-o a seguir (trocas de conta demo ↔ real).
+//
+// Adicionado: rota GET / com a meta tag de verificação de domínio da Deriv.
 // ============================================================
 
 import 'express-async-errors';
@@ -1366,6 +1368,21 @@ app.get('/health', (_req, res) => {
     wsSessions: sessions.size,
     wsAuthenticated: [...sessions.values()].filter(s => s.authenticated).length,
   });
+});
+
+// Verificação de domínio Deriv (pública, ANTES do rate limiter)
+app.get('/', (_req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8">
+  <meta name="deriv-site-verification" content="852454070144d56e94ca6bbcdef0c7c58171e58d573588c914052ede2147ffed">
+  <title>Nexora API</title>
+</head>
+<body>
+  <p>Nexora API</p>
+</body>
+</html>`);
 });
 
 app.use(apiLimiter);

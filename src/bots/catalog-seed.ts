@@ -64,7 +64,7 @@ const CATALOG_BOTS: CreateCatalogBotDto[] = [
     isActive: true,
     createdBy: 'admin',
     defaultConfig: {
-      symbol: 'R_100', contractType: 'DIGITUNDER', duration: 1, durationUnit: 'ticks',
+      symbol: '1HZ100V', contractType: 'DIGITUNDER', duration: 1, durationUnit: 'ticks',
       initialStake: 0.4, currency: 'USD', maxTrades: 0, maxLoss: 10, maxProfit: 5,
       strategyParams: { barrier: 7, multiplier: 2, maxStake: 12 },
     },

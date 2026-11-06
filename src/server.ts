@@ -105,6 +105,10 @@ interface ClientSession {
   clientSubs:           Map<string, string>;
   symbolsCache:         { at: number; list: ActiveSymbol[] } | null;
   symbolsByTypes:       Map<string, { at: number; list: ActiveSymbol[] }>;
+  /** Mercado pedido pelo gráfico do frontend (sobrevive a reconexões da Deriv). */
+  chartReq:             { symbol: string; count: number } | null;
+  chartStream:          { close: () => void } | null;
+  chartSeq:             number;
   msgWindowStart:       number;
   msgCount:             number;
 }
@@ -218,6 +222,69 @@ function closeDerivWsGracefully(
       resolve();
     }
   });
+}
+
+// ─── Gráfico: ticks_snapshot + stream de ticks da sessão ──────
+// O frontend já não abre WS próprio à Deriv. Pede `subscribe_ticks` e
+// recebe: 1× `ticks_snapshot` (histórico) + `tick` a cada tick novo
+// (o `tick` é reencaminhado por buildDerivMessageHandler).
+const CHART_SYMBOL_RE = /^[A-Za-z0-9_]{2,32}$/;
+const CHART_MAX_COUNT = 5000;
+
+function stopChartStream(session: ClientSession): void {
+  if (session.chartStream) {
+    try { session.chartStream.close(); } catch { /* ligação a fechar */ }
+    session.chartStream = null;
+  }
+}
+
+async function startChartTicks(ws: WebSocket, session: ClientSession): Promise<void> {
+  const req = session.chartReq;
+  if (!req) return;
+  const seq = ++session.chartSeq;                   // invalida pedidos anteriores
+  const stale = () => seq !== session.chartSeq || !sessions.has(ws);
+
+  stopChartStream(session);
+
+  let derivWs: WebSocket;
+  try { derivWs = await waitForDerivWs(session, 8_000); }
+  catch { if (!stale()) sendError(ws, 'Deriv indisponível para o gráfico', 'CHART_UNAVAILABLE'); return; }
+  if (stale()) return;
+
+  const router = getMessageRouter(derivWs);
+
+  // 1) histórico (snapshot) — falha aqui não impede o stream em direto
+  try {
+    const res = await router.request(
+      { ticks_history: req.symbol, end: 'latest', count: req.count, style: 'ticks' },
+      nextReqId(), 15_000,
+    );
+    if (stale()) return;
+    const history = res.history as { prices?: number[] } | undefined;
+    sendToClient(ws, 'ticks_snapshot', {
+      payload: {
+        symbol: req.symbol,
+        prices: Array.isArray(history?.prices) ? history!.prices : [],
+        pip_size: res.pip_size,
+      },
+    });
+  } catch (err: any) {
+    if (stale()) return;
+    logger.warn('[WS] ticks_history falhou', { symbol: req.symbol, error: err?.message });
+    sendError(ws, `Sem histórico para ${req.symbol}: ${err?.message ?? 'erro'}`, 'CHART_HISTORY_ERROR');
+  }
+
+  // 2) stream em direto (o `tick` chega ao cliente pelo proxy normal)
+  const handle = router.openStream(`ticks:${req.symbol}`, { ticks: req.symbol }, {
+    onMessage: () => { /* reencaminhado por buildDerivMessageHandler */ },
+    onError: (err) => {
+      if (stale()) return;
+      sendError(ws, `Mercado ${req.symbol}: ${err.message}`, 'CHART_STREAM_ERROR');
+    },
+    onDisconnect: () => { if (session.chartSeq === seq) session.chartStream = null; },
+  });
+  if (stale()) { handle.close(); return; }
+  session.chartStream = handle;
 }
 
 // ─── Aguardar WS disponível ───────────────────────────────────
@@ -567,6 +634,7 @@ function scheduleDerivReconnect(clientWs: WebSocket, session: ClientSession, rat
         // Os bots NÃO são parados: re-anexam-se ao run (auto_get) sozinhos.
         if (!session.botManager) initBotManagerForSession(clientWs, session);
         sendToClient(clientWs, 'deriv_reconnected', { message: 'Conexão Deriv restabelecida' });
+        if (session.chartReq) void startChartTicks(clientWs, session);
       });
     } catch (err: any) {
       logger.error('[WS] Falha na reconexão Deriv', { error: err.message });
@@ -946,6 +1014,8 @@ async function authenticateClient(ws: WebSocket, token: string, accountId?: stri
     if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
     await closeDerivWsGracefully(session);
     session.clientSubs.clear();
+    session.chartStream = null;          // o stream morreu com o upstream antigo
+    session.chartSeq++;                  // invalida arranques de gráfico em curso
     session.symbolsCache = null;
     session.symbolsByTypes.clear();
 
@@ -1093,7 +1163,8 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
     reconnectAttempts: 0, authenticated: false, authenticating: false, pendingAuth: null,
     isAdmin: false, isAlive: true,
     botManager: null, nextReqId: 900_000,
-    clientSubs: new Map(), symbolsCache: null, symbolsByTypes: new Map(), msgWindowStart: 0, msgCount: 0,
+    clientSubs: new Map(), symbolsCache: null, symbolsByTypes: new Map(),
+    chartReq: null, chartStream: null, chartSeq: 0, msgWindowStart: 0, msgCount: 0,
   };
   sessions.set(ws, session);
 
@@ -1159,6 +1230,28 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
       if (type === 'manual_buy') {
         if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
         await handleManualBuy(ws, session, payload);
+        return;
+      }
+
+      if (type === 'subscribe_ticks') {
+        if (!session.authenticated) { sendError(ws, 'Não autenticado', 'NOT_AUTH'); return; }
+        const symbol = String(payload.symbol ?? '');
+        if (!CHART_SYMBOL_RE.test(symbol)) { sendError(ws, 'Símbolo inválido', 'INVALID_SYMBOL'); return; }
+        const count = Math.min(CHART_MAX_COUNT, Math.max(1, Math.floor(Number(payload.count) || 1000)));
+        const cur = session.chartReq;
+        // mesmo pedido já activo: não repete (evita rajadas de pedidos à Deriv)
+        if (cur && cur.symbol === symbol && session.chartStream) {
+          return;
+        }
+        session.chartReq = { symbol, count };
+        void startChartTicks(ws, session);
+        return;
+      }
+
+      if (type === 'unsubscribe_ticks') {
+        session.chartReq = null;
+        session.chartSeq++;
+        stopChartStream(session);
         return;
       }
 

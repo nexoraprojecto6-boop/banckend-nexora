@@ -1,132 +1,46 @@
 // ============================================================
-// NEXORA FOREX — Bot Types
+// NEXORA FOREX — Bot Types v3 (modelo auto_* da Deriv)
+// ============================================================
+// A Deriv corre o ciclo de compras nos servidores dela (auto_start).
+// Estratégias disponíveis: 'martingale' e 'dalembert'.
 // ============================================================
 
 export type BotStatus = 'idle' | 'running' | 'paused' | 'stopped' | 'error';
-export type BotStrategyType = 'scalping' | 'martingale' | 'anti_martingale' | 'trend_following' | 'scalper' | 'alfha' | 'over1_recovery' | 'even_odd_recovery' | 'even_odd_smart';
-export type TradeDirection = 'CALL' | 'PUT';
+export type BotStrategyType = 'martingale' | 'dalembert';
 
-// ─── Configuração base (comum a todas as estratégias) ────────
+// Contratos aceites pelas duas estratégias (auto_list_strategies)
+export const AUTO_CONTRACT_TYPES = [
+  'ACCU', 'CALL', 'CALLE', 'PUT', 'PUTE', 'ASIAND', 'ASIANU',
+  'DIGITEVEN', 'DIGITODD', 'DIGITMATCH', 'DIGITDIFF', 'DIGITOVER', 'DIGITUNDER',
+] as const;
 
+// Contratos de dígitos que exigem barrier
+export const BARRIER_CONTRACTS = ['DIGITMATCH', 'DIGITDIFF', 'DIGITOVER', 'DIGITUNDER'] as const;
+
+// ─── Configuração ────────────────────────────────────────────
+// A Deriv EXIGE take_profit e stop_loss (> 0):
+//   maxProfit → take_profit | maxLoss → stop_loss | maxTrades → max_contracts
 export interface BotConfig {
-  symbol: string;              // ex: "R_100", "1HZ100V"
-  contractType: string;        // ex: "CALL", "PUT", "DIGITOVER"
+  symbol: string;               // ex: "R_100", "1HZ100V"
+  contractType: string;         // um de AUTO_CONTRACT_TYPES
   duration: number;
   durationUnit: 'ticks' | 's' | 'm' | 'h' | 'd';
   initialStake: number;
-  currency: string;            // moeda da conta ativa (o servidor força este valor)
-  maxTrades?: number;          // 0 = ilimitado
-  maxLoss?: number;            // para quando a perda LÍQUIDA (−netPnL) >= valor
-  maxProfit?: number;          // para se lucro total > valor
-  strategyParams?: Record<string, unknown>;
-  // strategyParams.fallbackSymbols?: string[]  → mercados alternativos, por ordem de
-  //   preferência, se o mercado do bot ficar fechado/suspenso/indisponível na conta.
+  currency: string;
+  maxTrades?: number;           // 0 = ilimitado
+  maxLoss: number;              // obrigatório (> 0)
+  maxProfit: number;            // obrigatório (> 0)
+  strategyParams?: AutoStrategyParams;
 }
 
-// ─── Parâmetros específicos por estratégia ───────────────────
-
-export interface ScalpingParams {
-  maxConsecutiveLosses: number; // pausa o bot após N perdas seguidas
+export interface AutoStrategyParams {
+  barrier?: string | number;    // obrigatório em DIGITOVER/UNDER/MATCH/DIFF
+  multiplier?: number;          // martingale: (1, 10], padrão 2
+  maxStake?: number;            // teto do stake (>= initialStake). RECOMENDADO
+  unit?: number;                // dalembert: obrigatório (> 0)
 }
 
-export interface MartingaleParams {
-  multiplier: number;          // multiplicador do stake (ex: 2.0)
-  maxStake: number;            // teto do stake para evitar explosão
-  resetOnWin: boolean;         // true = anti-martingale
-}
-
-export interface TrendFollowingParams {
-  ticksWindow: number;         // quantos ticks analisar
-  trendThreshold: number;      // variação % mínima para confirmar tendência (ex: 0.002)
-}
-
-// Parâmetros do bot SCALPER — apenas o necessário para configurar.
-// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
-export interface ScalperParams {
-  predictDigit: number;        // barreira do DIGITOVER (ex: 2 = "over 2", gatilho cobre dígitos 0,1,2)
-  gale: number;                // multiplicador do stake por perda
-  lossesToStartGale: number;   // nº de perdas seguidas antes do Gale começar
-  maxMartingaleSteps: number;  // nº de níveis de Gale antes de resetar o stake
-  pauseLossLimit: number;      // perda acumulada que pausa o bot temporariamente (0 = desactivado)
-  pauseSeconds: number;        // duração da pausa automática, em segundos
-  decimalPlaces?: number;      // casas decimais assumidas até chegar o 1.º tick (o pip_size real
-                                //   do tick tem prioridade). Padrão: 2
-  entryFilter?: boolean;       // true (padrão) = só entra quando o último dígito <= predictDigit;
-                                //   false = entra em todos os ticks (mais rápido)
-}
-
-// Parâmetros do bot ALFHA — opera Over e Under conforme o último dígito.
-// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
-export interface AlfhaParams {
-  digitOver: number;            // barreira para entrar em DIGITOVER
-  digitUnder: number;           // barreira para entrar em DIGITUNDER
-  gale: number;                 // multiplicador do stake por perda
-  lossesToStartGale: number;    // nº de perdas seguidas antes do Gale começar
-  maxMartingaleSteps: number;   // nº de níveis de Gale antes de resetar o stake
-  pauseLossLimit: number;       // perda acumulada que pausa o bot temporariamente (0 = desactivado)
-  pauseSeconds: number;         // duração da pausa automática, em segundos
-}
-
-// Parâmetros do bot OVER1_RECOVERY (nome de exibição: "ETHEREUM") —
-// Over 1 fixo, com gale de recuperação (recupera a perda acumulada
-// do ciclo + uma margem extra, calculado sobre o payout real da Deriv).
-// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
-export interface OverOneRecoveryParams {
-  digitBarrier: number;           // barreira do DIGITOVER (fixo em 1 para "Over 1")
-  recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
-  protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
-                                    //   (protege a banca em vez de continuar escalando)
-  maxMartingaleSteps: number;     // teto de perdas seguidas (mesmo em modo protetor) antes de cortar e resetar
-  maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
-                                    //   mesmo que a recuperação fique incompleta
-  minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)
-  pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
-  pauseSeconds: number;           // duração da pausa automática, em segundos
-  decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
-}
-
-// Parâmetros do bot EVEN_ODD_RECOVERY (nome de exibição: "LITECOIN") —
-// Even ou Odd fixo (conforme targetParity), com gale de recuperação
-// (recupera a perda acumulada do ciclo + uma margem extra, calculado
-// sobre o payout real da Deriv). Entrada filtrada por uma sequência de
-// ticks seguidos com a paridade oposta (streakTrigger) — NÃO muda a
-// probabilidade real do próximo dígito, apenas decide quando entrar.
-// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
-export interface EvenOddRecoveryParams {
-  targetParity: 'even' | 'odd';   // 'even' -> DIGITEVEN | 'odd' -> DIGITODD
-  streakTrigger: number;          // nº de ticks seguidos com a paridade oposta antes de entrar
-  recoveryMarginPercent: number;  // margem extra sobre a perda acumulada (ex: 10 = +10%)
-  protectiveStakePercent: number; // % do stake inicial usado a partir da 2ª perda SEGUIDA
-                                    //   (protege a banca em vez de continuar escalando)
-  maxMartingaleSteps: number;     // teto de perdas seguidas (mesmo em modo protetor) antes de cortar e resetar
-  maxStakeCap: number;            // teto absoluto de stake — NUNCA ultrapassado,
-                                    //   mesmo que a recuperação fique incompleta
-  minStake?: number;              // piso de stake (evita stake residual ~0 por arredondamento)
-  pauseLossLimit: number;         // perda acumulada que pausa o bot temporariamente (0 = desativado)
-  pauseSeconds: number;           // duração da pausa automática, em segundos
-  decimalPlaces?: number;         // casas decimais do símbolo (padrão 2)
-}
-
-// Parâmetros do bot EVEN_ODD_SMART (nome de exibição: "BITCOIN") —
-// Par/Ímpar em 1 tick (DIGITEVEN/DIGITODD escolhido a cada sinal) com
-// martingale de recuperação: stake = (perda acumulada + lucro alvo) / retorno
-// líquido real do payout. Tetos: níveis, múltiplo da stake inicial e o que
-// resta do config.maxLoss. A sequência de paridade (streakLength) é só um
-// filtro de entrada — NÃO muda a probabilidade real do próximo dígito.
-// STOP LOSS / TAKE PROFIT ficam em config.maxLoss / config.maxProfit.
-export interface EvenOddSmartParams {
-  mode: 'follow' | 'reverse';     // follow = mesma paridade da sequência; reverse = oposta
-  streakLength: number;           // ticks seguidos com a mesma paridade para disparar (0 = todo tick)
-  payoutRatio: number;            // retorno líquido por 1 de stake (reserva; o real vem de getProposal)
-  recoveryProfitFactor: number;   // lucro alvo extra na recuperação, × stake inicial
-  maxMartingaleSteps: number;     // níveis máximos antes de cortar e resetar
-  maxStakeMultiplier: number;     // teto da stake = stake inicial × este valor
-  pauseAfterLosses: number;       // perdas seguidas que disparam a pausa (0 = desativado)
-  pauseSeconds: number;           // duração da pausa automática, em segundos
-  decimalPlaces?: number;         // casas decimais assumidas até chegar o 1.º tick (padrão 2)
-}
-
-// ─── Estatísticas do bot ─────────────────────────────────────
+// ─── Estatísticas ────────────────────────────────────────────
 
 export interface BotStats {
   totalTrades: number;
@@ -135,14 +49,12 @@ export interface BotStats {
   totalProfit: number;
   totalLoss: number;
   netPnL: number;
-  winRate: number;             // 0–100
-  currentStreak: number;       // positivo = wins, negativo = losses
+  winRate: number;
+  currentStreak: number;
   currentStake: number;
   peakProfit: number;
   maxDrawdown: number;
 }
-
-// ─── Estado completo do bot ──────────────────────────────────
 
 export interface BotState {
   id: string;
@@ -151,13 +63,12 @@ export interface BotState {
   status: BotStatus;
   config: BotConfig;
   stats: BotStats;
+  runId?: string;               // run_id da Deriv
   lastError?: string;
   startedAt?: Date;
   stoppedAt?: Date;
   logs: BotLogEntry[];
 }
-
-// ─── Logs ────────────────────────────────────────────────────
 
 export type LogLevel = 'info' | 'warn' | 'error' | 'trade';
 
@@ -168,8 +79,6 @@ export interface BotLogEntry {
   data?: Record<string, unknown>;
 }
 
-// ─── Resultado de trade ──────────────────────────────────────
-
 export interface TradeResult {
   contractId: string;
   profit: number;
@@ -177,24 +86,12 @@ export interface TradeResult {
   won: boolean;
   entryTick?: number;
   exitTick?: number;
-  exitDigit?: number;   // último algarismo de exit_spot (string original da Deriv),
-                          // com as casas decimais reais do símbolo
+  exitDigit?: number;
   entryTime: Date;
   exitTime?: Date;
 }
 
-// ─── Eventos emitidos pelo bot ───────────────────────────────
-// Estes eventos são repassados via WebSocket ao frontend
-//
-// bot:goal_reached — emitido ANTES de bot:stopped quando o bot pára
-//   automaticamente por ter atingido uma condição de paragem (take
-//   profit, stop de perda, ou limite de trades). payload.reason
-//   identifica qual: 'max_profit_reached' | 'max_loss_reached' |
-//   'max_trades_reached'.
-//
-// bot:insufficient_balance — emitido quando uma compra falha por
-//   saldo insuficiente na conta Deriv (erro InsufficientBalance da
-//   API). O bot é parado automaticamente a seguir.
+// ─── Eventos (iguais aos anteriores → frontend não muda) ─────
 
 export type BotEventType =
   | 'bot:started'
@@ -215,8 +112,6 @@ export interface BotEvent {
   payload: Record<string, unknown>;
 }
 
-// ─── Shapes de request/response da API REST ──────────────────
-
 export interface CreateBotRequest {
   name: string;
   strategy: BotStrategyType;
@@ -233,51 +128,66 @@ export interface BotSummary {
   stoppedAt?: Date;
 }
 
-// ─── Interface do adaptador Deriv injectado nos bots ─────────
-// Recebe o derivWs da sessão do cliente (já autenticado)
+// ─── Adaptador Deriv (auto_*) ────────────────────────────────
+
+export interface AutoRunInfo {
+  runId: string;
+  status: 'running' | 'paused' | 'stopped';
+  stopReason?: 'error' | 'user_stopped' | 'condition_triggered';
+  stopReasonCode?: string;
+  totalStake: number;
+  totalPayout: number;
+  contractIds: string[];
+}
+
+export interface ContractOutcome {
+  profit: number;
+  won: boolean;
+  buyPrice: number;
+  entryTick: number;
+  exitTick: number;
+  entrySpot?: string;
+  exitSpot?: string;
+  exitDigit?: number;
+}
+
+export interface AutoStartParams {
+  tag: string;                                   // identifica o stream (usar o id do bot)
+  strategyId: string;
+  contractTemplate: Record<string, unknown>;
+  strategyParameters: Record<string, unknown>;
+}
+
+export interface AutoHandlers {
+  onUpdate: (run: AutoRunInfo) => void;
+  onError: (err: Error) => void;
+  onDisconnect: () => void;
+}
+
+export interface ManualBuyParams {
+  symbol: string;
+  contractType: string;
+  stake: number;
+  duration: number;
+  durationUnit: string;
+  currency: string;
+  barrier?: string;
+}
 
 export interface DerivWsAdapter {
-  buyContract(params: {
-    symbol: string;
-    contractType: string;
-    stake: number;
-    duration: number;
-    durationUnit: string;
-    currency: string;
-    barrier?: string;       // necessário para contratos de dígitos (DIGITOVER/DIGITUNDER)
-  }): Promise<{
+  /** Compra única (Operar Manual): buy directo, 1 viagem de rede. */
+  buyContract(params: ManualBuyParams): Promise<{
     contractId: string;
     payout?: number;
     buyPrice?: number;
     balanceAfter?: number;
   }>;
-
-  waitForContract(contractId: string): Promise<{
-    profit: number;
-    won: boolean;
-    entryTick: number;
-    exitTick: number;
-    entrySpot?: string;     // preço tal como a Deriv o envia (mantém zeros finais)
-    exitSpot?: string;
-    exitDigit?: number;     // último dígito de exitSpot — usar nas estratégias de dígitos
-  }>;
-
-  // pipSize: casas decimais do símbolo, enviado pela Deriv em cada tick
-  subscribeToTicks(
-    symbol: string,
-    onTick: (price: number, pipSize?: number) => void,
-  ): { unsubscribe: () => void };
-
-  // Pedido único de proposta (payout) sem comprar — usado pelas
-  // estratégias para calcular o stake certo ANTES de decidir quanto
-  // apostar (ex: gale de recuperação do Over1 Recovery / ETHEREUM).
-  getProposal(params: {
-    symbol: string;
-    contractType: string;
-    duration: number;
-    durationUnit: string;
-    currency: string;
-    barrier?: string;
-    stake: number;
-  }): Promise<{ payout: number }>;
+  /** auto_start com subscribe:1. Resolve com o estado inicial do run. */
+  autoStart(params: AutoStartParams, handlers: AutoHandlers): Promise<{ run: AutoRunInfo; detach: () => void }>;
+  /** Volta a subscrever um run existente (auto_get + subscribe) após reconexão. */
+  autoAttach(tag: string, runId: string, handlers: AutoHandlers): { detach: () => void };
+  /** auto_pause | auto_resume | auto_stop */
+  autoControl(action: 'pause' | 'resume' | 'stop', runId: string): Promise<AutoRunInfo>;
+  /** Resultado real de um contrato (proposal_open_contract). */
+  watchContract(contractId: string, maxWaitMs?: number): Promise<ContractOutcome>;
 }

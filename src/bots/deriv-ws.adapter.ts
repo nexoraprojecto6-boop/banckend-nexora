@@ -1,35 +1,22 @@
 // ============================================================
-// NEXORA FOREX — Deriv WS Adapter v2 (conta autenticada)
+// NEXORA FOREX — Deriv WS Adapter v3 (auto_* da Deriv)
 // ============================================================
-// Conforme a documentação oficial da Deriv (buy.md, proposal.md,
-// proposal-open-contract.md, ticks.md).
-//
-// Correcções vs v1:
-//   ✅ buy directo (buy:1 + parameters): 1 viagem de rede em vez de 2
-//      (proposal → buy). Fallback de 2 passos com { directBuy:false }.
-//   ✅ Acompanhamento do contrato começa NO MESMO INSTANTE em que o buy
-//      responde (antes só começava quando a estratégia chamava
-//      waitForContract → contratos de 1 tick podiam fechar antes).
-//   ✅ Timeout de waitForContract proporcional à duração (era fixo 35 s:
-//      contratos de 1m+ davam "Timeout" falso com o contrato ainda aberto)
-//   ✅ Campos da API nova: entry_spot / exit_spot / buy_price /
-//      sell_price (a v1 lia entry_tick/exit_tick → sempre 0, o que
-//      quebrava os dígitos finais das estratégias Even/Odd e Over/Under)
-//   ✅ Contrato só é dado como fechado com is_sold=1 ou status
-//      sold|won|lost|cancelled. is_expired/is_settleable NÃO têm lucro
-//      final → resultado registado como perda por engano.
-//   ✅ Profit = sell_price − buy_price (exacto), fallback profit
-//   ✅ Stake arredondado às casas decimais da moeda (martingale gerava
-//      0.35000000000000003 → InputValidationFailed)
-//   ✅ Streams (ticks / contrato) voltam a subscrever sozinhos após
-//      reconexão do WS; erro de símbolo inválido é registado
-//   ✅ Watchdog: ticks parados >30 s → nova subscrição
-//   ✅ onTick recebe também pip_size (2.º argumento, opcional) para
-//      calcular o último dígito correctamente (1.10 ≠ 1.1)
+// A Deriv executa o ciclo de compras (auto_start). Este adaptador:
+//   • inicia/retoma o acompanhamento de um run (subscribe:1)
+//   • pausa / retoma / pára o run
+//   • lê o resultado real de cada contrato (proposal_open_contract)
+// Já não existe buy/proposal/ticks aqui.
 // ============================================================
 
 import { WebSocket } from 'ws';
-import { DerivWsAdapter } from './bot.types.js';
+import {
+  AutoHandlers,
+  AutoRunInfo,
+  AutoStartParams,
+  ContractOutcome,
+  DerivWsAdapter,
+  ManualBuyParams,
+} from './bot.types.js';
 import { getMessageRouter } from './message-router.js';
 import { nextReqId } from '@utils/req-id.js';
 import { roundToCurrency } from '@utils/currency.js';
@@ -46,73 +33,67 @@ export class DerivApiError extends Error {
   }
 }
 
-function toDerivApiError(err: unknown, fallbackMessage: string): Error {
+function toDerivApiError(err: unknown, fallback: string): Error {
   if (err instanceof DerivApiError) return err;
   if (err instanceof Error && 'code' in err && typeof (err as { code?: unknown }).code === 'string') {
-    return new DerivApiError(err.message || fallbackMessage, (err as { code: string }).code);
+    return new DerivApiError(err.message || fallback, (err as { code: string }).code);
   }
-  return err instanceof Error ? err : new Error(fallbackMessage);
+  return err instanceof Error ? err : new Error(fallback);
 }
 
-// ─── Utilitários ─────────────────────────────────────────────
-
-const DURATION_UNIT_MAP: Record<string, string> = {
-  ticks: 't', t: 't', s: 's', m: 'm', h: 'h', d: 'd',
-};
-
-// Casas decimais por moeda (BTC/ETH/LTC: 8; fiat e stablecoins: 2) — ver utils/currency.ts
-const roundStake = roundToCurrency;
-
-/** Tempo máximo razoável até o contrato fechar (duração + margem). */
-function maxWaitMs(duration: number, unit: string): number {
-  const MARGIN = 45_000;
-  switch (unit) {
-    case 't': return duration * 2_000 + MARGIN;
-    case 's': return duration * 1_000 + MARGIN;
-    case 'm': return duration * 60_000 + MARGIN;
-    case 'h': return duration * 3_600_000 + MARGIN;
-    case 'd': return duration * 86_400_000 + MARGIN;
-    default:  return 10 * 60_000;
-  }
-}
-
-const backoffMs = (attempt: number) => Math.min(250 * 2 ** attempt, 5_000);
 const num = (v: unknown): number => (v === null || v === undefined || v === '' ? 0 : Number(v));
+const FIRST_RESPONSE_MS = 15_000;
+const DEFAULT_WAIT_MS = 30 * 60_000;
+const backoffMs = (attempt: number) => Math.min(250 * 2 ** attempt, 5_000);
+const UNIT: Record<string, string> = { ticks: 't', t: 't', s: 's', m: 'm', h: 'h', d: 'd' };
 
-interface ContractResult {
-  profit: number;
-  won: boolean;
-  entryTick: number;
-  exitTick: number;
-  entrySpot?: string;
-  exitSpot?: string;
-  exitDigit?: number;
+// ─── Parse do objecto "run" (defensivo) ──────────────────────
+// A resposta traz o run dentro de auto_start / auto_get / auto_pause /
+// auto_resume / auto_stop. Procuramos o 1.º objecto com run_id.
+
+function toContractId(c: unknown): string | null {
+  if (c === null || c === undefined) return null;
+  if (typeof c === 'string' || typeof c === 'number') return String(c);
+  if (typeof c === 'object') {
+    const o = c as Record<string, unknown>;
+    const id = o.contract_id ?? o.id;
+    return id === undefined || id === null ? null : String(id);
+  }
+  return null;
 }
 
-interface TickParams {
-  symbol: string;
-  contractType: string;
-  stake: number;
-  duration: number;
-  durationUnit: string;
-  currency: string;
-  barrier?: string;
-}
+export function parseRun(msg: Record<string, unknown>): AutoRunInfo | null {
+  for (const [key, value] of Object.entries(msg)) {
+    if (key === 'echo_req' || key === 'subscription') continue;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const r = value as Record<string, unknown>;
+    if (typeof r.run_id !== 'string') continue;
 
-const TICK_STALL_MS = 30_000;
-const DEFAULT_WAIT_MS = 10 * 60_000;
+    const contracts = Array.isArray(r.contracts) ? r.contracts : [];
+    const contractIds = contracts.map(toContractId).filter((x): x is string => x !== null);
+    const status = r.status === 'paused' || r.status === 'stopped' ? r.status : 'running';
+
+    return {
+      runId: r.run_id,
+      status,
+      stopReason: r.stop_reason as AutoRunInfo['stopReason'],
+      stopReasonCode: typeof r.stop_reason_code === 'string' ? r.stop_reason_code : undefined,
+      totalStake: num(r.total_stake),
+      totalPayout: num(r.total_payout),
+      contractIds,
+    };
+  }
+  return null;
+}
 
 // ─── Factory ─────────────────────────────────────────────────
 
 export function createDerivWsAdapter(
   getDerivWs: () => WebSocket | null,
-  options: { directBuy?: boolean } = {},
+  _options: { directBuy?: boolean } = {}, // mantido por compatibilidade com server.ts
 ): DerivWsAdapter {
-  const directBuy = options.directBuy ?? true;
-  const watchers = new Map<string, Promise<ContractResult>>();
+  const watchers = new Map<string, Promise<ContractOutcome>>();
 
-  // Espera até 5 s por um WS aberto: durante uma reconexão da sessão
-  // (OTP novo) o bot não deve falhar logo no primeiro pedido.
   async function requireOpenWs(waitMs = 5_000): Promise<WebSocket> {
     const deadline = Date.now() + waitMs;
     for (;;) {
@@ -123,121 +104,151 @@ export function createDerivWsAdapter(
     }
   }
 
-  function contractParameters(p: TickParams, unit: string, amount: number): Record<string, unknown> {
-    return {
-      amount,
-      basis: 'stake',
-      contract_type: p.contractType,
-      currency: p.currency,
-      duration: p.duration,
-      duration_unit: unit,
-      underlying_symbol: p.symbol,
-      ...(p.barrier !== undefined ? { barrier: p.barrier } : {}),
-    };
-  }
-
   // ──────────────────────────────────────────────────────────
-  // buyContract
+  // auto_start
   // ──────────────────────────────────────────────────────────
 
-  async function buyContract(params: TickParams): Promise<{
-    contractId: string;
-    payout?: number;
-    buyPrice?: number;
-    balanceAfter?: number;
-  }> {
-    const unit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
-    const amount = roundStake(params.stake, params.currency);
+  async function autoStart(
+    params: AutoStartParams,
+    h: AutoHandlers,
+  ): Promise<{ run: AutoRunInfo; detach: () => void }> {
     const router = getMessageRouter(await requireOpenWs());
 
-    let buyMsg: Record<string, unknown>;
+    return new Promise((resolve, reject) => {
+      let first = true;
+      let handle: { close: () => void } | null = null;
 
-    try {
-      if (directBuy) {
-        // buy.md: buy:1 + parameters, price = preço máximo aceite.
-        buyMsg = await router.request(
-          { buy: 1, price: amount, parameters: contractParameters(params, unit, amount) },
-          nextReqId(),
-          15_000,
-        );
-      } else {
-        const proposalMsg = await router.request(
-          { proposal: 1, ...contractParameters(params, unit, amount) },
-          nextReqId(),
-          15_000,
-        );
-        const proposal = proposalMsg.proposal as Record<string, unknown> | undefined;
-        if (!proposal?.id) throw new Error('Resposta de proposal inválida ou sem id');
+      const timer = setTimeout(() => {
+        if (!first) return;
+        first = false;
+        handle?.close();
+        // O run pode ter arrancado: o bot deve reconciliar antes de repetir.
+        reject(new Error('Timeout no auto_start — estado do run desconhecido, verifique antes de repetir'));
+      }, FIRST_RESPONSE_MS);
 
-        const router2 = getMessageRouter(await requireOpenWs());
-        buyMsg = await router2.request(
-          { buy: String(proposal.id), price: Number(proposal.ask_price ?? amount) },
-          nextReqId(),
-          15_000,
-        );
-      }
-    } catch (err) {
-      const e = toDerivApiError(err, 'Erro ao comprar contrato');
-      if (e.message.startsWith('Timeout')) {
-        // NÃO repetir: o contrato pode ter sido comprado.
-        throw new Error(`${e.message} — estado da compra desconhecido, verifique o portfólio antes de repetir`);
-      }
-      throw e;
-    }
-
-    const buy = buyMsg.buy as Record<string, unknown> | undefined;
-    if (!buy?.contract_id) throw new Error('Resposta buy inválida');
-
-    const contractId = String(buy.contract_id);
-
-    // Começa a acompanhar JÁ (mesmo tick de event-loop).
-    startWatch(contractId, maxWaitMs(params.duration, unit));
-
-    logger.debug('[DerivAdapter] buy confirmado', {
-      contractId, symbol: params.symbol, contractType: params.contractType, stake: amount,
+      handle = router.openStream(
+        `auto:${params.tag}`,
+        {
+          auto_start: 1,
+          contract_template: params.contractTemplate,
+          strategy_id: params.strategyId,
+          strategy_parameters: params.strategyParameters,
+        },
+        {
+          onMessage: (msg) => {
+            const run = parseRun(msg);
+            if (!run) {
+              logger.debug('[DerivAdapter] mensagem auto_* sem run_id', { keys: Object.keys(msg) });
+              return;
+            }
+            if (first) {
+              first = false;
+              clearTimeout(timer);
+              resolve({ run, detach: () => handle?.close() });
+            } else {
+              h.onUpdate(run);
+            }
+          },
+          onError: (err) => {
+            if (first) {
+              first = false;
+              clearTimeout(timer);
+              reject(toDerivApiError(err, 'Erro no auto_start'));
+            } else {
+              h.onError(toDerivApiError(err, 'Erro no stream do run'));
+            }
+          },
+          onDisconnect: () => {
+            if (first) {
+              first = false;
+              clearTimeout(timer);
+              reject(new Error('Ligação caiu durante o auto_start — estado do run desconhecido'));
+            } else {
+              h.onDisconnect();
+            }
+          },
+        },
+      );
     });
-
-    return {
-      contractId,
-      payout: buy.payout === undefined ? undefined : Number(buy.payout),
-      buyPrice: buy.buy_price === undefined ? undefined : Number(buy.buy_price),
-      balanceAfter: buy.balance_after === undefined ? undefined : Number(buy.balance_after),
-    };
   }
 
   // ──────────────────────────────────────────────────────────
-  // Acompanhamento de contrato
+  // auto_get + subscribe (re-anexar após reconexão)
   // ──────────────────────────────────────────────────────────
 
-  function startWatch(contractId: string, waitMs: number): Promise<ContractResult> {
+  function autoAttach(tag: string, runId: string, h: AutoHandlers): { detach: () => void } {
+    const ws = getDerivWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      const t = setTimeout(() => h.onDisconnect(), 0);
+      return { detach: () => clearTimeout(t) };
+    }
+    const router = getMessageRouter(ws);
+    const handle = router.openStream(
+      `auto:${tag}`,
+      { auto_get: 1, run_id: runId },
+      {
+        onMessage: (msg) => {
+          const run = parseRun(msg);
+          if (run && run.runId === runId) h.onUpdate(run);
+        },
+        onError: (err) => h.onError(toDerivApiError(err, 'Erro ao re-subscrever o run')),
+        onDisconnect: () => h.onDisconnect(),
+      },
+    );
+    return { detach: () => handle.close() };
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // auto_pause | auto_resume | auto_stop
+  // ──────────────────────────────────────────────────────────
+
+  async function autoControl(
+    action: 'pause' | 'resume' | 'stop',
+    runId: string,
+  ): Promise<AutoRunInfo> {
+    const router = getMessageRouter(await requireOpenWs());
+    let msg: Record<string, unknown>;
+    try {
+      msg = await router.request({ [`auto_${action}`]: 1, run_id: runId }, nextReqId(), FIRST_RESPONSE_MS);
+    } catch (err) {
+      throw toDerivApiError(err, `Erro em auto_${action}`);
+    }
+    const run = parseRun(msg);
+    if (!run) throw new Error(`Resposta auto_${action} inválida`);
+    return run;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Resultado real de um contrato (proposal_open_contract)
+  // ──────────────────────────────────────────────────────────
+
+  function watchContract(contractId: string, maxWaitMs = DEFAULT_WAIT_MS): Promise<ContractOutcome> {
     const existing = watchers.get(contractId);
     if (existing) return existing;
-
-    const p = watchContract(contractId, waitMs);
+    const p = doWatch(contractId, maxWaitMs);
     watchers.set(contractId, p);
     const cleanup = () => { watchers.delete(contractId); };
-    p.then(cleanup, cleanup); // trata rejeição → sem unhandledRejection
+    p.then(cleanup, cleanup);
     return p;
   }
 
-  function watchContract(contractId: string, waitMs: number): Promise<ContractResult> {
-    return new Promise<ContractResult>((resolve, reject) => {
+  function doWatch(contractId: string, waitMs: number): Promise<ContractOutcome> {
+    return new Promise<ContractOutcome>((resolve, reject) => {
       let settled = false;
       let handle: { close: () => void } | null = null;
       let retryTimer: ReturnType<typeof setTimeout> | null = null;
-      let deadline: ReturnType<typeof setTimeout> | null = null;
 
-      const finish = (err: Error | null, result?: ContractResult) => {
+      const finish = (err: Error | null, result?: ContractOutcome) => {
         if (settled) return;
         settled = true;
-        if (deadline) clearTimeout(deadline);
+        clearTimeout(deadline);
         if (retryTimer) clearTimeout(retryTimer);
         handle?.close();
         handle = null;
         if (err) reject(err); else resolve(result!);
       };
 
-      deadline = setTimeout(
+      const deadline = setTimeout(
         () => finish(new Error(`Timeout aguardando resultado do contrato ${contractId} (${Math.round(waitMs / 1000)}s)`)),
         waitMs,
       );
@@ -250,12 +261,9 @@ export function createDerivWsAdapter(
       const attach = (attempt: number) => {
         if (settled) return;
         const ws = getDerivWs();
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          scheduleAttach(attempt + 1);
-          return;
-        }
-        const router = getMessageRouter(ws);
-        handle = router.openStream(
+        if (!ws || ws.readyState !== WebSocket.OPEN) { scheduleAttach(attempt + 1); return; }
+
+        handle = getMessageRouter(ws).openStream(
           `poc:${contractId}`,
           { proposal_open_contract: 1, contract_id: Number(contractId) },
           {
@@ -271,32 +279,25 @@ export function createDerivWsAdapter(
 
               const buyPrice = num(poc.buy_price);
               const hasSell = poc.sell_price !== null && poc.sell_price !== undefined && poc.sell_price !== '';
-              const rawProfit = hasSell ? num(poc.sell_price) - buyPrice : num(poc.profit);
-              const profit = Number(rawProfit.toFixed(8));
+              const profit = Number((hasSell ? num(poc.sell_price) - buyPrice : num(poc.profit)).toFixed(8));
               const won = status === 'won' ? true : status === 'lost' ? false : profit > 0;
 
-              const entrySpot = poc.entry_spot ?? poc.entry_tick;
-              const exitSpot = poc.exit_spot ?? poc.exit_tick;
-              const exitSpotStr = exitSpot == null ? undefined : String(exitSpot);
-              const lastChar = exitSpotStr?.slice(-1);
-              const exitDigit = lastChar !== undefined && /\d/.test(lastChar) ? Number(lastChar) : undefined;
+              const entry = poc.entry_spot ?? poc.entry_tick;
+              const exit = poc.exit_spot ?? poc.exit_tick;
+              const exitStr = exit == null ? undefined : String(exit);
+              const last = exitStr?.slice(-1);
 
               finish(null, {
-                profit,
-                won,
-                entryTick: num(entrySpot),
-                exitTick: num(exitSpot),
-                entrySpot: entrySpot == null ? undefined : String(entrySpot),
-                exitSpot: exitSpotStr,
-                exitDigit,
+                profit, won, buyPrice,
+                entryTick: num(entry),
+                exitTick: num(exit),
+                entrySpot: entry == null ? undefined : String(entry),
+                exitSpot: exitStr,
+                exitDigit: last !== undefined && /\d/.test(last) ? Number(last) : undefined,
               });
             },
             onError: (err) => finish(toDerivApiError(err, 'Erro ao acompanhar contrato')),
-            onDisconnect: () => {
-              handle = null;
-              logger.warn('[DerivAdapter] Ligação caiu a meio do contrato — a re-subscrever', { contractId });
-              scheduleAttach(0);
-            },
+            onDisconnect: () => { handle = null; scheduleAttach(0); },
           },
         );
       };
@@ -305,136 +306,52 @@ export function createDerivWsAdapter(
     });
   }
 
-  function waitForContract(contractId: string): Promise<ContractResult> {
-    return watchers.get(contractId) ?? startWatch(contractId, DEFAULT_WAIT_MS);
-  }
-
   // ──────────────────────────────────────────────────────────
-  // subscribeToTicks
+  // buyContract (Operar Manual) — buy directo
   // ──────────────────────────────────────────────────────────
 
-  function subscribeToTicks(
-    symbol: string,
-    onTick: (price: number, pipSize?: number) => void,
-  ): { unsubscribe: () => void } {
-    const key = `ticks:${symbol}`;
-    let closed = false;
-    let handle: { close: () => void } | null = null;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastTickAt = Date.now();
-    let failures = 0;
-    let routerRef: ReturnType<typeof getMessageRouter> | null = null;
-
-    const scheduleAttach = (attempt: number) => {
-      if (closed) return;
-      if (retryTimer) clearTimeout(retryTimer);
-      retryTimer = setTimeout(() => attach(attempt), backoffMs(attempt));
-    };
-
-    const attach = (attempt: number) => {
-      if (closed) return;
-      const ws = getDerivWs();
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        scheduleAttach(attempt + 1);
-        return;
-      }
-      const router = getMessageRouter(ws);
-      routerRef = router;
-      lastTickAt = Date.now();
-
-      handle = router.openStream(key, { ticks: symbol }, {
-        onMessage: (msg) => {
-          const tick = msg.tick as Record<string, unknown> | undefined;
-          if (!tick) return;
-          const quote = Number(tick.quote);
-          if (!Number.isFinite(quote)) return;
-          lastTickAt = Date.now();
-          failures = 0;
-          try {
-            onTick(quote, tick.pip_size === undefined ? undefined : Number(tick.pip_size));
-          } catch (err) {
-            logger.error('[DerivAdapter] onTick lançou erro', { symbol, error: err });
-          }
-        },
-        onError: (err) => {
-          handle = null;
-          failures++;
-          logger.error('[DerivAdapter] Erro na subscrição de ticks', {
-            symbol, message: err.message, code: (err as { code?: string }).code, failures,
-          });
-          if (failures < 5) scheduleAttach(failures);
-        },
-        onDisconnect: () => {
-          handle = null;
-          scheduleAttach(0);
-        },
-      });
-    };
-
-    attach(0);
-
-    // Watchdog: stream "mudo" → forçar nova subscrição
-    const watchdog = setInterval(() => {
-      if (closed || !handle || !routerRef) return;
-      if (Date.now() - lastTickAt > TICK_STALL_MS) {
-        logger.warn('[DerivAdapter] Ticks parados — a re-subscrever', { symbol });
-        lastTickAt = Date.now();
-        routerRef.resetStream(key);
-      }
-    }, 10_000);
-    watchdog.unref?.();
-
-    return {
-      unsubscribe: () => {
-        if (closed) return;
-        closed = true;
-        clearInterval(watchdog);
-        if (retryTimer) clearTimeout(retryTimer);
-        handle?.close();
-        handle = null;
-      },
-    };
-  }
-
-  // ──────────────────────────────────────────────────────────
-  // getProposal — payout sem comprar
-  // ──────────────────────────────────────────────────────────
-
-  async function getProposal(params: {
-    symbol: string;
-    contractType: string;
-    duration: number;
-    durationUnit: string;
-    currency: string;
-    barrier?: string;
-    stake: number;
-  }): Promise<{ payout: number }> {
-    const unit = DURATION_UNIT_MAP[params.durationUnit] ?? params.durationUnit;
-    const amount = roundStake(params.stake, params.currency);
+  async function buyContract(p: ManualBuyParams) {
+    const amount = roundToCurrency(p.stake, p.currency);
     const router = getMessageRouter(await requireOpenWs());
 
     let msg: Record<string, unknown>;
     try {
-      msg = await router.request({
-        proposal: 1,
-        amount,
-        basis: 'stake',
-        contract_type: params.contractType,
-        currency: params.currency,
-        duration: params.duration,
-        duration_unit: unit,
-        underlying_symbol: params.symbol,
-        ...(params.barrier !== undefined ? { barrier: params.barrier } : {}),
-      }, nextReqId(), 15_000);
+      msg = await router.request(
+        {
+          buy: 1,
+          price: amount,
+          parameters: {
+            amount,
+            basis: 'stake',
+            contract_type: p.contractType,
+            currency: p.currency,
+            duration: p.duration,
+            duration_unit: UNIT[p.durationUnit] ?? p.durationUnit,
+            underlying_symbol: p.symbol,
+            ...(p.barrier !== undefined ? { barrier: p.barrier } : {}),
+          },
+        },
+        nextReqId(),
+        15_000,
+      );
     } catch (err) {
-      throw toDerivApiError(err, 'Erro ao consultar proposta/payout');
+      const e = toDerivApiError(err, 'Erro ao comprar contrato');
+      if (e.message.startsWith('Timeout')) {
+        throw new Error(`${e.message} — estado da compra desconhecido, verifique o portfólio antes de repetir`);
+      }
+      throw e;
     }
 
-    const proposal = msg.proposal as Record<string, unknown> | undefined;
-    if (proposal?.payout === undefined) throw new Error('Resposta de proposal inválida ou sem payout');
-
-    return { payout: Number(proposal.payout) };
+    const buy = msg.buy as Record<string, unknown> | undefined;
+    if (!buy?.contract_id) throw new Error('Resposta buy inválida');
+    return {
+      contractId: String(buy.contract_id),
+      payout: buy.payout === undefined ? undefined : Number(buy.payout),
+      buyPrice: buy.buy_price === undefined ? undefined : Number(buy.buy_price),
+      balanceAfter: buy.balance_after === undefined ? undefined : Number(buy.balance_after),
+    };
   }
 
-  return { buyContract, waitForContract, subscribeToTicks, getProposal };
+  return { buyContract, autoStart, autoAttach, autoControl, watchContract };
 }
+

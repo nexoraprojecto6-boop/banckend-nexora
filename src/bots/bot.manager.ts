@@ -1,22 +1,13 @@
 // ============================================================
-// NEXORA FOREX — Bot Manager v2
+// NEXORA FOREX — Bot Manager v3 (auto_* da Deriv)
 // ============================================================
-// Correcções vs v1:
-//   ✅ deleteBot() para bots running E paused (e agora é async,
-//      aguarda o stop e remove os listeners → sem leak de memória)
-//   ✅ stopAll() também pára bots em pausa
-//   ✅ stopAll()/destroy() usam allSettled: um bot que falha ao parar
-//      não impede os restantes
-//   ✅ even_odd_recovery (bot LITECOIN) NÃO estava registado no
-//      buildStrategy → "Estratégia desconhecida". Se a classe tiver outro
-//      nome, ajuste o import.
-//   ✅ even_odd_smart (bot BITCOIN) registado
+// Mesma API pública da v2 (rotas e server.ts continuam a funcionar).
+// Só existem 'martingale' e 'dalembert', ambas via auto_start.
 // ============================================================
 
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 import {
-  BotConfig,
   BotEvent,
   BotState,
   BotStrategyType,
@@ -24,15 +15,8 @@ import {
   CreateBotRequest,
   DerivWsAdapter,
 } from './bot.types.js';
-import { BaseStrategy, SymbolResolver } from './strategies/base.strategy.js';
-import { ScalpingStrategy } from './strategies/scalping.strategy.js';
-import { MartingaleStrategy } from './strategies/martingale.strategy.js';
-import { TrendFollowingStrategy } from './strategies/trend-following.strategy.js';
-import { ScalperStrategy } from './strategies/scalper.strategy.js';
-import { AlfhaStrategy } from './strategies/alfha.strategy.js';
-import { Over1RecoveryStrategy } from './strategies/over1-recovery.strategy.js';
-import { EvenOddRecoveryStrategy } from './strategies/even-odd-recovery.strategy.js';
-import { EvenOddSmartStrategy } from './strategies/even-odd-smart.strategy.js';
+import { AutoRunBot } from './auto-run.bot.js';
+import type { SymbolResolver } from './strategies/base.strategy.js';
 import logger from '@utils/logger.js';
 
 const BOT_EVENTS = [
@@ -49,8 +33,10 @@ const BOT_EVENTS = [
   'bot:insufficient_balance',
 ] as const;
 
+const STRATEGIES: readonly BotStrategyType[] = ['martingale', 'dalembert'];
+
 export class BotManager extends EventEmitter {
-  private bots = new Map<string, BaseStrategy>();
+  private bots = new Map<string, AutoRunBot>();
   private derivWs: DerivWsAdapter;
   private symbolResolver: SymbolResolver | null = null;
 
@@ -62,14 +48,16 @@ export class BotManager extends EventEmitter {
   // ─── CRUD ─────────────────────────────────────────────────
 
   createBot(req: CreateBotRequest): BotState {
+    if (!STRATEGIES.includes(req.strategy)) {
+      throw new Error(`Estratégia desconhecida: ${req.strategy} (disponíveis: ${STRATEGIES.join(', ')})`);
+    }
     const id = uuidv4();
-    const bot = this.buildStrategy(id, req.name, req.strategy, req.config);
+    const bot = new AutoRunBot(id, req.name, req.strategy, req.config, this.derivWs);
 
     BOT_EVENTS.forEach((event) => {
       bot.on(event, (botEvent: BotEvent) => this.emit('bot_event', botEvent));
     });
 
-    if (this.symbolResolver) bot.setSymbolResolver(this.symbolResolver);
     this.bots.set(id, bot);
     logger.info(`[BotManager] Bot criado — id: ${id}, estratégia: ${req.strategy}, nome: ${req.name}`);
     return bot.getState();
@@ -83,8 +71,9 @@ export class BotManager extends EventEmitter {
     await this.getOrThrow(botId).stop('manual');
   }
 
-  pauseBot(botId: string): void {
-    this.getOrThrow(botId).pause();
+  /** Assíncrono (chama auto_pause); nunca rejeita. */
+  async pauseBot(botId: string): Promise<void> {
+    await this.getOrThrow(botId).pause();
   }
 
   async resumeBot(botId: string): Promise<void> {
@@ -93,7 +82,7 @@ export class BotManager extends EventEmitter {
 
   async deleteBot(botId: string): Promise<void> {
     const bot = this.getOrThrow(botId);
-    const status = bot.getState().status;
+    const status = bot.status;
     if (status === 'running' || status === 'paused') {
       try {
         await bot.stop('deleted');
@@ -107,10 +96,9 @@ export class BotManager extends EventEmitter {
   }
 
   async stopAll(): Promise<void> {
-    const targets = Array.from(this.bots.values()).filter((b) => {
-      const s = b.getState().status;
-      return s === 'running' || s === 'paused';
-    });
+    const targets = Array.from(this.bots.values()).filter(
+      (b) => b.status === 'running' || b.status === 'paused',
+    );
     const results = await Promise.allSettled(targets.map((b) => b.stop('bulk_stop')));
     results.forEach((r) => {
       if (r.status === 'rejected') logger.error('[BotManager] Falha em stopAll', { error: r.reason });
@@ -134,10 +122,12 @@ export class BotManager extends EventEmitter {
     return this.getOrThrow(botId).getState().logs.slice(-limit);
   }
 
-  /** Ativa a mudança automática de mercado (mercado fechado/indisponível → outro aberto). */
+  /**
+   * Mantido por compatibilidade com server.ts. No modelo auto_* o
+   * símbolo é fixo no run; a troca automática de mercado já não existe.
+   */
   setSymbolResolver(resolver: SymbolResolver | null): void {
     this.symbolResolver = resolver;
-    this.bots.forEach((b) => b.setSymbolResolver(resolver));
   }
 
   // ─── Troca de conta (só afecta bots criados a seguir) ─────
@@ -156,38 +146,7 @@ export class BotManager extends EventEmitter {
     this.removeAllListeners();
   }
 
-  // ─── Factory ──────────────────────────────────────────────
-
-  private buildStrategy(
-    id: string,
-    name: string,
-    strategy: BotStrategyType,
-    config: BotConfig,
-  ): BaseStrategy {
-    switch (strategy) {
-      case 'scalping':
-        return new ScalpingStrategy(id, name, config, this.derivWs);
-      case 'martingale':
-      case 'anti_martingale':
-        return new MartingaleStrategy(id, name, config, this.derivWs);
-      case 'trend_following':
-        return new TrendFollowingStrategy(id, name, config, this.derivWs);
-      case 'scalper':
-        return new ScalperStrategy(id, name, config, this.derivWs);
-      case 'alfha':
-        return new AlfhaStrategy(id, name, config, this.derivWs);
-      case 'over1_recovery':
-        return new Over1RecoveryStrategy(id, name, config, this.derivWs);
-      case 'even_odd_recovery': // 'LITECOIN' — antes não registado → "Estratégia desconhecida"
-        return new EvenOddRecoveryStrategy(id, name, config, this.derivWs);
-      case 'even_odd_smart': // 'BITCOIN'
-        return new EvenOddSmartStrategy(id, name, config, this.derivWs);
-      default:
-        throw new Error(`Estratégia desconhecida: ${strategy}`);
-    }
-  }
-
-  private getOrThrow(botId: string): BaseStrategy {
+  private getOrThrow(botId: string): AutoRunBot {
     const bot = this.bots.get(botId);
     if (!bot) throw new Error(`Bot não encontrado: ${botId}`);
     return bot;

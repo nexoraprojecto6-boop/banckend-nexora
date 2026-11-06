@@ -107,9 +107,6 @@ interface ClientSession {
   symbolsByTypes:       Map<string, { at: number; list: ActiveSymbol[] }>;
   msgWindowStart:       number;
   msgCount:             number;
-    tickHandle:           { close: () => void } | null;
-  tickSymbol:           string | null;
-  tickGen:              number;
 }
 
 interface ActiveSymbol {
